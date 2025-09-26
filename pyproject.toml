@@ -1,0 +1,90 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dinov3_playground"
+version = "0.1.0"
+description = "DINOv3 feature extraction and fine-tuning playground for cell image analysis"
+readme = "README.md"
+license = {file = "LICENSE"}
+authors = [
+    {name = "GitHub Copilot", email = "copilot@github.com"},
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Image Processing",
+]
+requires-python = ">=3.8"
+dependencies = [
+    "torch>=1.9.0",
+    "numpy",
+    "pillow",
+    "transformers>=4.20.0",
+    "matplotlib",
+    "scikit-image",
+    "scipy",
+    "zarr",
+    "funlib.geometry",
+    "cellmap_flow",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-cov",
+    "black",
+    "flake8",
+    "isort",
+]
+docs = [
+    "sphinx",
+    "sphinx-rtd-theme",
+]
+
+[project.urls]
+Homepage = "https://github.com/davidackerman/dinov3_playground"
+Repository = "https://github.com/davidackerman/dinov3_playground"
+Issues = "https://github.com/davidackerman/dinov3_playground/issues"
+
+
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["dinov3_playground*"]
+exclude = ["tests*"]
+
+[tool.setuptools.package-data]
+dinov3_playground = ["*.py", "*.md"]
+
+[tool.black]
+line-length = 88
+target-version = ['py38']
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+  # directories
+  \.eggs
+  | \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | build
+  | dist
+)/
+'''
+
+[tool.isort]
+profile = "black"
+multi_line_output = 3
+line_length = 88

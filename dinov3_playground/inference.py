@@ -1,0 +1,667 @@
+"""
+Inference Module for DINOv3 UNet Models
+
+This module provides easy-to-use classes for loading trained models and running inference
+on new images or volumes. It automatically handles:
+- Loading the best model weights from training exports
+- Reconstructing the correct DINOv3 model configuration
+- Providing simple interfaces for 2D and 3D inference
+
+Author: GitHub Copilot
+Date: 2025-09-26
+"""
+
+import os
+import json
+import pickle
+import torch
+import numpy as np
+from pathlib import Path
+from typing import Union, Tuple, Optional, Dict, Any
+import warnings
+
+# Handle both relative and absolute imports
+try:
+    from .dinov3_core import initialize_dinov3, process, get_current_model_info
+    from .models import DINOv3UNet, DINOv3UNet3D, DINOv3UNet3DPipeline
+    from .memory_efficient_training import MemoryEfficientDataLoader3D
+except ImportError:
+    from dinov3_playground.dinov3_core import (
+        initialize_dinov3,
+        process,
+        get_current_model_info,
+    )
+    from dinov3_playground.models import DINOv3UNet, DINOv3UNet3D, DINOv3UNet3DPipeline
+    from dinov3_playground.memory_efficient_training import MemoryEfficientDataLoader3D
+
+
+class DINOv3UNetInference:
+    """
+    Easy-to-use inference class for 2D DINOv3 UNet models.
+
+    Automatically loads the best model weights and DINOv3 configuration
+    from a training export directory.
+    """
+
+    def __init__(self, export_dir: str, device: Optional[str] = None):
+        """
+        Initialize the inference class.
+
+        Args:
+            export_dir: Path to the training export directory containing checkpoints
+            device: Device to run inference on ('cuda', 'cpu', or None for auto)
+        """
+        self.export_dir = Path(export_dir)
+        self.device = torch.device(
+            device if device else ("cuda" if torch.cuda.is_available() else "cpu")
+        )
+
+        # Model components
+        self.unet = None
+        self.dinov3_processor = None
+        self.dinov3_model = None
+        self.model_config = None
+        self.training_config = None
+
+        # Load the model
+        self._load_model()
+
+    def _load_model(self):
+        """Load the best model weights and configuration."""
+        # Find checkpoint directory - look for timestamped directories
+        # Structure: export_dir/model_type_model_id/timestamp/model/
+        timestamp_dirs = []
+        for path in self.export_dir.iterdir():
+            if path.is_dir():
+                # Look for model subdirectories
+                model_dir = path / "model"
+                if model_dir.exists():
+                    timestamp_dirs.append(model_dir)
+
+        if not timestamp_dirs:
+            # Fallback: look for any directories that might contain checkpoints
+            checkpoint_dirs = list(self.export_dir.glob("**/model"))
+            if not checkpoint_dirs:
+                # Final fallback: look directly in export_dir
+                checkpoint_dirs = [self.export_dir]
+            timestamp_dirs = checkpoint_dirs
+
+        if not timestamp_dirs:
+            raise ValueError(f"No checkpoint directories found in {self.export_dir}")
+
+        # Take the most recent directory (sort by name, which includes timestamp)
+        checkpoint_dir = sorted(timestamp_dirs)[-1]
+
+        # Find best model checkpoint - the training saves as "best.pkl"
+        best_model_path = checkpoint_dir / "best.pkl"
+        if not best_model_path.exists():
+            # Look for any .pkl files as fallback
+            pkl_files = list(checkpoint_dir.glob("*.pkl"))
+            pkl_files = [f for f in pkl_files if not f.name.startswith("stats_epoch_")]
+            if pkl_files:
+                best_model_path = pkl_files[0]  # Take the first non-epoch file
+                warnings.warn(f"No best.pkl found, using {best_model_path.name}")
+            else:
+                raise ValueError(f"No model checkpoints found in {checkpoint_dir}")
+
+        # Load checkpoint
+        print(f"Loading model from: {best_model_path}")
+        with open(best_model_path, "rb") as f:
+            checkpoint = pickle.load(f)
+
+        # Extract training configuration from checkpoint
+        self.training_config = checkpoint.get("training_config", {})
+
+        # Extract model configuration from checkpoint or training config
+        self.model_config = checkpoint.get("model_config", {})
+        if not self.model_config and self.training_config:
+            # Try to reconstruct from training config
+            self.model_config = {
+                "num_classes": self.training_config.get("num_classes", 2),
+                "base_channels": self.training_config.get("base_channels", 64),
+                "input_size": self.training_config.get("input_size", (512, 512)),
+                "model_id": self.training_config.get(
+                    "model_id", "facebook/dinov3-vitl16-pretrain-sat493m"
+                ),
+            }
+
+        # Initialize DINOv3
+        model_id = self.model_config.get(
+            "model_id", "facebook/dinov3-vitl16-pretrain-sat493m"
+        )
+        image_size = self.training_config.get("image_size", 512)
+
+        print(f"Initializing DINOv3 model: {model_id}")
+        self.dinov3_processor, self.dinov3_model, output_channels = initialize_dinov3(
+            model_id=model_id, image_size=image_size
+        )
+
+        # Create UNet model
+        num_classes = self.model_config.get("num_classes", 2)
+        base_channels = self.model_config.get("base_channels", 64)
+        input_size = self.model_config.get("input_size", (512, 512))
+
+        print(
+            f"Creating 2D UNet with {output_channels} input channels, {num_classes} classes"
+        )
+        self.unet = DINOv3UNet(
+            input_channels=output_channels,
+            num_classes=num_classes,
+            base_channels=base_channels,
+            input_size=input_size,
+        ).to(self.device)
+
+        # Load model weights - the training saves UNet weights as "unet_state_dict"
+        if "unet_state_dict" in checkpoint:
+            self.unet.load_state_dict(checkpoint["unet_state_dict"])
+        elif "model_state_dict" in checkpoint:
+            self.unet.load_state_dict(checkpoint["model_state_dict"])
+        elif "state_dict" in checkpoint:
+            self.unet.load_state_dict(checkpoint["state_dict"])
+        else:
+            # Assume the entire checkpoint is the state dict
+            self.unet.load_state_dict(checkpoint)
+
+        self.unet.eval()
+
+        print(f"✅ Model loaded successfully!")
+        print(f"   - Device: {self.device}")
+        print(f"   - Classes: {num_classes}")
+        print(f"   - Input size: {input_size}")
+        print(f"   - DINOv3 channels: {output_channels}")
+
+    def predict(
+        self, image: np.ndarray, return_probabilities: bool = False
+    ) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
+        """
+        Run inference on a single 2D image.
+
+        Args:
+            image: Input image as numpy array (H, W) or (H, W, C)
+            return_probabilities: If True, return both predictions and probabilities
+
+        Returns:
+            predictions: Predicted class labels (H, W)
+            probabilities: Class probabilities (num_classes, H, W) if return_probabilities=True
+        """
+        # Ensure image is 2D
+        if image.ndim == 3 and image.shape[2] == 1:
+            image = image.squeeze(2)
+        elif image.ndim == 3:
+            # Convert to grayscale if RGB
+            image = np.mean(image, axis=2)
+
+        # Process through DINOv3
+        features = process(image[np.newaxis, ...])  # Add batch dimension
+
+        # Convert to tensor and move to device
+        features_tensor = torch.from_numpy(features).float().to(self.device)
+
+        # Run through UNet
+        with torch.no_grad():
+            logits = self.unet(features_tensor)
+            probabilities = torch.softmax(logits, dim=1)
+            predictions = torch.argmax(logits, dim=1)
+
+        # Convert back to numpy
+        predictions_np = predictions[0].cpu().numpy()
+        probabilities_np = probabilities[0].cpu().numpy()
+
+        if return_probabilities:
+            return predictions_np, probabilities_np
+        else:
+            return predictions_np
+
+    def predict_batch(
+        self, images: np.ndarray, return_probabilities: bool = False
+    ) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
+        """
+        Run inference on a batch of 2D images.
+
+        Args:
+            images: Input images as numpy array (N, H, W) or (N, H, W, C)
+            return_probabilities: If True, return both predictions and probabilities
+
+        Returns:
+            predictions: Predicted class labels (N, H, W)
+            probabilities: Class probabilities (N, num_classes, H, W) if return_probabilities=True
+        """
+        batch_predictions = []
+        batch_probabilities = []
+
+        for i in range(images.shape[0]):
+            if return_probabilities:
+                pred, prob = self.predict(images[i], return_probabilities=True)
+                batch_predictions.append(pred)
+                batch_probabilities.append(prob)
+            else:
+                pred = self.predict(images[i], return_probabilities=False)
+                batch_predictions.append(pred)
+
+        predictions_np = np.stack(batch_predictions, axis=0)
+
+        if return_probabilities:
+            probabilities_np = np.stack(batch_probabilities, axis=0)
+            return predictions_np, probabilities_np
+        else:
+            return predictions_np
+
+    def get_model_info(self) -> Dict[str, Any]:
+        """Get information about the loaded model."""
+        return {
+            "model_type": "2D UNet",
+            "num_classes": self.model_config.get("num_classes", 2),
+            "base_channels": self.model_config.get("base_channels", 64),
+            "input_size": self.model_config.get("input_size", (512, 512)),
+            "dinov3_model": self.model_config.get("model_id", "unknown"),
+            "device": str(self.device),
+            "export_dir": str(self.export_dir),
+        }
+
+
+class DINOv3UNet3DInference:
+    """
+    Easy-to-use inference class for 3D DINOv3 UNet models.
+
+    Automatically loads the best model weights and DINOv3 configuration
+    from a training export directory.
+    """
+
+    def __init__(self, export_dir: str, device: Optional[str] = None):
+        """
+        Initialize the 3D inference class.
+
+        Args:
+            export_dir: Path to the training export directory containing checkpoints
+            device: Device to run inference on ('cuda', 'cpu', or None for auto)
+        """
+        self.export_dir = Path(export_dir)
+        self.device = torch.device(
+            device if device else ("cuda" if torch.cuda.is_available() else "cpu")
+        )
+
+        # Model components
+        self.unet3d = None
+        self.pipeline = None
+        self.data_loader = None
+        self.model_config = None
+        self.training_config = None
+
+        # Load the model
+        self._load_model()
+
+    def _load_model(self):
+        """Load the best 3D model weights and configuration."""
+        # Find checkpoint directory - look for timestamped directories
+        # Structure: export_dir/model_type_model_id/timestamp/model/
+        timestamp_dirs = []
+        for path in self.export_dir.iterdir():
+            if path.is_dir():
+                # Look for model subdirectories
+                model_dir = path / "model"
+                if model_dir.exists():
+                    timestamp_dirs.append(model_dir)
+
+        if not timestamp_dirs:
+            # Fallback: look for any directories that might contain checkpoints
+            checkpoint_dirs = list(self.export_dir.glob("**/model"))
+            if not checkpoint_dirs:
+                # Final fallback: look directly in export_dir
+                checkpoint_dirs = [self.export_dir]
+            timestamp_dirs = checkpoint_dirs
+
+        if not timestamp_dirs:
+            raise ValueError(f"No checkpoint directories found in {self.export_dir}")
+
+        # Take the most recent directory (sort by name, which includes timestamp)
+        checkpoint_dir = sorted(timestamp_dirs)[-1]
+
+        # Find best model checkpoint - the training saves as "best.pkl"
+        best_model_path = checkpoint_dir / "best.pkl"
+        if not best_model_path.exists():
+            # Look for any .pkl files as fallback
+            pkl_files = list(checkpoint_dir.glob("*.pkl"))
+            pkl_files = [f for f in pkl_files if not f.name.startswith("stats_epoch_")]
+            if pkl_files:
+                best_model_path = pkl_files[0]  # Take the first non-epoch file
+                warnings.warn(f"No best.pkl found, using {best_model_path.name}")
+            else:
+                raise ValueError(f"No model checkpoints found in {checkpoint_dir}")
+
+        # Load checkpoint
+        print(f"Loading 3D model from: {best_model_path}")
+        with open(best_model_path, "rb") as f:
+            checkpoint = pickle.load(f)
+
+        # Extract training configuration from checkpoint
+        self.training_config = checkpoint.get("training_config", {})
+
+        # Extract model configuration
+        self.model_config = checkpoint.get("model_config", {})
+        if not self.model_config and self.training_config:
+            self.model_config = {
+                "num_classes": self.training_config.get("num_classes", 2),
+                "base_channels": self.training_config.get("base_channels", 64),
+                "input_size": self.training_config.get(
+                    "target_volume_size", (128, 128, 128)
+                ),
+                "dinov3_slice_size": self.training_config.get("dinov3_slice_size", 512),
+                "model_id": self.training_config.get(
+                    "model_id", "facebook/dinov3-vitl16-pretrain-sat493m"
+                ),
+            }
+
+        # Initialize DINOv3
+        model_id = self.model_config.get(
+            "model_id", "facebook/dinov3-vitl16-pretrain-sat493m"
+        )
+        image_size = self.training_config.get("image_size", 512)
+
+        print(f"Initializing DINOv3 model: {model_id}")
+        processor, model, output_channels = initialize_dinov3(
+            model_id=model_id, image_size=image_size
+        )
+
+        # Create 3D UNet model
+        num_classes = self.model_config.get("num_classes", 2)
+        base_channels = self.model_config.get("base_channels", 64)
+        input_size = self.model_config.get("input_size", (128, 128, 128))
+        dinov3_slice_size = self.model_config.get("dinov3_slice_size", 512)
+
+        print(
+            f"Creating 3D UNet with {output_channels} input channels, {num_classes} classes"
+        )
+        self.unet3d = DINOv3UNet3D(
+            input_channels=output_channels,
+            num_classes=num_classes,
+            base_channels=base_channels,
+            input_size=input_size,
+        ).to(self.device)
+
+        # Load model weights - the training saves 3D UNet weights as "unet3d_state_dict"
+        if "unet3d_state_dict" in checkpoint:
+            self.unet3d.load_state_dict(checkpoint["unet3d_state_dict"])
+        elif "model_state_dict" in checkpoint:
+            self.unet3d.load_state_dict(checkpoint["model_state_dict"])
+        elif "state_dict" in checkpoint:
+            self.unet3d.load_state_dict(checkpoint["state_dict"])
+        else:
+            self.unet3d.load_state_dict(checkpoint)
+
+        self.unet3d.eval()
+
+        # Create pipeline for easier inference
+        self.pipeline = DINOv3UNet3DPipeline(
+            num_classes=num_classes,
+            input_size=input_size,
+            dinov3_slice_size=dinov3_slice_size,
+            base_channels=base_channels,
+            device=self.device,
+        )
+        # Replace the pipeline's UNet with our trained model
+        self.pipeline.unet3d = self.unet3d
+
+        # Create minimal data loader for feature extraction compatibility
+        # Use dummy 4D data with correct shape
+        dummy_volume = np.zeros((2, *input_size), dtype=np.float32)  # 2 dummy volumes
+        self.data_loader = MemoryEfficientDataLoader3D(
+            raw_data=dummy_volume,
+            gt_data=dummy_volume,
+            train_volume_pool_size=1,
+            val_volume_pool_size=1,
+            target_volume_size=input_size,
+            seed=42,
+            model_id=model_id,
+        )
+
+        print(f"✅ 3D Model loaded successfully!")
+        print(f"   - Device: {self.device}")
+        print(f"   - Classes: {num_classes}")
+        print(f"   - Volume size: {input_size}")
+        print(f"   - DINOv3 channels: {output_channels}")
+
+    def predict(
+        self, volume: np.ndarray, return_probabilities: bool = False
+    ) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
+        """
+        Run inference on a single 3D volume.
+
+        Args:
+            volume: Input volume as numpy array (D, H, W)
+            return_probabilities: If True, return both predictions and probabilities
+
+        Returns:
+            predictions: Predicted class labels (D, H, W)
+            probabilities: Class probabilities (num_classes, D, H, W) if return_probabilities=True
+        """
+        # Ensure volume is 3D
+        if volume.ndim != 3:
+            raise ValueError(f"Expected 3D volume, got shape {volume.shape}")
+
+        # Add batch dimension and extract features
+        volume_batch = volume[np.newaxis, ...]  # (1, D, H, W)
+
+        # Extract DINOv3 features
+        features = self.data_loader.extract_dinov3_features_3d(volume_batch)
+
+        # Run through 3D UNet
+        with torch.no_grad():
+            logits = self.unet3d(features)
+            probabilities = torch.softmax(logits, dim=1)
+            predictions = torch.argmax(logits, dim=1)
+
+        # Convert back to numpy
+        predictions_np = predictions[0].cpu().numpy()
+        probabilities_np = probabilities[0].cpu().numpy()
+
+        if return_probabilities:
+            return predictions_np, probabilities_np
+        else:
+            return predictions_np
+
+    def predict_large_volume(
+        self,
+        volume: np.ndarray,
+        chunk_size: int = 64,
+        overlap: int = 16,
+        return_probabilities: bool = False,
+    ) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
+        """
+        Run inference on a large 3D volume using sliding window approach.
+
+        Args:
+            volume: Input volume as numpy array (D, H, W)
+            chunk_size: Size of chunks to process
+            overlap: Overlap between chunks
+            return_probabilities: If True, return both predictions and probabilities
+
+        Returns:
+            predictions: Predicted class labels (D, H, W)
+            probabilities: Class probabilities (num_classes, D, H, W) if return_probabilities=True
+        """
+        if return_probabilities:
+            predictions, probabilities = self.pipeline.predict_large_volume(
+                volume,
+                chunk_size=chunk_size,
+                overlap=overlap,
+                return_probabilities=True,
+            )
+            return predictions, probabilities
+        else:
+            predictions = self.pipeline.predict_large_volume(
+                volume,
+                chunk_size=chunk_size,
+                overlap=overlap,
+                return_probabilities=False,
+            )
+            return predictions
+
+    def predict_batch(
+        self, volumes: np.ndarray, return_probabilities: bool = False
+    ) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
+        """
+        Run inference on a batch of 3D volumes.
+
+        Args:
+            volumes: Input volumes as numpy array (N, D, H, W)
+            return_probabilities: If True, return both predictions and probabilities
+
+        Returns:
+            predictions: Predicted class labels (N, D, H, W)
+            probabilities: Class probabilities (N, num_classes, D, H, W) if return_probabilities=True
+        """
+        batch_predictions = []
+        batch_probabilities = []
+
+        for i in range(volumes.shape[0]):
+            if return_probabilities:
+                pred, prob = self.predict(volumes[i], return_probabilities=True)
+                batch_predictions.append(pred)
+                batch_probabilities.append(prob)
+            else:
+                pred = self.predict(volumes[i], return_probabilities=False)
+                batch_predictions.append(pred)
+
+        predictions_np = np.stack(batch_predictions, axis=0)
+
+        if return_probabilities:
+            probabilities_np = np.stack(batch_probabilities, axis=0)
+            return predictions_np, probabilities_np
+        else:
+            return predictions_np
+
+    def get_model_info(self) -> Dict[str, Any]:
+        """Get information about the loaded 3D model."""
+        return {
+            "model_type": "3D UNet",
+            "num_classes": self.model_config.get("num_classes", 2),
+            "base_channels": self.model_config.get("base_channels", 64),
+            "input_size": self.model_config.get("input_size", (128, 128, 128)),
+            "dinov3_slice_size": self.model_config.get("dinov3_slice_size", 512),
+            "dinov3_model": self.model_config.get("model_id", "unknown"),
+            "device": str(self.device),
+            "export_dir": str(self.export_dir),
+        }
+
+
+def load_inference_model(
+    export_dir: str, model_type: str = "auto", device: Optional[str] = None
+) -> Union[DINOv3UNetInference, DINOv3UNet3DInference]:
+    """
+    Convenience function to automatically load the appropriate inference model.
+
+    Args:
+        export_dir: Path to the training export directory
+        model_type: Type of model to load ('2d', '3d', or 'auto' to detect)
+        device: Device to run inference on
+
+    Returns:
+        Loaded inference model (2D or 3D)
+    """
+    export_path = Path(export_dir)
+
+    if model_type == "auto":
+        # Try to detect model type from training config embedded in best.pkl
+        # Find timestamp directories with model subdirectories
+        timestamp_dirs = []
+        for path in export_path.iterdir():
+            if path.is_dir():
+                model_dir = path / "model"
+                if model_dir.exists():
+                    timestamp_dirs.append(model_dir)
+
+        if not timestamp_dirs:
+            # Fallback: look for any directories that might contain checkpoints
+            checkpoint_dirs = list(export_path.glob("**/model"))
+            if not checkpoint_dirs:
+                checkpoint_dirs = [export_path]
+            timestamp_dirs = checkpoint_dirs
+
+        if timestamp_dirs:
+            # Take the most recent directory
+            checkpoint_dir = sorted(timestamp_dirs)[-1]
+            best_path = checkpoint_dir / "best.pkl"
+
+            if best_path.exists():
+                try:
+                    with open(best_path, "rb") as f:
+                        checkpoint = pickle.load(f)
+
+                    config = checkpoint.get("training_config", {})
+
+                    # Check for 3D-specific parameters
+                    if (
+                        any(
+                            key in config
+                            for key in [
+                                "target_volume_size",
+                                "volume_shape",
+                                "dinov3_slice_size",
+                                "volumes_per_batch",
+                            ]
+                        )
+                        or config.get("model_type") == "dinov3_unet3d"
+                    ):
+                        model_type = "3d"
+                    else:
+                        model_type = "2d"
+                except Exception as e:
+                    warnings.warn(f"Could not read checkpoint for auto-detection: {e}")
+                    model_type = "2d"
+            else:
+                # Default to 2D if can't determine
+                model_type = "2d"
+                warnings.warn("Could not determine model type, defaulting to 2D")
+        else:
+            model_type = "2d"
+            warnings.warn("No checkpoint directories found, defaulting to 2D")
+
+    if model_type == "3d":
+        return DINOv3UNet3DInference(export_dir, device)
+    else:
+        return DINOv3UNetInference(export_dir, device)
+
+
+# Example usage functions
+def demo_2d_inference(export_dir: str):
+    """Demonstrate how to use the 2D inference class."""
+    print("Loading 2D inference model...")
+    model = DINOv3UNetInference(export_dir)
+
+    print("Model info:", model.get_model_info())
+
+    # Create dummy test image
+    test_image = np.random.randint(0, 255, (512, 512), dtype=np.uint8)
+
+    # Run inference
+    predictions = model.predict(test_image)
+    predictions_with_prob, probabilities = model.predict(
+        test_image, return_probabilities=True
+    )
+
+    print(f"Input shape: {test_image.shape}")
+    print(f"Predictions shape: {predictions.shape}")
+    print(f"Probabilities shape: {probabilities.shape}")
+    print(f"Unique predictions: {np.unique(predictions)}")
+
+
+def demo_3d_inference(export_dir: str):
+    """Demonstrate how to use the 3D inference class."""
+    print("Loading 3D inference model...")
+    model = DINOv3UNet3DInference(export_dir)
+
+    print("Model info:", model.get_model_info())
+
+    # Create dummy test volume
+    test_volume = np.random.randint(0, 255, (128, 128, 128), dtype=np.uint8)
+
+    # Run inference
+    predictions = model.predict(test_volume)
+    predictions_with_prob, probabilities = model.predict(
+        test_volume, return_probabilities=True
+    )
+
+    print(f"Input shape: {test_volume.shape}")
+    print(f"Predictions shape: {predictions.shape}")
+    print(f"Probabilities shape: {probabilities.shape}")
+    print(f"Unique predictions: {np.unique(predictions)}")
