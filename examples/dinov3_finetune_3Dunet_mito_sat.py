@@ -13,9 +13,6 @@ Date: 2025-09-15
 import sys
 import os
 
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-
 import torch
 import torch.nn.functional as F
 import numpy as np
