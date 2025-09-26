@@ -26,9 +26,16 @@ from .dinov3_core import (
     apply_normalization_stats,
     output_channels,
 )
-from data_processing import sample_training_data
-from models import ImprovedClassifier, SimpleClassifier
-from model_training import balance_classes
+
+# Handle both relative and absolute imports
+try:
+    from .data_processing import sample_training_data
+    from .models import ImprovedClassifier, SimpleClassifier
+    from .model_training import balance_classes
+except ImportError:
+    from dinov3_playground.data_processing import sample_training_data
+    from dinov3_playground.models import ImprovedClassifier, SimpleClassifier
+    from dinov3_playground.model_training import balance_classes
 from torch.amp import autocast  # Updated import
 from torch.cuda.amp import GradScaler  # Keep GradScaler from cuda.amp
 
@@ -721,7 +728,7 @@ def train_classifier_memory_efficient(
     print(f"Validation set: {val_X.shape} features from {len(val_images)} images")
 
     # Initialize classifier
-    from models import ImprovedClassifier, SimpleClassifier
+    from .models import ImprovedClassifier, SimpleClassifier
 
     if use_improved_classifier:
         classifier = ImprovedClassifier(
@@ -1001,7 +1008,7 @@ def train_unet_memory_efficient(
     )
 
     # Initialize UNet with correct input channels
-    from models import DINOv3UNet
+    from .models import DINOv3UNet
 
     unet = DINOv3UNet(
         input_channels=current_output_channels,
@@ -1359,7 +1366,7 @@ def train_3d_unet_memory_efficient_v2(
     )
 
     # Initialize 3D UNet
-    from models import DINOv3UNet3D
+    from .models import DINOv3UNet3D
 
     unet3d = DINOv3UNet3D(
         input_channels=current_output_channels,
