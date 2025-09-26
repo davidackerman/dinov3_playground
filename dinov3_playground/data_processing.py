@@ -1,0 +1,1064 @@
+"""
+Data Processing Module for DINOv3 Training
+
+This module contains functions for:
+- Data sampling and augmentation
+- Image preprocessing and resizing
+- Data splitting and preparation
+
+Author: GitHub Copilot
+Date: 2025-09-11
+"""
+
+import numpy as np
+from scipy import ndimage
+from skimage import transform, exposure
+import random
+from funlib.geometry import Roi
+from cellmap_flow.image_data_interface import ImageDataInterface
+import warnings  # Add this import at the top
+
+
+def apply_augmentation(raw_patch, gt_patch):
+    """
+    Apply data augmentation to raw and ground truth patches.
+
+    Parameters:
+    -----------
+    raw_patch : numpy.ndarray
+        Raw image patch (2D)
+    gt_patch : numpy.ndarray
+        Ground truth patch (2D)
+
+    Returns:
+    --------
+    tuple: (augmented_raw, augmented_gt)
+    """
+    import numpy as np
+    from scipy import ndimage
+    from skimage import exposure
+
+    # Random rotation (0, 90, 180, 270 degrees)
+    if np.random.random() < 0.5:
+        k = np.random.choice([1, 2, 3])  # 90, 180, 270 degrees
+        raw_patch = np.rot90(raw_patch, k)
+        gt_patch = np.rot90(gt_patch, k)
+
+    # Random flipping
+    if np.random.random() < 0.5:
+        raw_patch = np.fliplr(raw_patch)  # Horizontal flip
+        gt_patch = np.fliplr(gt_patch)
+
+    if np.random.random() < 0.5:
+        raw_patch = np.flipud(raw_patch)  # Vertical flip
+        gt_patch = np.flipud(gt_patch)
+
+    # Intensity augmentation (only for raw image)
+    if np.random.random() < 0.7:
+        # Random brightness adjustment
+        brightness_factor = np.random.uniform(0.8, 1.2)
+        raw_patch = np.clip(raw_patch * brightness_factor, 0, 255)
+
+        # Random contrast adjustment
+        if np.random.random() < 0.5:
+            contrast_factor = np.random.uniform(0.8, 1.2)
+            mean_val = np.mean(raw_patch)
+            raw_patch = np.clip(
+                (raw_patch - mean_val) * contrast_factor + mean_val, 0, 255
+            )
+
+    # Gaussian noise (only for raw image)
+    if np.random.random() < 0.3:
+        noise_std = np.random.uniform(0, 5)
+        noise = np.random.normal(0, noise_std, raw_patch.shape)
+        raw_patch = np.clip(raw_patch + noise, 0, 255)
+
+    return raw_patch.astype(raw_patch.dtype), gt_patch.astype(gt_patch.dtype)
+
+
+def sample_training_data(
+    raw_data,
+    gt_data,
+    target_size=224,
+    num_samples=10,
+    method="flexible",
+    seed=None,
+    use_augmentation=True,
+    return_dataset_sources=False,
+):
+    """
+    Sample training patches from raw and ground truth data.
+
+    Parameters:
+    -----------
+    raw_data : numpy.ndarray
+        3D raw image data (z, y, x)
+    gt_data : numpy.ndarray
+        3D ground truth data (z, y, x)
+    target_size : int, default=224
+        Size of output patches (target_size x target_size)
+    num_samples : int, default=10
+        Number of patches to sample
+    method : str, default="flexible"
+        Sampling method: "random", "grid", or "flexible"
+    seed : int, optional
+        Random seed for reproducibility
+    use_augmentation : bool, default=True
+        Whether to apply data augmentation
+    return_dataset_sources : bool, default=False
+        Whether to return dataset source indices (for compatibility)
+
+    Returns:
+    --------
+    tuple: (sampled_images, sampled_gt) or (sampled_images, sampled_gt, dataset_sources)
+           if return_dataset_sources=True
+    """
+    if seed is not None:
+        np.random.seed(seed)
+
+    z_max, y_max, x_max = raw_data.shape
+
+    # Sample patches
+    sampled_images = []
+    sampled_gt = []
+
+    for i in range(num_samples):
+        if method == "random":
+            # Random sampling from entire volume
+            z = np.random.randint(0, z_max)
+            y = np.random.randint(0, max(1, y_max - target_size))
+            x = np.random.randint(0, max(1, x_max - target_size))
+
+        elif method == "grid":
+            # Grid-based sampling
+            grid_size = int(np.ceil(np.sqrt(num_samples)))
+            row = i // grid_size
+            col = i % grid_size
+
+            z = np.random.randint(0, z_max)
+            y = min(row * (y_max // grid_size), y_max - target_size)
+            x = min(col * (x_max // grid_size), x_max - target_size)
+
+        elif method == "flexible":
+            # Flexible sampling with boundary handling
+            z = np.random.randint(0, z_max)
+
+            if y_max >= target_size:
+                y = np.random.randint(0, y_max - target_size + 1)
+            else:
+                y = 0
+
+            if x_max >= target_size:
+                x = np.random.randint(0, x_max - target_size + 1)
+            else:
+                x = 0
+
+        else:
+            raise ValueError(f"Unknown sampling method: {method}")
+
+        # Extract patch
+        y_end = min(y + target_size, y_max)
+        x_end = min(x + target_size, x_max)
+
+        raw_patch = raw_data[z, y:y_end, x:x_end]
+        gt_patch = gt_data[z, y:y_end, x:x_end]
+
+        # Resize if necessary
+        if raw_patch.shape != (target_size, target_size):
+            raw_patch = transform.resize(
+                raw_patch,
+                (target_size, target_size),
+                preserve_range=True,
+                anti_aliasing=True,
+            ).astype(raw_data.dtype)
+
+            gt_patch = transform.resize(
+                gt_patch,
+                (target_size, target_size),
+                preserve_range=True,
+                anti_aliasing=False,
+                order=0,
+            ).astype(gt_data.dtype)
+
+        # Apply augmentation if requested
+        if use_augmentation:
+            raw_patch, gt_patch = apply_augmentation(raw_patch, gt_patch)
+
+        sampled_images.append(raw_patch)
+        sampled_gt.append(gt_patch)
+
+    sampled_images = np.array(sampled_images)
+    sampled_gt = np.array(sampled_gt)
+
+    if return_dataset_sources:
+        # For single dataset, all samples come from dataset 0
+        dataset_sources = [0] * num_samples
+        return sampled_images, sampled_gt, dataset_sources
+    else:
+        return sampled_images, sampled_gt
+
+
+def apply_intensity_augmentation(raw_slice, augment_prob=0.7):
+    """
+    Apply intensity-based data augmentation to raw image slice.
+
+    Parameters:
+    -----------
+    raw_slice : numpy.ndarray
+        Input image slice
+    augment_prob : float, default=0.7
+        Probability of applying each augmentation
+
+    Returns:
+    --------
+    numpy.ndarray: Augmented image slice
+    """
+    augmented = raw_slice.copy()
+
+    if np.random.random() < augment_prob:
+        # Brightness adjustment
+        brightness_factor = np.random.uniform(0.8, 1.2)
+        augmented = augmented * brightness_factor
+
+    if np.random.random() < augment_prob:
+        # Contrast adjustment using histogram stretching
+        p2, p98 = np.percentile(augmented, (2, 98))
+        augmented = exposure.rescale_intensity(augmented, in_range=(p2, p98))
+
+    if np.random.random() < augment_prob:
+        # Gamma correction
+        gamma = np.random.uniform(0.8, 1.2)
+        augmented = exposure.adjust_gamma(augmented, gamma)
+
+    if np.random.random() < augment_prob:
+        # Add slight Gaussian noise
+        noise_std = np.random.uniform(0.01, 0.05) * np.std(augmented)
+        noise = np.random.normal(0, noise_std, augmented.shape)
+        augmented = augmented + noise
+
+    return augmented
+
+
+def resize_and_crop_to_target(
+    raw_slice, gt_slice, target_size, resize_method="crop_or_pad", use_augmentation=True
+):
+    """
+    Resize and crop image slices to target size with optional augmentation.
+
+    Parameters:
+    -----------
+    raw_slice : numpy.ndarray
+        Raw image slice
+    gt_slice : numpy.ndarray
+        Ground truth slice
+    target_size : int
+        Target output size
+    resize_method : str, default='crop_or_pad'
+        Method: 'resize', 'crop_or_pad', or 'random_crop'
+    use_augmentation : bool, default=True
+        Whether to apply augmentation
+
+    Returns:
+    --------
+    tuple: (processed_raw, processed_gt)
+    """
+    h, w = raw_slice.shape
+
+    if resize_method == "resize":
+        # Simple resize to target size
+        raw_resized = transform.resize(
+            raw_slice, (target_size, target_size), preserve_range=True
+        )
+        gt_resized = transform.resize(
+            gt_slice, (target_size, target_size), preserve_range=True, order=0
+        )  # Nearest neighbor for labels
+
+    elif resize_method == "crop_or_pad":
+        # Crop or pad to target size
+        raw_resized = crop_or_pad_to_size(raw_slice, target_size)
+        gt_resized = crop_or_pad_to_size(gt_slice, target_size)
+
+    elif resize_method == "random_crop" and min(h, w) >= target_size:
+        # Random crop if image is large enough
+        top = np.random.randint(0, h - target_size + 1)
+        left = np.random.randint(0, w - target_size + 1)
+        raw_resized = raw_slice[top : top + target_size, left : left + target_size]
+        gt_resized = gt_slice[top : top + target_size, left : left + target_size]
+
+    else:
+        # Fall back to crop_or_pad if random_crop can't be applied
+        raw_resized = crop_or_pad_to_size(raw_slice, target_size)
+        gt_resized = crop_or_pad_to_size(gt_slice, target_size)
+
+    # Apply augmentation if requested
+    if use_augmentation:
+        # Intensity augmentation on raw data
+        raw_resized = apply_intensity_augmentation(raw_resized)
+
+        # Geometric augmentation on both raw and GT
+        if np.random.random() < 0.5:
+            # Random rotation
+            angle = np.random.uniform(-15, 15)
+            raw_resized = ndimage.rotate(raw_resized, angle, reshape=False, order=1)
+            gt_resized = ndimage.rotate(gt_resized, angle, reshape=False, order=0)
+
+        if np.random.random() < 0.5:
+            # Random horizontal flip
+            raw_resized = np.fliplr(raw_resized)
+            gt_resized = np.fliplr(gt_resized)
+
+        if np.random.random() < 0.5:
+            # Random vertical flip
+            raw_resized = np.flipud(raw_resized)
+            gt_resized = np.flipud(gt_resized)
+
+    return raw_resized.astype(np.float32), gt_resized.astype(np.int64)
+
+
+def crop_or_pad_to_size(image, target_size):
+    """
+    Crop or pad image to target size.
+
+    Parameters:
+    -----------
+    image : numpy.ndarray
+        Input image
+    target_size : int
+        Target size
+
+    Returns:
+    --------
+    numpy.ndarray: Processed image of size (target_size, target_size)
+    """
+    h, w = image.shape
+
+    # Calculate padding or cropping needed
+    pad_h = max(0, target_size - h)
+    pad_w = max(0, target_size - w)
+    crop_h = max(0, h - target_size)
+    crop_w = max(0, w - target_size)
+
+    # Apply padding if needed
+    if pad_h > 0 or pad_w > 0:
+        pad_top = pad_h // 2
+        pad_bottom = pad_h - pad_top
+        pad_left = pad_w // 2
+        pad_right = pad_w - pad_left
+
+        image = np.pad(
+            image, ((pad_top, pad_bottom), (pad_left, pad_right)), mode="reflect"
+        )
+
+    # Apply cropping if needed
+    if crop_h > 0 or crop_w > 0:
+        crop_top = crop_h // 2
+        crop_left = crop_w // 2
+        image = image[
+            crop_top : crop_top + target_size, crop_left : crop_left + target_size
+        ]
+
+    return image
+
+
+def create_image_level_split_demo():
+    """
+    Create a demonstration of proper image-level train/validation splitting.
+
+    This function shows how to split data at the image level to prevent data leakage.
+    """
+    print("=" * 60)
+    print("IMAGE-LEVEL TRAIN/VALIDATION SPLITTING DEMONSTRATION")
+    print("=" * 60)
+
+    # Simulate image sampling with image indices
+    n_images = 20
+    pixels_per_image = 1000
+
+    # Create mock image indices for all pixels
+    image_indices = []
+    for img_idx in range(n_images):
+        image_indices.extend([img_idx] * pixels_per_image)
+    image_indices = np.array(image_indices)
+
+    print(f"Total images: {n_images}")
+    print(f"Pixels per image: {pixels_per_image}")
+    print(f"Total pixels: {len(image_indices)}")
+
+    # Get unique images for splitting
+    unique_images = np.unique(image_indices)
+    np.random.shuffle(unique_images)
+
+    # Split images 80/20
+    split_idx = int(0.8 * len(unique_images))
+    train_images = unique_images[:split_idx]
+    val_images = unique_images[split_idx:]
+
+    print(f"\nImage-level split:")
+    print(f"Training images: {len(train_images)} ({train_images})")
+    print(f"Validation images: {len(val_images)} ({val_images})")
+
+    # Create pixel-level masks
+    train_mask = np.isin(image_indices, train_images)
+    val_mask = np.isin(image_indices, val_images)
+
+    print(f"\nPixel-level results:")
+    print(f"Training pixels: {train_mask.sum()}")
+    print(f"Validation pixels: {val_mask.sum()}")
+    print(f"Total: {train_mask.sum() + val_mask.sum()}")
+
+    # Verify no overlap
+    overlap = np.intersect1d(train_images, val_images)
+    print(f"Image overlap: {len(overlap)} (should be 0)")
+
+    return {
+        "train_images": train_images,
+        "val_images": val_images,
+        "train_mask": train_mask,
+        "val_mask": val_mask,
+        "image_indices": image_indices,
+    }
+
+
+def _sample_with_random_orientations(
+    dataset_pairs, crop_shape, base_resolution, min_label_fraction, max_attempts, seed
+):
+    """
+    Sample slices from random orientations and stack them to form the target shape.
+    """
+    target_z, target_y, target_x = crop_shape
+
+    # Determine the main plane (the one with thickness > 1)
+    if target_z > 1 and target_y == target_x:
+        # Z is the thick dimension, Y and X are the plane dimensions
+        plane_size = target_y
+        num_slices = target_z
+        output_shape = (target_z, target_y, target_x)
+    elif target_y > 1 and target_z == target_x:
+        # Y is the thick dimension
+        plane_size = target_z
+        num_slices = target_y
+        output_shape = (target_z, target_y, target_x)
+    elif target_x > 1 and target_z == target_y:
+        # X is the thick dimension
+        plane_size = target_z
+        num_slices = target_x
+        output_shape = (target_z, target_y, target_x)
+    else:
+        # All dimensions are similar, treat as a 3D block
+        print("  Treating as 3D block (no dominant plane)")
+        result = _sample_single_orientation(
+            dataset_pairs,
+            crop_shape,
+            base_resolution,
+            min_label_fraction,
+            max_attempts,
+            seed,
+        )
+        if result[0] is not None:
+            return result[0], result[1], [result[2]]  # Add dataset info as list
+        else:
+            return None, None, []
+
+    print(
+        f"  Sampling {num_slices} slices of size {plane_size}x{plane_size} from random orientations"
+    )
+
+    # Collect slices from different orientations
+    raw_slices = []
+    gt_slices = []
+    dataset_sources = []
+
+    for slice_idx in range(num_slices):
+        print(f"  Sampling slice {slice_idx + 1}/{num_slices}...")
+
+        # Randomly choose orientation for this slice
+        orientation = np.random.choice(["xy", "xz", "yz"])
+
+        # Define slice shape based on orientation
+        if orientation == "xy":
+            slice_shape = (1, plane_size, plane_size)  # (z, y, x)
+        elif orientation == "xz":
+            slice_shape = (plane_size, 1, plane_size)  # (z, y, x)
+        elif orientation == "yz":
+            slice_shape = (plane_size, plane_size, 1)  # (z, y, x)
+
+        print(f"    Orientation: {orientation}, shape: {slice_shape}")
+
+        # Sample this slice
+        result = _sample_single_orientation(
+            dataset_pairs,
+            slice_shape,
+            base_resolution,
+            min_label_fraction,
+            max_attempts // num_slices,
+            seed + slice_idx if seed else None,
+        )
+
+        raw_slice, gt_slice, dataset_idx = result
+
+        if raw_slice is None or gt_slice is None:
+            print(f"    Failed to find valid slice for orientation {orientation}")
+            continue
+
+        # Reshape slice to 2D for consistent handling
+        raw_2d = _extract_2d_from_3d(raw_slice, orientation)
+        gt_2d = _extract_2d_from_3d(gt_slice, orientation)
+
+        raw_slices.append(raw_2d)
+        gt_slices.append(gt_2d)
+        dataset_sources.append(dataset_idx)
+
+    if len(raw_slices) == 0:
+        print("  Failed to sample any valid slices")
+        return None, None, []
+
+    # If we don't have enough slices, repeat some randomly
+    while len(raw_slices) < num_slices:
+        idx = np.random.randint(0, len(raw_slices))
+        raw_slices.append(raw_slices[idx])
+        gt_slices.append(gt_slices[idx])
+        dataset_sources.append(dataset_sources[idx])
+
+    # Stack slices into the target shape
+    raw_stacked, gt_stacked = _stack_slices_to_target_shape(
+        raw_slices[:num_slices], gt_slices[:num_slices], output_shape
+    )
+
+    print(
+        f"  Successfully stacked {len(raw_slices)} slices into shape {raw_stacked.shape}"
+    )
+
+    return raw_stacked, gt_stacked, dataset_sources[:num_slices]
+
+
+def _extract_2d_from_3d(data_3d, orientation):
+    """
+    Extract 2D slice from 3D data based on orientation.
+    """
+    if orientation == "xy":
+        return data_3d[0, :, :]  # Remove z dimension
+    elif orientation == "xz":
+        return data_3d[:, 0, :]  # Remove y dimension
+    elif orientation == "yz":
+        return data_3d[:, :, 0]  # Remove x dimension
+    else:
+        raise ValueError(f"Unknown orientation: {orientation}")
+
+
+def _stack_slices_to_target_shape(raw_slices, gt_slices, target_shape):
+    """
+    Stack 2D slices into the target 3D shape.
+    """
+    target_z, target_y, target_x = target_shape
+
+    # Initialize output arrays
+    raw_output = np.zeros(target_shape, dtype=raw_slices[0].dtype)
+    gt_output = np.zeros(target_shape, dtype=gt_slices[0].dtype)
+
+    # Determine stacking direction based on target shape
+    if target_z > 1 and target_y == target_x:
+        # Stack along Z dimension
+        for i, (raw_slice, gt_slice) in enumerate(zip(raw_slices, gt_slices)):
+            # Resize slice to match Y, X dimensions if needed
+            if raw_slice.shape != (target_y, target_x):
+                from skimage import transform
+
+                raw_slice = transform.resize(
+                    raw_slice, (target_y, target_x), preserve_range=True
+                )
+                gt_slice = transform.resize(
+                    gt_slice, (target_y, target_x), preserve_range=True, order=0
+                )
+
+            raw_output[i, :, :] = raw_slice
+            gt_output[i, :, :] = gt_slice
+
+    elif target_y > 1 and target_z == target_x:
+        # Stack along Y dimension
+        for i, (raw_slice, gt_slice) in enumerate(zip(raw_slices, gt_slices)):
+            if raw_slice.shape != (target_z, target_x):
+                from skimage import transform
+
+                raw_slice = transform.resize(
+                    raw_slice, (target_z, target_x), preserve_range=True
+                )
+                gt_slice = transform.resize(
+                    gt_slice, (target_z, target_x), preserve_range=True, order=0
+                )
+
+            raw_output[:, i, :] = raw_slice
+            gt_output[:, i, :] = gt_slice
+
+    elif target_x > 1 and target_z == target_y:
+        # Stack along X dimension
+        for i, (raw_slice, gt_slice) in enumerate(zip(raw_slices, gt_slices)):
+            if raw_slice.shape != (target_z, target_y):
+                from skimage import transform
+
+                raw_slice = transform.resize(
+                    raw_slice, (target_z, target_y), preserve_range=True
+                )
+                gt_slice = transform.resize(
+                    gt_slice, (target_z, target_y), preserve_range=True, order=0
+                )
+
+            raw_output[:, :, i] = raw_slice
+            gt_output[:, :, i] = gt_slice
+
+    return raw_output, gt_output
+
+
+def _sample_single_orientation(
+    dataset_pairs, crop_shape, base_resolution, min_label_fraction, max_attempts, seed
+):
+    """
+    Sample a single crop from datasets (original functionality).
+    Now returns dataset index as well.
+    """
+    if seed is not None:
+        np.random.seed(seed)
+
+    # Convert crop shape to nm
+    crop_shape_nm = np.array(crop_shape) * base_resolution
+
+    # Randomly shuffle dataset order
+    dataset_indices = list(range(len(dataset_pairs)))
+    np.random.shuffle(dataset_indices)
+
+    for dataset_idx in dataset_indices:
+        raw_path, gt_path = dataset_pairs[dataset_idx]
+
+        # try:
+        # Initialize data interfaces
+        raw_idi = ImageDataInterface(raw_path, output_voxel_size=3 * [base_resolution])
+        gt_idi = ImageDataInterface(gt_path, output_voxel_size=3 * [base_resolution])
+
+        # Get bounds
+        raw_begin = np.array(raw_idi.roi.begin)
+        raw_end = np.array(raw_idi.roi.end)
+        gt_begin = np.array(gt_idi.roi.begin)
+        gt_end = np.array(gt_idi.roi.end)
+
+        # Find overlapping region
+        overlap_begin = np.maximum(raw_begin, gt_begin)
+        overlap_end = np.minimum(raw_end, gt_end)
+        overlap_shape = overlap_end - overlap_begin
+
+        # Check if overlap is large enough for our crop
+        if np.any(overlap_shape < crop_shape_nm):
+            warnings.warn(
+                f"Dataset {dataset_idx} overlap {overlap_shape} is smaller than crop shape {crop_shape_nm}. "
+                f"ROI may extend beyond data bounds and will be padded with zeros.",
+                UserWarning,
+            )
+            # Don't skip - continue with sampling, allowing padding
+
+        # Calculate valid offset range (use data bounds even if smaller than crop)
+        # Allow offsets that may extend beyond data - ImageDataInterface will handle padding
+        data_begin = overlap_begin
+        data_end = overlap_end
+
+        # For offsets, we can start from the beginning of the overlap region
+        # and extend beyond if needed
+        min_offset = data_begin
+        max_offset = data_end - 1  # Allow at least 1 voxel overlap
+
+        # If the data is smaller than crop in any dimension, we may need negative offsets
+        # or offsets that extend beyond the data
+
+        allow_extension_beyond_roi = False
+        for i in range(3):
+            if overlap_shape[i] < crop_shape_nm[i]:
+                allow_extension_beyond_roi = True
+                # Data is smaller than crop - center the crop on the available data
+                center_offset = (
+                    data_begin[i] + overlap_shape[i] / 2 - crop_shape_nm[i] / 2
+                )
+                min_offset[i] = (
+                    center_offset - overlap_shape[i] / 4
+                )  # Allow some variation
+                max_offset[i] = center_offset + overlap_shape[i] / 4
+
+        # Round to base_resolution multiples
+        min_offset_aligned = (
+            np.floor(min_offset / base_resolution).astype(int) * base_resolution
+        )
+        max_offset_aligned = (
+            np.ceil(max_offset / base_resolution).astype(int) * base_resolution
+        )
+
+        # Ensure we have at least one valid offset
+        if np.any(max_offset_aligned < min_offset_aligned):
+            warnings.warn(
+                f"Dataset {dataset_idx} has no valid aligned offsets. Using center position.",
+                UserWarning,
+            )
+            # Use center of overlap region
+            center_offset = overlap_begin + overlap_shape / 2 - crop_shape_nm / 2
+            min_offset_aligned = (
+                np.floor(center_offset / base_resolution).astype(int) * base_resolution
+            )
+            max_offset_aligned = min_offset_aligned.copy()
+
+        # Try to find a valid crop from this dataset
+        for attempt in range(max_attempts):
+            # Generate random offset (multiple of base_resolution)
+            offset_multiples = []
+            for i in range(3):
+                min_mult = min_offset_aligned[i] // base_resolution
+                max_mult = max_offset_aligned[i] // base_resolution
+                if min_mult <= max_mult:
+                    offset_multiples.append(np.random.randint(min_mult, max_mult + 1))
+                else:
+                    offset_multiples.append(min_mult)
+
+            random_offset = np.array(offset_multiples) * base_resolution
+
+            # Create ROI (may extend beyond data bounds - that's OK)
+            roi = Roi(random_offset, crop_shape_nm)
+
+            # Check if ROI extends significantly beyond data bounds and warn
+            roi_begin = np.array(roi.begin)
+            roi_end = np.array(roi.end)
+            extends_before = np.any(roi_begin < overlap_begin)
+            extends_after = np.any(roi_end > overlap_end)
+
+            if extends_before or extends_after:
+                if allow_extension_beyond_roi:
+                    warnings.warn(
+                        f"Dataset {dataset_idx}: ROI {roi} extends beyond data bounds "
+                        f"[{overlap_begin} to {overlap_end}]. Will be padded with zeros.",
+                        UserWarning,
+                    )
+                else:
+                    continue  # Skip this ROI and try again
+            # try:
+            # First check GT to see if it has enough labels
+            gt_crop = gt_idi.to_ndarray_ts(roi)
+
+            # Convert to boolean if needed and calculate label fraction
+            if gt_crop.dtype != bool:
+                gt_crop = gt_crop > 0
+
+            label_fraction = np.sum(gt_crop) / gt_crop.size
+
+            if label_fraction >= min_label_fraction:
+                # Valid GT, now get raw data
+                raw_crop = raw_idi.to_ndarray_ts(roi)
+                return raw_crop, gt_crop.astype(bool), dataset_idx
+            # except Exception as e:
+            #         warnings.warn(f"Error accessing ROI {roi} in dataset {dataset_idx}: {e}", UserWarning)
+            #         continue
+
+        # If we get here, we couldn't find a valid crop with enough labels
+        warnings.warn(
+            f"Dataset {dataset_idx}: Could not find crop with sufficient labels "
+            f"(min_label_fraction={min_label_fraction}) after {max_attempts} attempts",
+            UserWarning,
+        )
+
+        # except Exception as e:
+        #     warnings.warn(f"Error accessing dataset {dataset_idx}: {e}", UserWarning)
+        #     continue
+
+    return None, None, -1
+
+
+def sample_from_multiple_datasets(
+    dataset_pairs,
+    crop_shape=(224, 224, 10),
+    base_resolution=32,
+    min_label_fraction=0.05,
+    max_attempts=1000,
+    seed=None,
+    random_orientations=True,
+):
+    """
+    Randomly sample crops from multiple datasets with validation.
+
+    Parameters:
+    -----------
+    dataset_pairs : list of tuples
+        List of (raw_path, gt_path) pairs
+    crop_shape : tuple, default=(224, 224, 10)
+        Shape of the crop in voxels (will be multiplied by base_resolution)
+    base_resolution : int, default=32
+        Base resolution in nm (offsets must be multiples of this)
+    min_label_fraction : float, default=0.05
+        Minimum fraction of non-zero labels required for valid GT
+    max_attempts : int, default=100
+        Maximum attempts to find a valid crop per dataset
+    seed : int, optional
+        Random seed for reproducibility
+    random_orientations : bool, default=True
+        If True, sample slices from random orientations and stack them
+
+    Returns:
+    --------
+    tuple: (raw_data, gt_data, dataset_sources) where dataset_sources indicates
+           which dataset each slice came from
+    """
+    if seed is not None:
+        np.random.seed(seed)
+
+    print(f"Sampling from {len(dataset_pairs)} datasets...")
+    print(f"Target crop shape: {crop_shape} voxels")
+    print(f"Base resolution: {base_resolution} nm")
+    print(f"Minimum label fraction: {min_label_fraction}")
+    print(f"Random orientations: {random_orientations}")
+
+    if random_orientations:
+        return _sample_with_random_orientations(
+            dataset_pairs,
+            crop_shape,
+            base_resolution,
+            min_label_fraction,
+            max_attempts,
+            seed,
+        )
+    else:
+        result = _sample_single_orientation(
+            dataset_pairs,
+            crop_shape,
+            base_resolution,
+            min_label_fraction,
+            max_attempts,
+            seed,
+        )
+        if result[0] is not None:
+            return result[0], result[1], [result[2]]  # Return as list for consistency
+        else:
+            return None, None, []
+
+
+def load_random_training_data(
+    dataset_pairs,
+    crop_shape=(224, 224, 10),
+    base_resolution=32,
+    min_label_fraction=0.05,
+    seed=None,
+    random_orientations=True,
+):
+    """
+    Load random training data from multiple datasets.
+
+    Parameters:
+    -----------
+    dataset_pairs : list of tuples
+        List of (raw_path, gt_path) pairs
+    crop_shape : tuple, default=(224, 224, 10)
+        Shape of the crop in voxels
+    base_resolution : int, default=32
+        Base resolution in nm
+    min_label_fraction : float, default=0.05
+        Minimum fraction of non-zero labels required
+    seed : int, optional
+        Random seed for reproducibility
+    random_orientations : bool, default=True
+        If True, sample slices from random orientations and stack them
+
+    Returns:
+    --------
+    tuple: (raw_data, gt_data, dataset_sources) where dataset_sources indicates
+           which dataset each slice came from
+    """
+    raw, gt, dataset_sources = sample_from_multiple_datasets(
+        dataset_pairs=dataset_pairs,
+        crop_shape=crop_shape,
+        base_resolution=base_resolution,
+        min_label_fraction=min_label_fraction,
+        seed=seed,
+        random_orientations=random_orientations,
+    )
+
+    if raw is None or gt is None:
+        raise ValueError("Could not find valid training data from any dataset")
+
+    return raw, gt, dataset_sources
+
+
+# Example usage function
+def get_example_dataset_pairs():
+    """
+    Example dataset pairs for testing. Replace with your actual dataset paths.
+
+    Returns:
+    --------
+    list: List of (raw_path, gt_path) tuples
+    """
+    dataset_pairs = [
+        # Dataset 1
+        (
+            "/nrs/cellmap/data/jrc_22ak351-leaf-3mb/jrc_22ak351-leaf-3mb.zarr/recon-1/em/fibsem-uint8/s3",
+            "/groups/cellmap/cellmap/parkg/for Aubrey/3mb_s3.zarr/jrc_22ak351-leaf-3mb_nuc/s0",
+        ),
+        # Add more dataset pairs here
+        # (
+        #     "/path/to/raw2.zarr",
+        #     "/path/to/gt2.zarr"
+        # ),
+        # (
+        #     "/path/to/raw3.zarr",
+        #     "/path/to/gt3.zarr"
+        # ),
+    ]
+
+    return dataset_pairs
+
+
+# %%
+# Load random training data from multiple datasets (3D volumes)
+def load_random_3d_training_data(
+    dataset_pairs,
+    volume_shape,
+    base_resolution,
+    min_label_fraction=0.05,
+    num_volumes=10,
+    seed=42,
+):
+    """
+    Load random 3D volumes from multiple datasets for 3D UNet training.
+
+    Parameters:
+    -----------
+    dataset_pairs : list
+        List of (raw_path, gt_path) tuples
+    volume_shape : tuple
+        3D shape of volumes to sample (D, H, W), e.g., (64, 64, 64)
+    base_resolution : int
+        Resolution in nm for sampling
+    min_label_fraction : float
+        Minimum fraction of positive labels required
+    num_volumes : int
+        Number of 3D volumes to sample
+    seed : int
+        Random seed
+
+    Returns:
+    --------
+    tuple: (raw_volumes, gt_volumes, dataset_sources)
+           Each has shape (num_volumes, D, H, W)
+    """
+    if seed is not None:
+        np.random.seed(seed)
+
+    # Convert volume shape to nm
+    volume_shape_nm = np.array(volume_shape) * base_resolution
+
+    raw_volumes = []
+    gt_volumes = []
+    dataset_sources = []
+
+    print(
+        f"Sampling {num_volumes} volumes of shape {volume_shape} from {len(dataset_pairs)} datasets..."
+    )
+
+    volumes_collected = 0
+    max_attempts = num_volumes * 10  # Allow multiple attempts
+
+    for attempt in range(max_attempts):
+        if volumes_collected >= num_volumes:
+            break
+
+        # Randomly select a dataset
+        dataset_idx = np.random.randint(0, len(dataset_pairs))
+        raw_path, gt_path = dataset_pairs[dataset_idx]
+
+        try:
+            # Initialize data interfaces
+            raw_idi = ImageDataInterface(
+                raw_path, output_voxel_size=3 * [base_resolution]
+            )
+            gt_idi = ImageDataInterface(
+                gt_path, output_voxel_size=3 * [base_resolution]
+            )
+
+            # Get bounds
+            raw_begin = np.array(raw_idi.roi.begin)
+            raw_end = np.array(raw_idi.roi.end)
+            gt_begin = np.array(gt_idi.roi.begin)
+            gt_end = np.array(gt_idi.roi.end)
+
+            # Find overlapping region
+            overlap_begin = np.maximum(raw_begin, gt_begin)
+            overlap_end = np.minimum(raw_end, gt_end)
+            overlap_shape = overlap_end - overlap_begin
+
+            # Check if overlap is large enough for our volume
+            if np.any(overlap_shape < volume_shape_nm):
+                print(
+                    f"  Dataset {dataset_idx}: overlap {overlap_shape} too small for volume {volume_shape_nm}"
+                )
+                continue
+
+            # Calculate valid sampling region
+            max_offset = overlap_end - volume_shape_nm
+            min_offset = overlap_begin
+
+            if np.any(max_offset < min_offset):
+                print(f"  Dataset {dataset_idx}: no valid sampling region")
+                continue
+
+            # Generate random offset (aligned to base_resolution)
+            random_offset = []
+            for i in range(3):
+                min_mult = int(min_offset[i] // base_resolution)
+                max_mult = int(max_offset[i] // base_resolution)
+                offset_mult = np.random.randint(min_mult, max_mult + 1)
+                random_offset.append(offset_mult * base_resolution)
+
+            random_offset = np.array(random_offset)
+
+            # Create ROI for 3D volume
+            roi = Roi(random_offset, volume_shape_nm)
+
+            # Sample GT first to check label fraction
+            gt_volume = gt_idi.to_ndarray_ts(roi)
+
+            # Convert to boolean and check label fraction
+            if gt_volume.dtype != bool:
+                gt_volume_bool = gt_volume > 0
+            else:
+                gt_volume_bool = gt_volume
+
+            label_fraction = np.sum(gt_volume_bool) / gt_volume_bool.size
+
+            if label_fraction < min_label_fraction:
+                print(
+                    f"  Dataset {dataset_idx}: label fraction {label_fraction:.3f} too low"
+                )
+                continue
+
+            # Get raw volume
+            raw_volume = raw_idi.to_ndarray_ts(roi)
+
+            # Ensure correct shape
+            if raw_volume.shape != volume_shape or gt_volume_bool.shape != volume_shape:
+                print(
+                    f"  Dataset {dataset_idx}: shape mismatch - raw: {raw_volume.shape}, gt: {gt_volume_bool.shape}, expected: {volume_shape}"
+                )
+                continue
+
+            # Store the volumes
+            raw_volumes.append(raw_volume)
+            gt_volumes.append(gt_volume_bool.astype(np.uint8))
+            dataset_sources.append(dataset_idx)
+            volumes_collected += 1
+
+            print(
+                f"  ✓ Volume {volumes_collected}/{num_volumes} from dataset {dataset_idx} "
+                f"(label fraction: {label_fraction:.3f})"
+            )
+
+        except Exception as e:
+            print(f"  Dataset {dataset_idx}: error - {e}")
+            continue
+
+    if volumes_collected < num_volumes:
+        print(f"Warning: Only collected {volumes_collected}/{num_volumes} volumes")
+
+    # Convert to numpy arrays
+    raw_volumes = np.array(raw_volumes)  # Shape: (num_volumes, D, H, W)
+    gt_volumes = np.array(gt_volumes)  # Shape: (num_volumes, D, H, W)
+
+    return raw_volumes, gt_volumes, dataset_sources
