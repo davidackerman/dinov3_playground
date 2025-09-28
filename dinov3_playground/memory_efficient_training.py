@@ -1674,7 +1674,7 @@ def train_3d_unet_memory_efficient_v2(
         )
         print(f"  Val:   Loss={val_loss:.4f}, Acc={val_acc:.4f}")
 
-        # Print per-class accuracies
+        # Print per-class accuracies with class distribution
         print(
             f"  Train Class Accs: ["
             + ", ".join([f"{acc:.3f}" for acc in train_class_acc])
@@ -1683,6 +1683,20 @@ def train_3d_unet_memory_efficient_v2(
         print(
             f"  Val Class Accs:   ["
             + ", ".join([f"{acc:.3f}" for acc in val_class_acc])
+            + "]"
+        )
+
+        # Print class distribution to understand accuracy weighting
+        val_class_counts = []
+        for class_id in range(num_classes):
+            class_mask = val_labels == class_id
+            class_count = class_mask.sum().item()
+            val_class_counts.append(class_count)
+
+        val_class_percentages = [count / val_total * 100 for count in val_class_counts]
+        print(
+            f"  Val Class Dist:   ["
+            + ", ".join([f"{pct:.1f}%" for pct in val_class_percentages])
             + "]"
         )
 
