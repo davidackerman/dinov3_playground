@@ -124,6 +124,9 @@ class MemoryEfficientDataLoader3D:
         self.learn_upsampling = learn_upsampling  # Store upsampling mode
         self.dinov3_stride = dinov3_stride  # Store sliding window stride
 
+        # Calculate padding requirements for sliding window
+        self._calculate_padding_requirements()
+
         # Set up random state
         self.rng = np.random.RandomState(seed)
 
@@ -150,8 +153,22 @@ class MemoryEfficientDataLoader3D:
             print(
                 f"  - DINOv3 stride: {dinov3_stride} (sliding window inference enabled)"
             )
+            # Calculate padding requirements
+            self._calculate_padding_requirements()
         else:
             print(f"  - DINOv3 stride: 16 (standard inference)")
+            self.sliding_window_padding = 0
+
+    def _calculate_padding_requirements(self):
+        """Calculate padding requirements for sliding window inference."""
+        if self.dinov3_stride is not None and self.dinov3_stride < 16:
+            # Calculate maximum shift needed
+            patch_size = 16  # DINOv3 patch size
+            max_shift = patch_size - self.dinov3_stride
+            self.sliding_window_padding = max_shift
+            print(f"  - Required padding: {max_shift} pixels per slice")
+        else:
+            self.sliding_window_padding = 0
 
     def sample_training_batch(self, batch_size):
         """
@@ -252,6 +269,13 @@ class MemoryEfficientDataLoader3D:
                     anti_aliasing=True,
                 ).astype(volumes.dtype)
 
+                # Apply padding if sliding window is enabled
+                if self.sliding_window_padding > 0:
+                    # Pre-pad the slice to avoid padding inside process function
+                    slice_upsampled = np.pad(
+                        slice_upsampled, self.sliding_window_padding, mode="reflect"
+                    )
+
                 # Extract features
                 slice_batch = slice_upsampled[np.newaxis, ...]
 
@@ -263,7 +287,11 @@ class MemoryEfficientDataLoader3D:
                     dinov3_features = process(
                         slice_batch,
                         model_id=self.model_id,
-                        image_size=self.dinov3_slice_size,
+                        image_size=(
+                            self.dinov3_slice_size + 2 * self.sliding_window_padding
+                            if self.sliding_window_padding > 0
+                            else self.dinov3_slice_size
+                        ),
                         stride=self.dinov3_stride,  # NEW: Add sliding window support
                     )
 
@@ -291,6 +319,22 @@ class MemoryEfficientDataLoader3D:
 
                     # Remove batch dimension: (channels, patch_h, patch_w)
                     features_2d = dinov3_features.squeeze(1)
+
+                    # If we used padding, crop back to original size
+                    if self.sliding_window_padding > 0:
+                        # Calculate expected size without padding
+                        expected_size = (
+                            self.dinov3_slice_size // 16
+                        )  # Assuming 16x16 patches
+                        if patch_h > expected_size or patch_w > expected_size:
+                            # Crop from center to remove padding effects
+                            pad_h = (patch_h - expected_size) // 2
+                            pad_w = (patch_w - expected_size) // 2
+                            features_2d = features_2d[
+                                :,
+                                pad_h : pad_h + expected_size,
+                                pad_w : pad_w + expected_size,
+                            ]
 
                 elif len(dinov3_features.shape) == 3:
                     # Alternative format: (batch_size, tokens, channels) or similar
@@ -2077,9 +2121,19 @@ def train_3d_unet_with_memory_efficient_loader(
     use_gradient_checkpointing=False,
     memory_efficient_mode="auto",  # "auto", "aggressive", "conservative"
     learn_upsampling=False,  # NEW PARAMETER
+    dinov3_stride=None,  # NEW PARAMETER for sliding window inference
 ):
     """
     Memory-efficient 3D UNet training with multiple precision and memory optimization options.
+
+    Parameters:
+    -----------
+    dinov3_stride : int, optional
+        Stride for DINOv3 sliding window inference. If None, uses patch_size (16) for standard inference.
+        Use smaller values (e.g., 8, 4) for higher resolution features at the cost of increased computation:
+        - stride=8: 4x more features, 4x slower
+        - stride=4: 16x more features, 16x slower
+        Best used with learn_upsampling=True to avoid downsampling high-res features.
     """
 
     # Auto-detect best memory settings
@@ -2176,6 +2230,7 @@ def train_3d_unet_with_memory_efficient_loader(
         seed=seed,
         model_id=model_id,
         learn_upsampling=learn_upsampling,
+        dinov3_stride=dinov3_stride,  # NEW: Sliding window parameter
     )
 
     print("Data loader created successfully!")

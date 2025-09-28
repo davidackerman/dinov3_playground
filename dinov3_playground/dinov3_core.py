@@ -359,6 +359,20 @@ def _process_sliding_window(data, stride, patch_size, image_size):
     print(f"Sliding window inference: stride={stride}, patch_size={patch_size}")
     print(f"Using {len(shifts)} shifts: {shifts}")
 
+    # Pre-pad all images to handle maximum shifts
+    max_shift = patch_size - stride
+    padded_data = np.zeros(
+        (batch_size, height + max_shift, width + max_shift), dtype=data.dtype
+    )
+
+    for b in range(batch_size):
+        # Pad with reflection to avoid edge artifacts
+        padded_data[b] = np.pad(
+            data[b], ((0, max_shift), (0, max_shift)), mode="reflect"
+        )
+
+    print(f"Pre-padded data shape: {padded_data.shape}")
+
     # Get number of output channels from a test run
     test_features = _process_single_standard(data[:1], image_size)  # Just first image
     output_channels = test_features.shape[0]
@@ -371,11 +385,16 @@ def _process_sliding_window(data, stride, patch_size, image_size):
     for shift_idx, (dy, dx) in enumerate(shifts):
         print(f"Processing shift {shift_idx + 1}/{len(shifts)}: ({dy}, {dx})")
 
-        # Create shifted images by rolling/shifting the input
-        shifted_data = np.zeros_like(data)
+        # Extract shifted windows from pre-padded data
+        shifted_data = np.zeros((batch_size, height, width), dtype=data.dtype)
         for b in range(batch_size):
-            # Use numpy roll to shift the image
-            shifted_data[b] = np.roll(np.roll(data[b], dy, axis=0), dx, axis=1)
+            # Extract the shifted region
+            start_y = dy
+            start_x = dx
+            end_y = start_y + height
+            end_x = start_x + width
+
+            shifted_data[b] = padded_data[b, start_y:end_y, start_x:end_x]
 
         # Process the shifted images through standard DINOv3
         shift_features = _process_single_standard(shifted_data, image_size)
