@@ -19,6 +19,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F  # Add this import
 import torch.optim as optim
+import time
+from tqdm import tqdm
 from datetime import datetime
 from .dinov3_core import (
     process,
@@ -252,11 +254,12 @@ class MemoryEfficientDataLoader3D:
                 if isinstance(dinov3_features, np.ndarray):
                     dinov3_features = torch.from_numpy(dinov3_features)
 
-                # DEBUG: Print feature information
-                if b == 0 and z == 0:  # Only print for first slice
+                # DEBUG: Print feature information (only once per training session)
+                if not hasattr(self, "_debug_printed") and b == 0 and z == 0:
                     print(f"  - DINOv3 features shape: {dinov3_features.shape}")
                     print(f"  - DINOv3 features size: {dinov3_features.numel()}")
                     print(f"  - DINOv3 features type: {type(dinov3_features)}")
+                    self._debug_printed = True
 
                 # FIXED: Handle the actual DINOv3 output format
                 # DINOv3 returns (channels, batch_size, patch_h, patch_w)
@@ -298,9 +301,10 @@ class MemoryEfficientDataLoader3D:
                         f"Unexpected DINOv3 features shape: {dinov3_features.shape}"
                     )
 
-                # DEBUG: Print reshaped features
-                if b == 0 and z == 0:
+                # DEBUG: Print reshaped features (only once per training session)
+                if not hasattr(self, "_reshape_debug_printed") and b == 0 and z == 0:
                     print(f"  - Reshaped features_2d shape: {features_2d.shape}")
+                    self._reshape_debug_printed = True
 
                 # Resize to target spatial dimensions
                 features_resized = torch.nn.functional.interpolate(
@@ -312,9 +316,10 @@ class MemoryEfficientDataLoader3D:
                     0
                 )  # Remove batch dimension
 
-                # DEBUG: Print final features
-                if b == 0 and z == 0:
+                # DEBUG: Print final features (only once per training session)
+                if not hasattr(self, "_resize_debug_printed") and b == 0 and z == 0:
                     print(f"  - Final features_resized shape: {features_resized.shape}")
+                    self._resize_debug_printed = True
 
                 volume_features.append(features_resized)
 
@@ -326,7 +331,10 @@ class MemoryEfficientDataLoader3D:
 
         batch_features = torch.stack(all_features, dim=0)
 
-        print(f"  - Final batch features shape: {batch_features.shape}")
+        # DEBUG: Print final batch shape (only once per training session)
+        if not hasattr(self, "_batch_debug_printed"):
+            print(f"  - Final batch features shape: {batch_features.shape}")
+            self._batch_debug_printed = True
 
         return batch_features.to(device)
 
@@ -745,6 +753,7 @@ def train_classifier_memory_efficient(
 
     # Get current model info for config saving
     from .dinov3_core import get_current_model_info
+
     model_info = get_current_model_info()
     current_output_channels = model_info["output_channels"]
 
@@ -878,7 +887,7 @@ def train_classifier_memory_efficient(
                     "model_type": model_name,
                     "use_improved_classifier": use_improved_classifier,
                     "target_size": target_size,  # Add target size
-                    "image_size": target_size,   # Add image size for DINOv3
+                    "image_size": target_size,  # Add image size for DINOv3
                     "input_channels": current_output_channels,  # Add input channels
                 },
             }
@@ -1247,7 +1256,7 @@ def train_unet_memory_efficient(
                     "model_id": model_id,
                     "model_type": "dinov3_unet",
                     "target_size": data_loader.target_size,  # Add target size
-                    "image_size": data_loader.target_size,   # Add image size for DINOv3
+                    "image_size": data_loader.target_size,  # Add image size for DINOv3
                 },
             }
 
@@ -1448,6 +1457,8 @@ def train_3d_unet_memory_efficient_v2(
     print(f"Starting memory-efficient 3D UNet training for up to {epochs} epochs...")
 
     for epoch in range(epochs):
+        epoch_start_time = time.time()
+
         # Training phase
         unet3d.train()
         epoch_train_loss = 0.0
@@ -1456,7 +1467,15 @@ def train_3d_unet_memory_efficient_v2(
         epoch_train_class_correct = np.zeros(num_classes)
         epoch_train_class_total = np.zeros(num_classes)
 
-        for batch_idx in range(batches_per_epoch):
+        # Progress bar for batches within epoch
+        batch_pbar = tqdm(
+            range(batches_per_epoch),
+            desc=f"Epoch {epoch+1}/{epochs} - Training",
+            leave=False,
+            ncols=120,
+        )
+
+        for batch_idx in batch_pbar:
             # Sample new training volumes for this batch
             train_volumes, train_gt_volumes = data_loader_3d.sample_training_batch(
                 volumes_per_batch
@@ -1513,6 +1532,16 @@ def train_3d_unet_memory_efficient_v2(
                     epoch_train_class_correct[class_id] += class_correct
                     epoch_train_class_total[class_id] += class_total
 
+            # Update progress bar with current metrics
+            current_loss = epoch_train_loss / max(epoch_train_total, 1)
+            current_acc = epoch_train_correct / max(epoch_train_total, 1)
+            batch_pbar.set_postfix(
+                {"Loss": f"{current_loss:.4f}", "Acc": f"{current_acc:.4f}"}
+            )
+
+        batch_pbar.close()
+        training_time = time.time() - epoch_start_time
+
         # Average training metrics for this epoch
         train_loss = epoch_train_loss / epoch_train_total
         train_acc = epoch_train_correct / epoch_train_total
@@ -1529,7 +1558,8 @@ def train_3d_unet_memory_efficient_v2(
             else:
                 train_class_acc.append(0.0)
 
-        # Validation phase (using fixed validation set)
+        # Validation phase with timing
+        val_start_time = time.time()
         unet3d.eval()
         with torch.no_grad():
             if use_mixed_precision:
@@ -1546,7 +1576,7 @@ def train_3d_unet_memory_efficient_v2(
             val_total = val_labels.numel()
             val_acc = val_correct / val_total
 
-            # MISSING: Calculate per-class validation accuracies
+            # Calculate per-class validation accuracies
             val_class_acc = []
             for class_id in range(num_classes):
                 class_mask = val_labels == class_id
@@ -1559,6 +1589,9 @@ def train_3d_unet_memory_efficient_v2(
                     val_class_acc.append(class_acc)
                 else:
                     val_class_acc.append(0.0)
+
+        val_time = time.time() - val_start_time
+        total_epoch_time = time.time() - epoch_start_time
 
         # Record metrics
         train_losses.append(train_loss)
@@ -1582,9 +1615,11 @@ def train_3d_unet_memory_efficient_v2(
         else:
             epochs_without_improvement += 1
 
-        # Print progress every epoch
+        # Print progress every epoch with timing
         current_lr = optimizer.param_groups[0]["lr"]
-        print(f"Epoch {epoch+1}/{epochs}")
+        print(
+            f"Epoch {epoch+1}/{epochs} - Time: {total_epoch_time:.1f}s (Train: {training_time:.1f}s, Val: {val_time:.1f}s)"
+        )
         print(
             f"  Train: Loss={train_loss:.4f}, Acc={train_acc:.4f} (from {epoch_train_total} voxels)"
         )
