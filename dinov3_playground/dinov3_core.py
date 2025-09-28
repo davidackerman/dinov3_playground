@@ -252,32 +252,168 @@ def apply_normalization_stats(features, stats):
     return normalized
 
 
-def process(data, model_id=None, image_size=896):
+def _combine_shifted_features(
+    all_shift_features, shifts, stride, patch_size, output_channels, batch_size
+):
     """
-    Process raw image data through DINOv3 to extract features.
+    Combine features from multiple shifted windows into a higher resolution grid.
+
+    Parameters:
+    -----------
+    all_shift_features : list
+        List of feature arrays from each shift
+    shifts : list
+        List of (dy, dx) shift tuples
+    stride : int
+        Stride used for shifting
+    patch_size : int
+        DINOv3 patch size
+    output_channels : int
+        Number of feature channels
+    batch_size : int
+        Batch size
+
+    Returns:
+    --------
+    numpy.ndarray: Combined high resolution features
+    """
+    # Get dimensions from first shift
+    first_features = all_shift_features[0]  # (channels, batch, patch_h, patch_w)
+    _, _, patch_h, patch_w = first_features.shape
+
+    # Calculate high resolution dimensions
+    scale_factor = patch_size // stride  # e.g., 16//8 = 2
+    high_res_h = patch_h * scale_factor
+    high_res_w = patch_w * scale_factor
+
+    print(
+        f"Combining features: {patch_h}x{patch_w} -> {high_res_h}x{high_res_w} (scale: {scale_factor}x)"
+    )
+
+    # Initialize high resolution feature map
+    high_res_features = np.zeros((output_channels, batch_size, high_res_h, high_res_w))
+
+    # Place each shifted feature set in the appropriate position
+    shift_idx = 0
+    for dy in range(0, patch_size, stride):
+        for dx in range(0, patch_size, stride):
+            if shift_idx < len(all_shift_features):
+                features = all_shift_features[
+                    shift_idx
+                ]  # (channels, batch, patch_h, patch_w)
+
+                # Calculate where to place these features in the high-res grid
+                start_y = (dy * patch_h) // patch_size
+                start_x = (dx * patch_w) // patch_size
+                end_y = start_y + patch_h
+                end_x = start_x + patch_w
+
+                # Make sure we don't exceed bounds
+                end_y = min(end_y, high_res_h)
+                end_x = min(end_x, high_res_w)
+                actual_h = end_y - start_y
+                actual_w = end_x - start_x
+
+                # Place the features
+                high_res_features[:, :, start_y:end_y, start_x:end_x] = features[
+                    :, :, :actual_h, :actual_w
+                ]
+
+                shift_idx += 1
+
+    return high_res_features
+
+
+def _process_sliding_window(data, stride, patch_size, image_size):
+    """
+    Process data using sliding window inference for higher resolution features.
 
     Parameters:
     -----------
     data : numpy.ndarray
-        Input images of shape (batch_size, height, width) or (height, width)
-    model_id : str, optional
-        Model ID to use (will initialize if different from current)
+        Input images of shape (batch_size, height, width)
+    stride : int
+        Stride for sliding window
+    patch_size : int
+        DINOv3 patch size (typically 16)
+    image_size : int
+        DINOv3 input image size
 
     Returns:
     --------
-    numpy.ndarray: Features of shape (output_channels, batch_size, patch_h, patch_w)
+    numpy.ndarray: High resolution features
     """
     global model, processor, DEVICE
 
-    # Initialize or switch model if needed
-    if model_id is not None and model_id != current_model_id:
-        initialize_dinov3(model_id, image_size)
-    else:
-        ensure_initialized(model_id)
+    batch_size, height, width = data.shape
 
-    # Handle single image
-    if data.ndim == 2:
-        data = data[np.newaxis, ...]  # Add batch dimension
+    # Calculate how many shifts we need
+    # For stride < patch_size, we need multiple shifts to cover all positions
+    if stride >= patch_size:
+        shifts = [(0, 0)]  # No sliding window needed
+    else:
+        shifts = []
+        # Generate shifts from 0 to (patch_size - stride) in steps of stride
+        for dy in range(0, patch_size, stride):
+            for dx in range(0, patch_size, stride):
+                shifts.append((dy, dx))
+
+    print(f"Sliding window inference: stride={stride}, patch_size={patch_size}")
+    print(f"Using {len(shifts)} shifts: {shifts}")
+
+    # Get number of output channels from a test run
+    test_features = _process_single_standard(data[:1], image_size)  # Just first image
+    output_channels = test_features.shape[0]
+
+    print(f"Output channels: {output_channels}")
+
+    # Process each shift
+    all_shift_features = []
+
+    for shift_idx, (dy, dx) in enumerate(shifts):
+        print(f"Processing shift {shift_idx + 1}/{len(shifts)}: ({dy}, {dx})")
+
+        # Create shifted images by rolling/shifting the input
+        shifted_data = np.zeros_like(data)
+        for b in range(batch_size):
+            # Use numpy roll to shift the image
+            shifted_data[b] = np.roll(np.roll(data[b], dy, axis=0), dx, axis=1)
+
+        # Process the shifted images through standard DINOv3
+        shift_features = _process_single_standard(shifted_data, image_size)
+        all_shift_features.append(shift_features)
+
+    # Now we need to combine the shifted features into a higher resolution grid
+    # Each shift gives us features at positions that are stride apart
+    if stride == patch_size:
+        # No overlapping, just return the first (and only) shift
+        high_res_features = all_shift_features[0]
+    else:
+        # Combine overlapping features by interleaving them
+        high_res_features = _combine_shifted_features(
+            all_shift_features, shifts, stride, patch_size, output_channels, batch_size
+        )
+
+    print(f"Final high resolution features shape: {high_res_features.shape}")
+    return high_res_features
+
+
+def _process_single_standard(data, image_size):
+    """
+    Process data through standard DINOv3 without sliding window.
+
+    Parameters:
+    -----------
+    data : numpy.ndarray
+        Input images of shape (batch_size, height, width)
+    image_size : int
+        DINOv3 input image size
+
+    Returns:
+    --------
+    numpy.ndarray: Standard resolution features
+    """
+    global model, processor, DEVICE
 
     batch_size, height, width = data.shape
 
@@ -314,8 +450,6 @@ def process(data, model_id=None, image_size=896):
         # Total tokens = patch_tokens + special_tokens (CLS + register tokens)
         total_tokens = features.shape[1]
         num_special_tokens = total_tokens - expected_patch_tokens
-
-        # print(f"Debug: Total tokens: {total_tokens}, Expected patch tokens: {expected_patch_tokens}, Special tokens: {num_special_tokens}")
 
         # Extract only patch features (skip special tokens at the beginning)
         if num_special_tokens > 0:
@@ -362,6 +496,53 @@ def process(data, model_id=None, image_size=896):
         output = spatial_features.permute(3, 0, 1, 2).cpu().numpy()
 
     return output
+
+
+def process(data, model_id=None, image_size=896, stride=None):
+    """
+    Process raw image data through DINOv3 to extract features.
+
+    Supports sliding window inference for higher resolution outputs by using
+    overlapping patches with stride < patch_size.
+
+    Parameters:
+    -----------
+    data : numpy.ndarray
+        Input images of shape (batch_size, height, width) or (height, width)
+    model_id : str, optional
+        Model ID to use (will initialize if different from current)
+    image_size : int, default=896
+        Input image size for DINOv3
+    stride : int, optional
+        Stride for sliding window inference. If None, uses patch_size (no overlap).
+        If stride < patch_size, creates overlapping windows for higher resolution.
+
+    Returns:
+    --------
+    numpy.ndarray: Features of shape (output_channels, batch_size, patch_h, patch_w)
+        If stride is provided, patch_h and patch_w will be higher than default.
+    """
+    global model, processor, DEVICE
+
+    # Initialize or switch model if needed
+    if model_id is not None and model_id != current_model_id:
+        initialize_dinov3(model_id, image_size)
+    else:
+        ensure_initialized(model_id)
+
+    # Handle single image
+    if data.ndim == 2:
+        data = data[np.newaxis, ...]  # Add batch dimension
+
+    batch_size, height, width = data.shape
+
+    # If stride is specified and different from patch size, use sliding window inference
+    patch_size = model.config.patch_size
+    if stride is not None and stride != patch_size:
+        return _process_sliding_window(data, stride, patch_size, image_size)
+
+    # Otherwise, use standard processing
+    return _process_single_standard(data, image_size)
 
 
 # Initialize with default model for backward compatibility
