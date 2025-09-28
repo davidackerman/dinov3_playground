@@ -115,21 +115,35 @@ class DINOv3UNetInference:
         # Extract model configuration from checkpoint or training config
         self.model_config = checkpoint.get("model_config", {})
         if not self.model_config and self.training_config:
-            # Try to reconstruct from training config
+            # Try to reconstruct from training config with better field mapping
+            # Handle different field names between old and new configs
+            target_size = self.training_config.get("target_size", 512)
+            input_size = self.training_config.get(
+                "input_size", (target_size, target_size)
+            )
+
             self.model_config = {
                 "num_classes": self.training_config.get("num_classes", 2),
                 "base_channels": self.training_config.get("base_channels", 64),
-                "input_size": self.training_config.get("input_size", (512, 512)),
+                "input_size": input_size,
+                "input_channels": self.training_config.get("input_channels", 384),
                 "model_id": self.training_config.get(
                     "model_id", "facebook/dinov3-vitl16-pretrain-sat493m"
                 ),
+                "model_type": self.training_config.get("model_type", "dinov3_unet"),
             }
+            print(f"Reconstructed model_config from training_config")
 
         # Initialize DINOv3
         model_id = self.model_config.get(
             "model_id", "facebook/dinov3-vitl16-pretrain-sat493m"
         )
-        image_size = self.training_config.get("image_size", 512)
+        # Try multiple sources for image_size (2D case)
+        image_size = (
+            self.training_config.get("image_size")
+            or self.training_config.get("target_size")
+            or 512
+        )
 
         print(f"Initializing DINOv3 model: {model_id}")
         self.dinov3_processor, self.dinov3_model, output_channels = initialize_dinov3(
@@ -169,6 +183,9 @@ class DINOv3UNetInference:
         print(f"   - Classes: {num_classes}")
         print(f"   - Input size: {input_size}")
         print(f"   - DINOv3 channels: {output_channels}")
+        print(f"   - DINOv3 image size: {image_size}")
+        print(f"   - Model config keys: {list(self.model_config.keys())}")
+        print(f"   - Training config keys: {list(self.training_config.keys())}")
 
     def predict(
         self, image: np.ndarray, return_probabilities: bool = False
@@ -339,23 +356,36 @@ class DINOv3UNet3DInference:
         # Extract model configuration
         self.model_config = checkpoint.get("model_config", {})
         if not self.model_config and self.training_config:
+            # Better fallback reconstruction for 3D models
+            target_volume_size = self.training_config.get(
+                "target_volume_size", (128, 128, 128)
+            )
+            dinov3_slice_size = self.training_config.get("dinov3_slice_size", 512)
+
             self.model_config = {
                 "num_classes": self.training_config.get("num_classes", 2),
                 "base_channels": self.training_config.get("base_channels", 64),
-                "input_size": self.training_config.get(
-                    "target_volume_size", (128, 128, 128)
-                ),
-                "dinov3_slice_size": self.training_config.get("dinov3_slice_size", 512),
+                "input_size": target_volume_size,
+                "input_channels": self.training_config.get("input_channels", 384),
+                "dinov3_slice_size": dinov3_slice_size,
                 "model_id": self.training_config.get(
                     "model_id", "facebook/dinov3-vitl16-pretrain-sat493m"
                 ),
+                "model_type": self.training_config.get("model_type", "dinov3_unet3d"),
             }
+            print(f"Reconstructed 3D model_config from training_config")
 
         # Initialize DINOv3
         model_id = self.model_config.get(
             "model_id", "facebook/dinov3-vitl16-pretrain-sat493m"
         )
-        image_size = self.training_config.get("image_size", 512)
+        # Try multiple sources for image_size (3D case)
+        image_size = (
+            self.training_config.get("image_size")
+            or self.training_config.get("dinov3_slice_size")
+            or self.model_config.get("dinov3_slice_size")
+            or 512
+        )
 
         print(f"Initializing DINOv3 model: {model_id}")
         processor, model, output_channels = initialize_dinov3(
@@ -419,6 +449,10 @@ class DINOv3UNet3DInference:
         print(f"   - Classes: {num_classes}")
         print(f"   - Volume size: {input_size}")
         print(f"   - DINOv3 channels: {output_channels}")
+        print(f"   - DINOv3 image size: {image_size}")
+        print(f"   - DINOv3 slice size: {dinov3_slice_size}")
+        print(f"   - Model config keys: {list(self.model_config.keys())}")
+        print(f"   - Training config keys: {list(self.training_config.keys())}")
 
     def predict(
         self, volume: np.ndarray, return_probabilities: bool = False

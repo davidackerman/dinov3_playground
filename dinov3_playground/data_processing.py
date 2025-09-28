@@ -882,28 +882,109 @@ def get_example_dataset_pairs():
     """
     Example dataset pairs for testing. Replace with your actual dataset paths.
 
+    Supports both legacy tuple format and new dictionary format for multiple classes.
+
     Returns:
     --------
-    list: List of (raw_path, gt_path) tuples
+    list: List of dictionaries with keys "raw" and any class names (e.g., "nuc", "mito", "vesicles")
+          OR list of (raw_path, gt_path) tuples for backward compatibility
     """
+    # New format supporting multiple classes with descriptive names
     dataset_pairs = [
-        # Dataset 1
-        (
-            "/nrs/cellmap/data/jrc_22ak351-leaf-3mb/jrc_22ak351-leaf-3mb.zarr/recon-1/em/fibsem-uint8/s3",
-            "/groups/cellmap/cellmap/parkg/for Aubrey/3mb_s3.zarr/jrc_22ak351-leaf-3mb_nuc/s0",
-        ),
+        # Dataset 1 - Multiple classes with descriptive names
+        {
+            "raw": "/nrs/cellmap/data/jrc_22ak351-leaf-3mb/jrc_22ak351-leaf-3mb.zarr/recon-1/em/fibsem-uint8/s3",
+            "nuc": "/groups/cellmap/cellmap/parkg/for Aubrey/3mb_s3.zarr/jrc_22ak351-leaf-3mb_nuc/s0",
+            "mito": "/groups/cellmap/cellmap/parkg/for Aubrey/3mb_s3.zarr/jrc_22ak351-leaf-3mb_mito/s0",
+        },
         # Add more dataset pairs here
-        # (
-        #     "/path/to/raw2.zarr",
-        #     "/path/to/gt2.zarr"
-        # ),
-        # (
-        #     "/path/to/raw3.zarr",
-        #     "/path/to/gt3.zarr"
-        # ),
-    ]
+        # {
+        #     "raw": "/path/to/raw2.zarr",
+        #     "nuc": "/path/to/nuclei2.zarr",
+        #     "mito": "/path/to/mito2.zarr",
+        #     "vesicles": "/path/to/vesicles2.zarr",
+        # },
+    ]  # Legacy format (will be converted internally)
+    # dataset_pairs = [
+    #     (
+    #         "/nrs/cellmap/data/jrc_22ak351-leaf-3mb/jrc_22ak351-leaf-3mb.zarr/recon-1/em/fibsem-uint8/s3",
+    #         "/groups/cellmap/cellmap/parkg/for Aubrey/3mb_s3.zarr/jrc_22ak351-leaf-3mb_nuc/s0",
+    #     ),
+    # ]
 
     return dataset_pairs
+
+
+def convert_dataset_pairs_format(dataset_pairs):
+    """
+    Convert dataset pairs to standardized dictionary format.
+
+    Parameters:
+    -----------
+    dataset_pairs : list
+        List of tuples (raw_path, gt_path) or dictionaries {"raw": path, "nuc": path, "mito": path, ...}
+        Class keys can have any descriptive name (e.g., "nuc", "mito", "vesicles", "class_1", etc.)
+
+    Returns:
+    --------
+    list: List of dictionaries with standardized format
+    """
+    converted_pairs = []
+
+    for pair in dataset_pairs:
+        if isinstance(pair, tuple):
+            # Legacy format: (raw_path, gt_path)
+            if len(pair) == 2:
+                converted_pairs.append({"raw": pair[0], "class_1": pair[1]})
+            else:
+                raise ValueError(
+                    f"Tuple format must have exactly 2 elements (raw, gt), got {len(pair)}"
+                )
+        elif isinstance(pair, dict):
+            # New format: already a dictionary
+            if "raw" not in pair:
+                raise ValueError("Dictionary format must contain 'raw' key")
+
+            # Ensure we have at least one class (any key that's not "raw")
+            class_keys = [k for k in pair.keys() if k != "raw"]
+            if not class_keys:
+                raise ValueError(
+                    "Dictionary format must contain at least one class key (any key other than 'raw')"
+                )
+
+            converted_pairs.append(pair.copy())
+        else:
+            raise ValueError(f"Dataset pair must be tuple or dict, got {type(pair)}")
+
+    return converted_pairs
+
+
+def get_num_classes_from_dataset_pairs(dataset_pairs):
+    """
+    Determine the number of classes from dataset pairs.
+
+    Parameters:
+    -----------
+    dataset_pairs : list
+        List of dataset dictionaries or tuples
+
+    Returns:
+    --------
+    int: Number of classes (including background)
+    """
+    converted_pairs = convert_dataset_pairs_format(dataset_pairs)
+
+    if not converted_pairs:
+        return 2  # Default to binary classification
+
+    # Find maximum number of classes across all datasets
+    max_classes = 0
+    for pair in converted_pairs:
+        class_keys = [k for k in pair.keys() if k != "raw"]
+        max_classes = max(max_classes, len(class_keys))
+
+    # Add 1 for background class (class 0)
+    return max_classes + 1
 
 
 # %%
@@ -918,11 +999,13 @@ def load_random_3d_training_data(
 ):
     """
     Load random 3D volumes from multiple datasets for 3D UNet training.
+    Supports both legacy tuple format and new dictionary format for multiple classes.
 
     Parameters:
     -----------
     dataset_pairs : list
-        List of (raw_path, gt_path) tuples
+        List of dictionaries with keys {"raw": path, "class_1": path, "class_2": path, ...}
+        OR list of (raw_path, gt_path) tuples for backward compatibility
     volume_shape : tuple
         3D shape of volumes to sample (D, H, W), e.g., (64, 64, 64)
     base_resolution : int
@@ -936,11 +1019,26 @@ def load_random_3d_training_data(
 
     Returns:
     --------
-    tuple: (raw_volumes, gt_volumes, dataset_sources)
+    tuple: (raw_volumes, gt_volumes, dataset_sources, num_classes)
+        - raw_volumes: np.array of shape (num_volumes, D, H, W)
+        - gt_volumes: np.array of shape (num_volumes, D, H, W) with class indices
+        - dataset_sources: list of dataset indices
+        - num_classes: int, total number of classes including background
            Each has shape (num_volumes, D, H, W)
     """
     if seed is not None:
         np.random.seed(seed)
+
+    # Convert dataset pairs to standardized format
+    converted_pairs = convert_dataset_pairs_format(dataset_pairs)
+    num_classes = get_num_classes_from_dataset_pairs(dataset_pairs)
+
+    print(
+        f"Dataset format conversion complete. Found {num_classes} classes (including background)."
+    )
+    print(
+        f"Note: Datasets with TensorStore/Zarr compatibility issues will be automatically skipped."
+    )
 
     # Convert volume shape to nm
     volume_shape_nm = np.array(volume_shape) * base_resolution
@@ -950,7 +1048,7 @@ def load_random_3d_training_data(
     dataset_sources = []
 
     print(
-        f"Sampling {num_volumes} volumes of shape {volume_shape} from {len(dataset_pairs)} datasets..."
+        f"Sampling {num_volumes} volumes of shape {volume_shape} from {len(converted_pairs)} datasets..."
     )
 
     volumes_collected = 0
@@ -961,27 +1059,38 @@ def load_random_3d_training_data(
             break
 
         # Randomly select a dataset
-        dataset_idx = np.random.randint(0, len(dataset_pairs))
-        raw_path, gt_path = dataset_pairs[dataset_idx]
+        dataset_idx = np.random.randint(0, len(converted_pairs))
+        dataset_dict = converted_pairs[dataset_idx]
+        raw_path = dataset_dict["raw"]
 
         try:
-            # Initialize data interfaces
+            # Initialize raw data interface
             raw_idi = ImageDataInterface(
                 raw_path, output_voxel_size=3 * [base_resolution]
             )
-            gt_idi = ImageDataInterface(
-                gt_path, output_voxel_size=3 * [base_resolution]
-            )
 
-            # Get bounds
+            # Initialize all class data interfaces (any key that's not "raw")
+            class_keys = [k for k in dataset_dict.keys() if k != "raw"]
+            class_idis = {}
+            for class_key in class_keys:
+                class_idis[class_key] = ImageDataInterface(
+                    dataset_dict[class_key], output_voxel_size=3 * [base_resolution]
+                )
+
+            # Get bounds from raw data
             raw_begin = np.array(raw_idi.roi.begin)
             raw_end = np.array(raw_idi.roi.end)
-            gt_begin = np.array(gt_idi.roi.begin)
-            gt_end = np.array(gt_idi.roi.end)
 
-            # Find overlapping region
-            overlap_begin = np.maximum(raw_begin, gt_begin)
-            overlap_end = np.minimum(raw_end, gt_end)
+            # Find overlapping region across all datasets
+            overlap_begin = raw_begin.copy()
+            overlap_end = raw_end.copy()
+
+            for class_key, class_idi in class_idis.items():
+                class_begin = np.array(class_idi.roi.begin)
+                class_end = np.array(class_idi.roi.end)
+                overlap_begin = np.maximum(overlap_begin, class_begin)
+                overlap_end = np.minimum(overlap_end, class_end)
+
             overlap_shape = overlap_end - overlap_begin
 
             # Check if overlap is large enough for our volume
@@ -1012,20 +1121,41 @@ def load_random_3d_training_data(
             # Create ROI for 3D volume
             roi = Roi(random_offset, volume_shape_nm)
 
-            # Sample GT first to check label fraction
-            gt_volume = gt_idi.to_ndarray_ts(roi)
+            # Sample all class volumes
+            class_volumes = {}
+            for class_key, class_idi in class_idis.items():
+                class_volumes[class_key] = class_idi.to_ndarray_ts(roi)
 
-            # Convert to boolean and check label fraction
-            if gt_volume.dtype != bool:
-                gt_volume_bool = gt_volume > 0
-            else:
-                gt_volume_bool = gt_volume
+            # Create multi-class ground truth volume
+            # Initialize with background (class 0)
+            gt_volume = np.zeros(volume_shape, dtype=np.uint8)
 
-            label_fraction = np.sum(gt_volume_bool) / gt_volume_bool.size
+            # Assign class labels (assign sequential class numbers starting from 1)
+            # Sort class keys alphabetically for consistent ordering
+            sorted_class_keys = sorted(class_keys)
+            total_label_fraction = 0.0
 
-            if label_fraction < min_label_fraction:
+            for class_idx, class_key in enumerate(sorted_class_keys, start=1):
+                class_vol = class_volumes[class_key]
+
+                # Convert to boolean mask
+                if class_vol.dtype != bool:
+                    class_mask = class_vol > 0
+                else:
+                    class_mask = class_vol
+
+                # Assign class label where mask is True
+                # Later classes override earlier ones in overlapping regions
+                gt_volume[class_mask] = class_idx
+
+                # Update total label fraction
+                class_fraction = np.sum(class_mask) / class_mask.size
+                total_label_fraction += class_fraction
+
+            # Check minimum label fraction across all classes
+            if total_label_fraction < min_label_fraction:
                 print(
-                    f"  Dataset {dataset_idx}: label fraction {label_fraction:.3f} too low"
+                    f"  Dataset {dataset_idx}: total label fraction {total_label_fraction:.3f} too low"
                 )
                 continue
 
@@ -1033,25 +1163,51 @@ def load_random_3d_training_data(
             raw_volume = raw_idi.to_ndarray_ts(roi)
 
             # Ensure correct shape
-            if raw_volume.shape != volume_shape or gt_volume_bool.shape != volume_shape:
+            if raw_volume.shape != volume_shape or gt_volume.shape != volume_shape:
                 print(
-                    f"  Dataset {dataset_idx}: shape mismatch - raw: {raw_volume.shape}, gt: {gt_volume_bool.shape}, expected: {volume_shape}"
+                    f"  Dataset {dataset_idx}: shape mismatch - raw: {raw_volume.shape}, gt: {gt_volume.shape}, expected: {volume_shape}"
                 )
                 continue
 
             # Store the volumes
             raw_volumes.append(raw_volume)
-            gt_volumes.append(gt_volume_bool.astype(np.uint8))
+            gt_volumes.append(gt_volume)
             dataset_sources.append(dataset_idx)
             volumes_collected += 1
 
+            # Print class distribution for this volume
+            unique_classes, class_counts = np.unique(gt_volume, return_counts=True)
+            class_info = ", ".join(
+                [
+                    f"class {c}: {cnt/gt_volume.size:.3f}"
+                    for c, cnt in zip(unique_classes, class_counts)
+                ]
+            )
+
             print(
                 f"  ✓ Volume {volumes_collected}/{num_volumes} from dataset {dataset_idx} "
-                f"(label fraction: {label_fraction:.3f})"
+                f"(total label fraction: {total_label_fraction:.3f}, {class_info})"
             )
 
         except Exception as e:
-            print(f"  Dataset {dataset_idx}: error - {e}")
+            error_msg = str(e)
+            if "FAILED_PRECONDITION" in error_msg and "checksum" in error_msg:
+                print(
+                    f"  Dataset {dataset_idx}: TensorStore/Zarr compatibility issue - skipping"
+                )
+                print(
+                    f"    Issue: Zarr file contains unsupported 'checksum' field in compressor"
+                )
+                print(f"    Path: {dataset_dict}")
+                print(
+                    f"    Suggestion: This dataset may need to be re-saved with compatible Zarr format"
+                )
+            elif "Error opening" in error_msg and "zarr" in error_msg.lower():
+                print(f"  Dataset {dataset_idx}: Zarr format issue - skipping")
+                print(f"    Path: {dataset_dict}")
+                print(f"    Error: {error_msg[:200]}...")
+            else:
+                print(f"  Dataset {dataset_idx}: error - {e}")
             continue
 
     if volumes_collected < num_volumes:
@@ -1059,6 +1215,14 @@ def load_random_3d_training_data(
 
     # Convert to numpy arrays
     raw_volumes = np.array(raw_volumes)  # Shape: (num_volumes, D, H, W)
-    gt_volumes = np.array(gt_volumes)  # Shape: (num_volumes, D, H, W)
+    gt_volumes = np.array(
+        gt_volumes
+    )  # Shape: (num_volumes, D, H, W) with class indices
 
-    return raw_volumes, gt_volumes, dataset_sources
+    print(f"Final dataset summary:")
+    print(f"  Raw volumes shape: {raw_volumes.shape}")
+    print(f"  GT volumes shape: {gt_volumes.shape}")
+    print(f"  Number of classes: {num_classes}")
+    print(f"  Classes found in data: {np.unique(gt_volumes)}")
+
+    return raw_volumes, gt_volumes, dataset_sources, num_classes

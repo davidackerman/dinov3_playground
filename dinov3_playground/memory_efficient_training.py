@@ -743,6 +743,11 @@ def train_classifier_memory_efficient(
 
     print(f"Using {model_name}")
 
+    # Get current model info for config saving
+    from .dinov3_core import get_current_model_info
+    model_info = get_current_model_info()
+    current_output_channels = model_info["output_channels"]
+
     # Loss and optimizer
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(
@@ -860,6 +865,21 @@ def train_classifier_memory_efficient(
                     "batches_per_epoch": batches_per_epoch,
                     "model_type": model_name,
                     "model_id": model_id,
+                    "target_size": target_size,  # 2D image size
+                    "image_size": target_size,  # For DINOv3 initialization
+                    "seed": data_loader.seed,  # Add seed
+                    "train_image_pool_size": data_loader.train_image_pool_size,  # Add pool sizes
+                    "val_image_pool_size": data_loader.val_image_pool_size,
+                },
+                "model_config": {
+                    "num_classes": num_classes,
+                    "input_size": (target_size, target_size),  # 2D input size
+                    "model_id": model_id,
+                    "model_type": model_name,
+                    "use_improved_classifier": use_improved_classifier,
+                    "target_size": target_size,  # Add target size
+                    "image_size": target_size,   # Add image size for DINOv3
+                    "input_channels": current_output_channels,  # Add input channels
                 },
             }
 
@@ -1210,6 +1230,24 @@ def train_unet_memory_efficient(
                     "model_id": model_id,
                     "input_channels": current_output_channels,
                     "use_class_weighting": use_class_weighting,
+                    "target_size": data_loader.target_size,  # Add target size
+                    "image_size": data_loader.target_size,  # For DINOv3 initialization
+                    "seed": data_loader.seed,  # Add seed
+                    "train_image_pool_size": data_loader.train_image_pool_size,  # Add pool sizes
+                    "val_image_pool_size": data_loader.val_image_pool_size,
+                },
+                "model_config": {
+                    "num_classes": num_classes,
+                    "base_channels": base_channels,
+                    "input_size": (
+                        data_loader.target_size,
+                        data_loader.target_size,
+                    ),  # 2D input size
+                    "input_channels": current_output_channels,
+                    "model_id": model_id,
+                    "model_type": "dinov3_unet",
+                    "target_size": data_loader.target_size,  # Add target size
+                    "image_size": data_loader.target_size,   # Add image size for DINOv3
                 },
             }
 
@@ -1287,6 +1325,10 @@ def train_3d_unet_memory_efficient_v2(
     export_base_dir=None,
     use_class_weighting=True,
     use_mixed_precision=True,  # Add this parameter
+    # Additional parameters for complete config saving
+    use_half_precision=False,
+    use_gradient_checkpointing=False,
+    memory_efficient_mode="auto",
 ):
     """
     Train 3D UNet using memory-efficient data loading with DINOv3 features.
@@ -1596,6 +1638,24 @@ def train_3d_unet_memory_efficient_v2(
                     "input_channels": current_output_channels,
                     "use_class_weighting": use_class_weighting,
                     "target_volume_size": data_loader_3d.target_volume_size,
+                    "dinov3_slice_size": data_loader_3d.dinov3_slice_size,
+                    "image_size": data_loader_3d.dinov3_slice_size,  # For DINOv3 initialization
+                    "seed": data_loader_3d.seed,  # Add seed
+                    "use_mixed_precision": use_mixed_precision,  # Add memory efficiency params
+                    "use_half_precision": use_half_precision,
+                    "use_gradient_checkpointing": use_gradient_checkpointing,
+                    "memory_efficient_mode": memory_efficient_mode,
+                    "train_volume_pool_size": data_loader_3d.train_volume_pool_size,
+                    "val_volume_pool_size": data_loader_3d.val_volume_pool_size,
+                },
+                "model_config": {
+                    "num_classes": num_classes,
+                    "base_channels": base_channels,
+                    "input_size": data_loader_3d.target_volume_size,  # 3D volume size
+                    "input_channels": current_output_channels,
+                    "model_id": model_id,
+                    "model_type": "dinov3_unet3d",
+                    "dinov3_slice_size": data_loader_3d.dinov3_slice_size,
                 },
             }
 
@@ -1946,10 +2006,19 @@ def train_3d_unet_with_memory_efficient_loader(
     print(f"  - Gradient checkpointing: {use_gradient_checkpointing}")
     print(f"  - Adjusted base channels: {base_channels}")
     print(f"  - Volumes per batch: {volumes_per_batch}")
+    # Auto-detect number of classes if not provided
+    if num_classes is None:
+        unique_classes = np.unique(gt_data)
+        num_classes = len(unique_classes)
+        print(
+            f"Auto-detected {num_classes} classes from ground truth data: {unique_classes}"
+        )
+
     print(f"Setting up memory-efficient 3D UNet training:")
     print(f"  Raw data shape: {raw_data.shape}")
     print(f"  GT data shape: {gt_data.shape}")
     print(f"  Number of classes: {num_classes}")
+    print(f"  Classes in data: {np.unique(gt_data)}")
     print(f"  Target volume size: {target_volume_size}")
     print(f"  Training volume pool: {train_volume_pool_size}")
     print(f"  Validation volumes: {val_volume_pool_size}")
@@ -2016,6 +2085,9 @@ def train_3d_unet_with_memory_efficient_loader(
         export_base_dir=export_base_dir,
         use_class_weighting=use_class_weighting,
         use_mixed_precision=use_mixed_precision,  # Pass through
+        use_half_precision=use_half_precision,  # Pass through additional params
+        use_gradient_checkpointing=use_gradient_checkpointing,
+        memory_efficient_mode=memory_efficient_mode,
     )
 
     print(f"\n3D UNet training completed!")
