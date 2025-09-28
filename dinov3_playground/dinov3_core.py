@@ -110,7 +110,7 @@ def get_current_model_info():
 
 def ensure_initialized(model_id=None):
     """
-    Ensure DINOv3 is initialized. If not, initialize with default or provided model_id.
+    Ensure DINOv3 is initialized. Raises error if not initialized and no model_id provided.
 
     Parameters:
     -----------
@@ -121,7 +121,10 @@ def ensure_initialized(model_id=None):
 
     if model is None or processor is None:
         if model_id is None:
-            model_id = "facebook/dinov3-vits16-pretrain-lvd1689m"
+            raise RuntimeError(
+                "DINOv3 model is not initialized. Please call initialize_dinov3(model_id) first, "
+                "or provide model_id parameter to the function you're calling."
+            )
         initialize_dinov3(model_id)
 
 
@@ -291,7 +294,7 @@ def _combine_shifted_features(
     # Initialize high resolution feature map
     high_res_features = np.zeros((output_channels, batch_size, high_res_h, high_res_w))
 
-    # Place each shifted feature set in the appropriate position
+    # Interleave features from different shifts to create high resolution output
     shift_idx = 0
     for dy in range(0, patch_size, stride):
         for dx in range(0, patch_size, stride):
@@ -300,22 +303,20 @@ def _combine_shifted_features(
                     shift_idx
                 ]  # (channels, batch, patch_h, patch_w)
 
-                # Calculate where to place these features in the high-res grid
-                start_y = (dy * patch_h) // patch_size
-                start_x = (dx * patch_w) // patch_size
-                end_y = start_y + patch_h
-                end_x = start_x + patch_w
+                # Interleave this shift's features into the high-res grid
+                # Each feature from this shift goes to positions offset by (dy, dx)
+                # in the stride pattern
+                for i in range(patch_h):
+                    for j in range(patch_w):
+                        # Calculate the high-res position for this feature
+                        high_res_i = i * scale_factor + (dy // stride)
+                        high_res_j = j * scale_factor + (dx // stride)
 
-                # Make sure we don't exceed bounds
-                end_y = min(end_y, high_res_h)
-                end_x = min(end_x, high_res_w)
-                actual_h = end_y - start_y
-                actual_w = end_x - start_x
-
-                # Place the features
-                high_res_features[:, :, start_y:end_y, start_x:end_x] = features[
-                    :, :, :actual_h, :actual_w
-                ]
+                        # Make sure we don't exceed bounds
+                        if high_res_i < high_res_h and high_res_j < high_res_w:
+                            high_res_features[:, :, high_res_i, high_res_j] = features[
+                                :, :, i, j
+                            ]
 
                 shift_idx += 1
 
@@ -356,49 +357,63 @@ def _process_sliding_window(data, stride, patch_size, image_size):
             for dx in range(0, patch_size, stride):
                 shifts.append((dy, dx))
 
-    print(f"Sliding window inference: stride={stride}, patch_size={patch_size}")
-    print(f"Using {len(shifts)} shifts: {shifts}")
+    from tqdm import tqdm
 
     # Pre-pad all images to handle maximum shifts
-    max_shift = patch_size - stride
-    padded_data = np.zeros(
-        (batch_size, height + max_shift, width + max_shift), dtype=data.dtype
-    )
+    max_shift = patch_size - stride if stride < patch_size else 0
 
-    for b in range(batch_size):
-        # Pad with reflection to avoid edge artifacts
-        padded_data[b] = np.pad(
-            data[b], ((0, max_shift), (0, max_shift)), mode="reflect"
+    if max_shift > 0:
+        padded_data = np.zeros(
+            (batch_size, height + max_shift, width + max_shift), dtype=data.dtype
         )
-
-    print(f"Pre-padded data shape: {padded_data.shape}")
+        for b in range(batch_size):
+            # Pad with reflection to avoid edge artifacts
+            padded_data[b] = np.pad(
+                data[b], ((0, max_shift), (0, max_shift)), mode="reflect"
+            )
+    else:
+        padded_data = data  # No padding needed
 
     # Get number of output channels from a test run
     test_features = _process_single_standard(data[:1], image_size)  # Just first image
     output_channels = test_features.shape[0]
 
-    print(f"Output channels: {output_channels}")
-
-    # Process each shift
+    # Process shifts with progress bar and batching
     all_shift_features = []
 
-    for shift_idx, (dy, dx) in enumerate(shifts):
-        print(f"Processing shift {shift_idx + 1}/{len(shifts)}: ({dy}, {dx})")
+    # Group shifts into batches for more efficient processing
+    shift_batch_size = min(len(shifts), 4)  # Process up to 4 shifts at once
 
-        # Extract shifted windows from pre-padded data
-        shifted_data = np.zeros((batch_size, height, width), dtype=data.dtype)
-        for b in range(batch_size):
-            # Extract the shifted region
-            start_y = dy
-            start_x = dx
-            end_y = start_y + height
-            end_x = start_x + width
+    with tqdm(
+        total=len(shifts),
+        desc=f"Processing {len(shifts)} shifts",
+        leave=True,
+        position=0,
+    ) as pbar:
+        for batch_start in range(0, len(shifts), shift_batch_size):
+            batch_end = min(batch_start + shift_batch_size, len(shifts))
+            batch_shifts = shifts[batch_start:batch_end]
 
-            shifted_data[b] = padded_data[b, start_y:end_y, start_x:end_x]
+            # Process this batch of shifts
+            batch_shift_features = []
 
-        # Process the shifted images through standard DINOv3
-        shift_features = _process_single_standard(shifted_data, image_size)
-        all_shift_features.append(shift_features)
+            for dy, dx in batch_shifts:
+                # Extract shifted windows from pre-padded data
+                shifted_data = np.zeros((batch_size, height, width), dtype=data.dtype)
+                for b in range(batch_size):
+                    # Extract the shifted region
+                    start_y = dy
+                    start_x = dx
+                    end_y = start_y + height
+                    end_x = start_x + width
+                    shifted_data[b] = padded_data[b, start_y:end_y, start_x:end_x]
+
+                # Process the shifted images through standard DINOv3
+                shift_features = _process_single_standard(shifted_data, image_size)
+                batch_shift_features.append(shift_features)
+                pbar.update(1)
+
+            all_shift_features.extend(batch_shift_features)
 
     # Now we need to combine the shifted features into a higher resolution grid
     # Each shift gives us features at positions that are stride apart
@@ -562,6 +577,5 @@ def process(data, model_id=None, image_size=896, stride=None):
     return _process_single_standard(data, image_size)
 
 
-# Initialize with default model for backward compatibility
-# This can be overridden by calling initialize_dinov3() explicitly
-initialize_dinov3()
+# DINOv3 initialization is now explicit only
+# Call initialize_dinov3() with your desired parameters before using the model

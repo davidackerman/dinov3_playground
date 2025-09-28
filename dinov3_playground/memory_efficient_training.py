@@ -95,11 +95,33 @@ class MemoryEfficientDataLoader3D:
             Use smaller values (e.g., 8, 4) for higher resolution features.
         """
 
-        # Validate inputs
-        if raw_data.shape != gt_data.shape:
+        # Validate inputs with ROI-level padding support
+        if raw_data.shape[0] != gt_data.shape[0]:
             raise ValueError(
-                f"Raw and GT data shapes must match: {raw_data.shape} vs {gt_data.shape}"
+                f"Number of volumes must match: {raw_data.shape[0]} vs {gt_data.shape[0]}"
             )
+
+        if len(raw_data.shape) >= 2 and raw_data.shape[1] != gt_data.shape[1]:
+            raise ValueError(
+                f"Depth dimension must match: {raw_data.shape[1]} vs {gt_data.shape[1]}"
+            )
+
+        # Allow spatial dimensions to differ due to ROI-level padding
+        if len(raw_data.shape) >= 4:
+            raw_spatial = raw_data.shape[2:]
+            gt_spatial = gt_data.shape[2:]
+            if raw_spatial != gt_spatial:
+                roi_padding = 0
+                if dinov3_stride is not None and dinov3_stride < 16:
+                    roi_padding = 16 - dinov3_stride
+                expected_raw_spatial = tuple(
+                    dim + 2 * roi_padding for dim in gt_spatial
+                )
+                if raw_spatial != expected_raw_spatial:
+                    raise ValueError(
+                        f"Raw spatial dimensions {raw_spatial} don't match GT {gt_spatial} "
+                        f"or expected padded dimensions {expected_raw_spatial} for stride {dinov3_stride}"
+                    )
 
         if len(raw_data.shape) != 4:
             raise ValueError(
@@ -162,11 +184,15 @@ class MemoryEfficientDataLoader3D:
     def _calculate_padding_requirements(self):
         """Calculate padding requirements for sliding window inference."""
         if self.dinov3_stride is not None and self.dinov3_stride < 16:
-            # Calculate maximum shift needed
+            # Calculate maximum shift needed for info
             patch_size = 16  # DINOv3 patch size
             max_shift = patch_size - self.dinov3_stride
-            self.sliding_window_padding = max_shift
-            print(f"  - Required padding: {max_shift} pixels per slice")
+            print(
+                f"  - Sliding window context: {max_shift} pixels (handled at ROI level)"
+            )
+            self.sliding_window_padding = (
+                0  # No per-slice padding needed with ROI-level padding
+            )
         else:
             self.sliding_window_padding = 0
 
@@ -226,6 +252,13 @@ class MemoryEfficientDataLoader3D:
         # Get current model info to determine output channels
         model_info = get_current_model_info()
         current_output_channels = model_info["output_channels"]
+
+        # Check if input has ROI-level padding
+        has_roi_padding = (height != target_h) or (width != target_w)
+        if has_roi_padding:
+            roi_padding = max((height - target_h) // 2, (width - target_w) // 2)
+            # print(f"Detected ROI-level padding: {roi_padding} pixels, input {(height, width)} -> target {(target_h, target_w)}")
+
         # if epoch is not None and batch is not None:
         #     print(f"Epoch {epoch}, Batch {batch}:")
         # print(f"Processing {batch_size} volumes for DINOv3 feature extraction...")
@@ -240,25 +273,36 @@ class MemoryEfficientDataLoader3D:
             volume_features = []
 
             for z in range(target_d):
-                # Resize volume slice
+                # Extract slice from potentially padded volume
                 if volumes.shape[1] == target_d:
                     slice_2d = volumes[b, z]
                 else:
-                    # Need to resize the volume first
+                    # Need to resize the volume first (depth dimension)
                     volume_resized = resize(
                         volumes[b],
-                        (target_d, target_h, target_w),
+                        (target_d, height, width),  # Keep spatial dimensions for now
                         preserve_range=True,
                         anti_aliasing=True,
                     )
                     slice_2d = volume_resized[z]
 
-                slice_2d = resize(
-                    slice_2d,
-                    (target_h, target_w),
-                    preserve_range=True,
-                    anti_aliasing=True,
-                ).astype(volumes.dtype)
+                # Handle ROI-level padding: crop to target spatial size
+                if has_roi_padding:
+                    # Crop from center of padded slice
+                    start_h = (height - target_h) // 2
+                    start_w = (width - target_w) // 2
+                    slice_2d = slice_2d[
+                        start_h : start_h + target_h, start_w : start_w + target_w
+                    ]
+
+                # Ensure slice is exactly the target spatial size
+                if slice_2d.shape != (target_h, target_w):
+                    slice_2d = resize(
+                        slice_2d,
+                        (target_h, target_w),
+                        preserve_range=True,
+                        anti_aliasing=True,
+                    ).astype(volumes.dtype)
 
                 # FIXED: Upsample to the correct DINOv3 input size
                 # The issue was here - we need to match the size that DINOv3 was initialized with
@@ -269,12 +313,8 @@ class MemoryEfficientDataLoader3D:
                     anti_aliasing=True,
                 ).astype(volumes.dtype)
 
-                # Apply padding if sliding window is enabled
-                if self.sliding_window_padding > 0:
-                    # Pre-pad the slice to avoid padding inside process function
-                    slice_upsampled = np.pad(
-                        slice_upsampled, self.sliding_window_padding, mode="reflect"
-                    )
+                # Note: Sliding window padding is now handled at ROI level, not per-slice
+                # No additional padding needed here since ROI-level padding already provides context
 
                 # Extract features
                 slice_batch = slice_upsampled[np.newaxis, ...]
@@ -287,12 +327,8 @@ class MemoryEfficientDataLoader3D:
                     dinov3_features = process(
                         slice_batch,
                         model_id=self.model_id,
-                        image_size=(
-                            self.dinov3_slice_size + 2 * self.sliding_window_padding
-                            if self.sliding_window_padding > 0
-                            else self.dinov3_slice_size
-                        ),
-                        stride=self.dinov3_stride,  # NEW: Add sliding window support
+                        image_size=self.dinov3_slice_size,  # Use original size - ROI padding handles context
+                        stride=self.dinov3_stride,  # Sliding window inference enabled
                     )
 
                 # Convert to torch tensor if it's numpy
@@ -320,21 +356,32 @@ class MemoryEfficientDataLoader3D:
                     # Remove batch dimension: (channels, patch_h, patch_w)
                     features_2d = dinov3_features.squeeze(1)
 
-                    # If we used padding, crop back to original size
-                    if self.sliding_window_padding > 0:
-                        # Calculate expected size without padding
-                        expected_size = (
-                            self.dinov3_slice_size // 16
-                        )  # Assuming 16x16 patches
-                        if patch_h > expected_size or patch_w > expected_size:
-                            # Crop from center to remove padding effects
-                            pad_h = (patch_h - expected_size) // 2
-                            pad_w = (patch_w - expected_size) // 2
-                            features_2d = features_2d[
-                                :,
-                                pad_h : pad_h + expected_size,
-                                pad_w : pad_w + expected_size,
-                            ]
+                    # With sliding window inference, we get higher resolution features
+                    if self.dinov3_stride is not None and self.dinov3_stride < 16:
+                        # Higher resolution due to sliding window (ROI-level padding provides context)
+                        expected_features_size = (
+                            self.dinov3_slice_size // self.dinov3_stride
+                        )
+
+                        # DEBUG: Print sizing information
+                        if (
+                            not hasattr(self, "_size_debug_printed")
+                            and b == 0
+                            and z == 0
+                        ):
+                            from tqdm import tqdm
+
+                            tqdm.write(f"  - Slice size: {self.dinov3_slice_size}")
+                            tqdm.write(f"  - Stride: {self.dinov3_stride}")
+                            tqdm.write(
+                                f"  - Sliding window context handled at ROI level"
+                            )
+                            tqdm.write(f"  - Feature size: {patch_h}x{patch_w}")
+                            self._size_debug_printed = True
+
+                        # Don't crop the features - keep the higher resolution
+                        # The UNet will handle the size differences through learned upsampling
+                        pass  # Keep features_2d as is
 
                 elif len(dinov3_features.shape) == 3:
                     # Alternative format: (batch_size, tokens, channels) or similar
@@ -2208,10 +2255,40 @@ def train_3d_unet_with_memory_efficient_loader(
             f"Need at least {val_volume_pool_size + 2} volumes for training"
         )
 
-    if raw_data.shape != gt_data.shape:
+    # Validate shapes with ROI-level padding support
+    if raw_data.shape[0] != gt_data.shape[0]:
         raise ValueError(
-            f"Raw and GT data shapes must match: {raw_data.shape} vs {gt_data.shape}"
+            f"Number of volumes must match: {raw_data.shape[0]} vs {gt_data.shape[0]}"
         )
+
+    if raw_data.shape[1] != gt_data.shape[1]:
+        raise ValueError(
+            f"Depth dimension must match: {raw_data.shape[1]} vs {gt_data.shape[1]}"
+        )
+
+    # Check if raw data has ROI-level padding (different spatial dimensions)
+    raw_spatial = raw_data.shape[2:]  # (H, W)
+    gt_spatial = gt_data.shape[2:]  # (H, W)
+
+    if raw_spatial != gt_spatial:
+        # Calculate expected padding based on dinov3_stride
+        roi_padding = 0
+        if dinov3_stride is not None and dinov3_stride < 16:
+            roi_padding = 16 - dinov3_stride
+
+        expected_raw_spatial = tuple(dim + 2 * roi_padding for dim in gt_spatial)
+
+        if raw_spatial != expected_raw_spatial:
+            raise ValueError(
+                f"Raw spatial dimensions {raw_spatial} don't match GT {gt_spatial} "
+                f"or expected padded dimensions {expected_raw_spatial} for stride {dinov3_stride}"
+            )
+
+        print(
+            f"✓ Detected ROI-level padding: Raw {raw_spatial} vs GT {gt_spatial} (padding={roi_padding})"
+        )
+    else:
+        print(f"✓ No ROI-level padding: Raw and GT shapes match {raw_data.shape}")
 
     if len(raw_data.shape) != 4:
         raise ValueError(
