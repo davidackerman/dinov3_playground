@@ -996,6 +996,7 @@ def load_random_3d_training_data(
     min_label_fraction=0.05,
     num_volumes=10,
     seed=42,
+    dinov3_stride=None,
 ):
     """
     Load random 3D volumes from multiple datasets for 3D UNet training.
@@ -1016,18 +1017,29 @@ def load_random_3d_training_data(
         Number of 3D volumes to sample
     seed : int
         Random seed
+    dinov3_stride : int, optional
+        If provided, will add ROI-level padding for sliding window inference
+        to avoid boundary issues. Padding = 16 - stride pixels per spatial dimension.
 
     Returns:
     --------
     tuple: (raw_volumes, gt_volumes, dataset_sources, num_classes)
-        - raw_volumes: np.array of shape (num_volumes, D, H, W)
-        - gt_volumes: np.array of shape (num_volumes, D, H, W) with class indices
+        - raw_volumes: np.array of shape (num_volumes, D, H, W) or (num_volumes, D+pad, H+pad, W+pad) if padded
+        - gt_volumes: np.array of shape (num_volumes, D, H, W) with class indices (always unpadded)
         - dataset_sources: list of dataset indices
         - num_classes: int, total number of classes including background
            Each has shape (num_volumes, D, H, W)
     """
     if seed is not None:
         np.random.seed(seed)
+
+    # Calculate padding requirements for sliding window inference
+    roi_padding = 0
+    if dinov3_stride is not None and dinov3_stride < 16:
+        roi_padding = 16 - dinov3_stride
+        print(
+            f"ROI-level padding enabled: {roi_padding} pixels per spatial dimension for stride={dinov3_stride}"
+        )
 
     # Convert dataset pairs to standardized format
     converted_pairs = convert_dataset_pairs_format(dataset_pairs)
@@ -1042,6 +1054,17 @@ def load_random_3d_training_data(
 
     # Convert volume shape to nm
     volume_shape_nm = np.array(volume_shape) * base_resolution
+
+    # Calculate padded volume shape for ROI sampling (only for raw data)
+    padded_volume_shape_nm = volume_shape_nm.copy()
+    if roi_padding > 0:
+        # Add padding to spatial dimensions (H, W) but not depth (D)
+        padded_volume_shape_nm[1:] += 2 * roi_padding * base_resolution
+        print(f"Original volume shape (nm): {volume_shape_nm}")
+        print(f"Padded ROI shape (nm): {padded_volume_shape_nm}")
+        print(
+            f"Padding per side: {roi_padding * base_resolution} nm ({roi_padding} pixels at {base_resolution}nm resolution)"
+        )
 
     raw_volumes = []
     gt_volumes = []
@@ -1093,15 +1116,16 @@ def load_random_3d_training_data(
 
             overlap_shape = overlap_end - overlap_begin
 
-            # Check if overlap is large enough for our volume
-            if np.any(overlap_shape < volume_shape_nm):
+            # Check if overlap is large enough for our volume (use padded shape for ROI)
+            required_shape = padded_volume_shape_nm
+            if np.any(overlap_shape < required_shape):
                 print(
-                    f"  Dataset {dataset_idx}: overlap {overlap_shape} too small for volume {volume_shape_nm}"
+                    f"  Dataset {dataset_idx}: overlap {overlap_shape} too small for volume {required_shape}"
                 )
                 continue
 
-            # Calculate valid sampling region
-            max_offset = overlap_end - volume_shape_nm
+            # Calculate valid sampling region (use padded shape)
+            max_offset = overlap_end - required_shape
             min_offset = overlap_begin
 
             if np.any(max_offset < min_offset):
@@ -1118,13 +1142,26 @@ def load_random_3d_training_data(
 
             random_offset = np.array(random_offset)
 
-            # Create ROI for 3D volume
-            roi = Roi(random_offset, volume_shape_nm)
+            # Create ROIs for 3D volume
+            # Use padded ROI for raw data (to include boundary context for sliding window)
+            padded_roi = Roi(random_offset, padded_volume_shape_nm)
+            # Use original ROI for ground truth (to maintain target shape)
+            if roi_padding > 0:
+                # Center the original ROI within the padded ROI
+                gt_offset = random_offset + np.array(
+                    [0, roi_padding * base_resolution, roi_padding * base_resolution]
+                )
+                gt_roi = Roi(gt_offset, volume_shape_nm)
+            else:
+                gt_roi = padded_roi  # Same as padded when no padding
 
-            # Sample all class volumes
+            # Sample raw volume with padding (for sliding window context)
+            raw_volume = raw_idi.to_ndarray_ts(padded_roi)
+
+            # Sample all class volumes without padding (maintain target shape)
             class_volumes = {}
             for class_key, class_idi in class_idis.items():
-                class_volumes[class_key] = class_idi.to_ndarray_ts(roi)
+                class_volumes[class_key] = class_idi.to_ndarray_ts(gt_roi)
 
             # Create multi-class ground truth volume
             # Initialize with background (class 0)
@@ -1159,13 +1196,21 @@ def load_random_3d_training_data(
                 )
                 continue
 
-            # Get raw volume
-            raw_volume = raw_idi.to_ndarray_ts(roi)
-
-            # Ensure correct shape
-            if raw_volume.shape != volume_shape or gt_volume.shape != volume_shape:
+            # Validate shapes
+            expected_raw_shape = (
+                tuple(padded_volume_shape_nm // base_resolution)
+                if roi_padding > 0
+                else volume_shape
+            )
+            if gt_volume.shape != volume_shape:
                 print(
-                    f"  Dataset {dataset_idx}: shape mismatch - raw: {raw_volume.shape}, gt: {gt_volume.shape}, expected: {volume_shape}"
+                    f"  Dataset {dataset_idx}: GT shape mismatch - got: {gt_volume.shape}, expected: {volume_shape}"
+                )
+                continue
+
+            if raw_volume.shape != expected_raw_shape:
+                print(
+                    f"  Dataset {dataset_idx}: Raw shape mismatch - got: {raw_volume.shape}, expected: {expected_raw_shape}"
                 )
                 continue
 
