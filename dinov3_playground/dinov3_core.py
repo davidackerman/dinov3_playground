@@ -253,7 +253,7 @@ def apply_normalization_stats(features, stats):
 
 
 def _combine_shifted_features(
-    all_shift_features, shifts, stride, patch_size, output_channels, batch_size
+    all_shift_features, stride, patch_size, output_channels, batch_size
 ):
     """
     Combine features from multiple shifted windows into a higher resolution grid.
@@ -262,8 +262,6 @@ def _combine_shifted_features(
     -----------
     all_shift_features : list
         List of feature arrays from each shift
-    shifts : list
-        List of (dy, dx) shift tuples
     stride : int
         Stride used for shifting
     patch_size : int
@@ -391,7 +389,7 @@ def _process_sliding_window(data, stride, patch_size, image_size):
     else:
         # Combine overlapping features by interleaving them
         high_res_features = _combine_shifted_features(
-            all_shift_features, shifts, stride, patch_size, output_channels, batch_size
+            all_shift_features, stride, patch_size, output_channels, batch_size
         )
 
     print(f"Final high resolution features shape: {high_res_features.shape}")

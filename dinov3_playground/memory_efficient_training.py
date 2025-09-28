@@ -65,6 +65,7 @@ class MemoryEfficientDataLoader3D:
         seed=42,
         model_id=None,
         learn_upsampling=False,  # NEW PARAMETER
+        dinov3_stride=None,  # NEW PARAMETER for sliding window inference
     ):
         """
         Initialize memory-efficient 3D data loader.
@@ -87,6 +88,11 @@ class MemoryEfficientDataLoader3D:
             Random seed for reproducibility
         model_id : str, optional
             DINOv3 model identifier to use
+        learn_upsampling : bool, default=False
+            Whether to use learned upsampling in the UNet
+        dinov3_stride : int, optional
+            Stride for DINOv3 sliding window inference. If None, uses patch_size (16).
+            Use smaller values (e.g., 8, 4) for higher resolution features.
         """
 
         # Validate inputs
@@ -116,6 +122,7 @@ class MemoryEfficientDataLoader3D:
         self.model_id = model_id
         self.seed = seed  # Store seed for config saving
         self.learn_upsampling = learn_upsampling  # Store upsampling mode
+        self.dinov3_stride = dinov3_stride  # Store sliding window stride
 
         # Set up random state
         self.rng = np.random.RandomState(seed)
@@ -139,6 +146,12 @@ class MemoryEfficientDataLoader3D:
         print(f"  - Validation set: {len(self.val_indices)} volumes")
         print(f"  - Target volume size: {target_volume_size}")
         print(f"  - DINOv3 slice size: {dinov3_slice_size}")
+        if dinov3_stride is not None:
+            print(
+                f"  - DINOv3 stride: {dinov3_stride} (sliding window inference enabled)"
+            )
+        else:
+            print(f"  - DINOv3 stride: 16 (standard inference)")
 
     def sample_training_batch(self, batch_size):
         """
@@ -251,6 +264,7 @@ class MemoryEfficientDataLoader3D:
                         slice_batch,
                         model_id=self.model_id,
                         image_size=self.dinov3_slice_size,
+                        stride=self.dinov3_stride,  # NEW: Add sliding window support
                     )
 
                 # Convert to torch tensor if it's numpy
