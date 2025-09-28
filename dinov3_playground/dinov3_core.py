@@ -287,9 +287,8 @@ def _combine_shifted_features(
     high_res_h = patch_h * scale_factor
     high_res_w = patch_w * scale_factor
 
-    print(
-        f"Combining features: {patch_h}x{patch_w} -> {high_res_h}x{high_res_w} (scale: {scale_factor}x)"
-    )
+    # Debug output suppressed during training to show progress bars clearly
+    # print(f"Combining features: {patch_h}x{patch_w} -> {high_res_h}x{high_res_w} (scale: {scale_factor}x)")
 
     # Initialize high resolution feature map
     high_res_features = np.zeros((output_channels, batch_size, high_res_h, high_res_w))
@@ -357,8 +356,6 @@ def _process_sliding_window(data, stride, patch_size, image_size):
             for dx in range(0, patch_size, stride):
                 shifts.append((dy, dx))
 
-    from tqdm import tqdm
-
     # Pre-pad all images to handle maximum shifts
     max_shift = patch_size - stride if stride < patch_size else 0
 
@@ -384,36 +381,30 @@ def _process_sliding_window(data, stride, patch_size, image_size):
     # Group shifts into batches for more efficient processing
     shift_batch_size = min(len(shifts), 4)  # Process up to 4 shifts at once
 
-    with tqdm(
-        total=len(shifts),
-        desc=f"Processing {len(shifts)} shifts",
-        leave=True,
-        position=0,
-    ) as pbar:
-        for batch_start in range(0, len(shifts), shift_batch_size):
-            batch_end = min(batch_start + shift_batch_size, len(shifts))
-            batch_shifts = shifts[batch_start:batch_end]
+    # Process shifts in batches (progress shown at higher level)
+    for batch_start in range(0, len(shifts), shift_batch_size):
+        batch_end = min(batch_start + shift_batch_size, len(shifts))
+        batch_shifts = shifts[batch_start:batch_end]
 
-            # Process this batch of shifts
-            batch_shift_features = []
+        # Process this batch of shifts
+        batch_shift_features = []
 
-            for dy, dx in batch_shifts:
-                # Extract shifted windows from pre-padded data
-                shifted_data = np.zeros((batch_size, height, width), dtype=data.dtype)
-                for b in range(batch_size):
-                    # Extract the shifted region
-                    start_y = dy
-                    start_x = dx
-                    end_y = start_y + height
-                    end_x = start_x + width
-                    shifted_data[b] = padded_data[b, start_y:end_y, start_x:end_x]
+        for dy, dx in batch_shifts:
+            # Extract shifted windows from pre-padded data
+            shifted_data = np.zeros((batch_size, height, width), dtype=data.dtype)
+            for b in range(batch_size):
+                # Extract the shifted region
+                start_y = dy
+                start_x = dx
+                end_y = start_y + height
+                end_x = start_x + width
+                shifted_data[b] = padded_data[b, start_y:end_y, start_x:end_x]
 
-                # Process the shifted images through standard DINOv3
-                shift_features = _process_single_standard(shifted_data, image_size)
-                batch_shift_features.append(shift_features)
-                pbar.update(1)
+            # Process the shifted images through standard DINOv3
+            shift_features = _process_single_standard(shifted_data, image_size)
+            batch_shift_features.append(shift_features)
 
-            all_shift_features.extend(batch_shift_features)
+        all_shift_features.extend(batch_shift_features)
 
     # Now we need to combine the shifted features into a higher resolution grid
     # Each shift gives us features at positions that are stride apart
@@ -426,7 +417,8 @@ def _process_sliding_window(data, stride, patch_size, image_size):
             all_shift_features, stride, patch_size, output_channels, batch_size
         )
 
-    print(f"Final high resolution features shape: {high_res_features.shape}")
+    # Debug output suppressed during training to show progress bars clearly
+    # print(f"Final high resolution features shape: {high_res_features.shape}")
     return high_res_features
 
 

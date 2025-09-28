@@ -1077,183 +1077,196 @@ def load_random_3d_training_data(
     volumes_collected = 0
     max_attempts = num_volumes * 10  # Allow multiple attempts
 
-    for attempt in range(max_attempts):
-        if volumes_collected >= num_volumes:
-            break
+    # Add progress bar for data loading
+    from tqdm import tqdm
 
-        # Randomly select a dataset
-        dataset_idx = np.random.randint(0, len(converted_pairs))
-        dataset_dict = converted_pairs[dataset_idx]
-        raw_path = dataset_dict["raw"]
+    with tqdm(total=num_volumes, desc="Loading training volumes", unit="vol") as pbar:
+        for attempt in range(max_attempts):
+            if volumes_collected >= num_volumes:
+                break
 
-        try:
-            # Initialize raw data interface
-            raw_idi = ImageDataInterface(
-                raw_path, output_voxel_size=3 * [base_resolution]
-            )
+            # Randomly select a dataset
+            dataset_idx = np.random.randint(0, len(converted_pairs))
+            dataset_dict = converted_pairs[dataset_idx]
+            raw_path = dataset_dict["raw"]
 
-            # Initialize all class data interfaces (any key that's not "raw")
-            class_keys = [k for k in dataset_dict.keys() if k != "raw"]
-            class_idis = {}
-            for class_key in class_keys:
-                class_idis[class_key] = ImageDataInterface(
-                    dataset_dict[class_key], output_voxel_size=3 * [base_resolution]
+            try:
+                # Initialize raw data interface
+                raw_idi = ImageDataInterface(
+                    raw_path, output_voxel_size=3 * [base_resolution]
                 )
 
-            # Get bounds from raw data
-            raw_begin = np.array(raw_idi.roi.begin)
-            raw_end = np.array(raw_idi.roi.end)
+                # Initialize all class data interfaces (any key that's not "raw")
+                class_keys = [k for k in dataset_dict.keys() if k != "raw"]
+                class_idis = {}
+                for class_key in class_keys:
+                    class_idis[class_key] = ImageDataInterface(
+                        dataset_dict[class_key], output_voxel_size=3 * [base_resolution]
+                    )
 
-            # Find overlapping region across all datasets
-            overlap_begin = raw_begin.copy()
-            overlap_end = raw_end.copy()
+                # Get bounds from raw data
+                raw_begin = np.array(raw_idi.roi.begin)
+                raw_end = np.array(raw_idi.roi.end)
 
-            for class_key, class_idi in class_idis.items():
-                class_begin = np.array(class_idi.roi.begin)
-                class_end = np.array(class_idi.roi.end)
-                overlap_begin = np.maximum(overlap_begin, class_begin)
-                overlap_end = np.minimum(overlap_end, class_end)
+                # Find overlapping region across all datasets
+                overlap_begin = raw_begin.copy()
+                overlap_end = raw_end.copy()
 
-            overlap_shape = overlap_end - overlap_begin
+                for class_key, class_idi in class_idis.items():
+                    class_begin = np.array(class_idi.roi.begin)
+                    class_end = np.array(class_idi.roi.end)
+                    overlap_begin = np.maximum(overlap_begin, class_begin)
+                    overlap_end = np.minimum(overlap_end, class_end)
 
-            # Check if overlap is large enough for our volume (use padded shape for ROI)
-            required_shape = padded_volume_shape_nm
-            if np.any(overlap_shape < required_shape):
-                print(
-                    f"  Dataset {dataset_idx}: overlap {overlap_shape} too small for volume {required_shape}"
-                )
-                continue
+                overlap_shape = overlap_end - overlap_begin
 
-            # Calculate valid sampling region (use padded shape)
-            max_offset = overlap_end - required_shape
-            min_offset = overlap_begin
+                # Check if overlap is large enough for our volume (use padded shape for ROI)
+                required_shape = padded_volume_shape_nm
+                if np.any(overlap_shape < required_shape):
+                    print(
+                        f"  Dataset {dataset_idx}: overlap {overlap_shape} too small for volume {required_shape}"
+                    )
+                    continue
 
-            if np.any(max_offset < min_offset):
-                print(f"  Dataset {dataset_idx}: no valid sampling region")
-                continue
+                # Calculate valid sampling region (use padded shape)
+                max_offset = overlap_end - required_shape
+                min_offset = overlap_begin
 
-            # Generate random offset (aligned to base_resolution)
-            random_offset = []
-            for i in range(3):
-                min_mult = int(min_offset[i] // base_resolution)
-                max_mult = int(max_offset[i] // base_resolution)
-                offset_mult = np.random.randint(min_mult, max_mult + 1)
-                random_offset.append(offset_mult * base_resolution)
+                if np.any(max_offset < min_offset):
+                    print(f"  Dataset {dataset_idx}: no valid sampling region")
+                    continue
 
-            random_offset = np.array(random_offset)
+                # Generate random offset (aligned to base_resolution)
+                random_offset = []
+                for i in range(3):
+                    min_mult = int(min_offset[i] // base_resolution)
+                    max_mult = int(max_offset[i] // base_resolution)
+                    offset_mult = np.random.randint(min_mult, max_mult + 1)
+                    random_offset.append(offset_mult * base_resolution)
 
-            # Create ROIs for 3D volume
-            # Use padded ROI for raw data (to include boundary context for sliding window)
-            padded_roi = Roi(random_offset, padded_volume_shape_nm)
-            # Use original ROI for ground truth (to maintain target shape)
-            if roi_padding > 0:
-                # Center the original ROI within the padded ROI
-                gt_offset = random_offset + np.array(
-                    [0, roi_padding * base_resolution, roi_padding * base_resolution]
-                )
-                gt_roi = Roi(gt_offset, volume_shape_nm)
-            else:
-                gt_roi = padded_roi  # Same as padded when no padding
+                random_offset = np.array(random_offset)
 
-            # Sample raw volume with padding (for sliding window context)
-            raw_volume = raw_idi.to_ndarray_ts(padded_roi)
-
-            # Sample all class volumes without padding (maintain target shape)
-            class_volumes = {}
-            for class_key, class_idi in class_idis.items():
-                class_volumes[class_key] = class_idi.to_ndarray_ts(gt_roi)
-
-            # Create multi-class ground truth volume
-            # Initialize with background (class 0)
-            gt_volume = np.zeros(volume_shape, dtype=np.uint8)
-
-            # Assign class labels (assign sequential class numbers starting from 1)
-            # Sort class keys alphabetically for consistent ordering
-            sorted_class_keys = sorted(class_keys)
-            total_label_fraction = 0.0
-
-            for class_idx, class_key in enumerate(sorted_class_keys, start=1):
-                class_vol = class_volumes[class_key]
-
-                # Convert to boolean mask
-                if class_vol.dtype != bool:
-                    class_mask = class_vol > 0
+                # Create ROIs for 3D volume
+                # Use padded ROI for raw data (to include boundary context for sliding window)
+                padded_roi = Roi(random_offset, padded_volume_shape_nm)
+                # Use original ROI for ground truth (to maintain target shape)
+                if roi_padding > 0:
+                    # Center the original ROI within the padded ROI
+                    gt_offset = random_offset + np.array(
+                        [
+                            0,
+                            roi_padding * base_resolution,
+                            roi_padding * base_resolution,
+                        ]
+                    )
+                    gt_roi = Roi(gt_offset, volume_shape_nm)
                 else:
-                    class_mask = class_vol
+                    gt_roi = padded_roi  # Same as padded when no padding
 
-                # Assign class label where mask is True
-                # Later classes override earlier ones in overlapping regions
-                gt_volume[class_mask] = class_idx
+                # Sample raw volume with padding (for sliding window context)
+                raw_volume = raw_idi.to_ndarray_ts(padded_roi)
 
-                # Update total label fraction
-                class_fraction = np.sum(class_mask) / class_mask.size
-                total_label_fraction += class_fraction
+                # Sample all class volumes without padding (maintain target shape)
+                class_volumes = {}
+                for class_key, class_idi in class_idis.items():
+                    class_volumes[class_key] = class_idi.to_ndarray_ts(gt_roi)
 
-            # Check minimum label fraction across all classes
-            if total_label_fraction < min_label_fraction:
-                print(
-                    f"  Dataset {dataset_idx}: total label fraction {total_label_fraction:.3f} too low"
+                # Create multi-class ground truth volume
+                # Initialize with background (class 0)
+                gt_volume = np.zeros(volume_shape, dtype=np.uint8)
+
+                # Assign class labels (assign sequential class numbers starting from 1)
+                # Sort class keys alphabetically for consistent ordering
+                sorted_class_keys = sorted(class_keys)
+                total_label_fraction = 0.0
+
+                for class_idx, class_key in enumerate(sorted_class_keys, start=1):
+                    class_vol = class_volumes[class_key]
+
+                    # Convert to boolean mask
+                    if class_vol.dtype != bool:
+                        class_mask = class_vol > 0
+                    else:
+                        class_mask = class_vol
+
+                    # Assign class label where mask is True
+                    # Later classes override earlier ones in overlapping regions
+                    gt_volume[class_mask] = class_idx
+
+                    # Update total label fraction
+                    class_fraction = np.sum(class_mask) / class_mask.size
+                    total_label_fraction += class_fraction
+
+                # Check minimum label fraction across all classes
+                if total_label_fraction < min_label_fraction:
+                    print(
+                        f"  Dataset {dataset_idx}: total label fraction {total_label_fraction:.3f} too low"
+                    )
+                    continue
+
+                # Validate shapes
+                expected_raw_shape = (
+                    tuple(padded_volume_shape_nm // base_resolution)
+                    if roi_padding > 0
+                    else volume_shape
                 )
+                if gt_volume.shape != volume_shape:
+                    print(
+                        f"  Dataset {dataset_idx}: GT shape mismatch - got: {gt_volume.shape}, expected: {volume_shape}"
+                    )
+                    continue
+
+                if raw_volume.shape != expected_raw_shape:
+                    print(
+                        f"  Dataset {dataset_idx}: Raw shape mismatch - got: {raw_volume.shape}, expected: {expected_raw_shape}"
+                    )
+                    continue
+
+                # Store the volumes
+                raw_volumes.append(raw_volume)
+                gt_volumes.append(gt_volume)
+                dataset_sources.append(dataset_idx)
+                volumes_collected += 1
+
+                # Print class distribution for this volume
+                unique_classes, class_counts = np.unique(gt_volume, return_counts=True)
+                class_info = ", ".join(
+                    [
+                        f"class {c}: {cnt/gt_volume.size:.3f}"
+                        for c, cnt in zip(unique_classes, class_counts)
+                    ]
+                )
+
+                # Update progress bar
+                pbar.update(1)
+                pbar.set_postfix(
+                    {
+                        "dataset": dataset_idx,
+                        "label_frac": f"{total_label_fraction:.3f}",
+                        "classes": len(unique_classes),
+                    }
+                )
+
+            except Exception as e:
+                error_msg = str(e)
+                if "FAILED_PRECONDITION" in error_msg and "checksum" in error_msg:
+                    print(
+                        f"  Dataset {dataset_idx}: TensorStore/Zarr compatibility issue - skipping"
+                    )
+                    print(
+                        f"    Issue: Zarr file contains unsupported 'checksum' field in compressor"
+                    )
+                    print(f"    Path: {dataset_dict}")
+                    print(
+                        f"    Suggestion: This dataset may need to be re-saved with compatible Zarr format"
+                    )
+                elif "Error opening" in error_msg and "zarr" in error_msg.lower():
+                    print(f"  Dataset {dataset_idx}: Zarr format issue - skipping")
+                    print(f"    Path: {dataset_dict}")
+                    print(f"    Error: {error_msg[:200]}...")
+                else:
+                    print(f"  Dataset {dataset_idx}: error - {e}")
                 continue
-
-            # Validate shapes
-            expected_raw_shape = (
-                tuple(padded_volume_shape_nm // base_resolution)
-                if roi_padding > 0
-                else volume_shape
-            )
-            if gt_volume.shape != volume_shape:
-                print(
-                    f"  Dataset {dataset_idx}: GT shape mismatch - got: {gt_volume.shape}, expected: {volume_shape}"
-                )
-                continue
-
-            if raw_volume.shape != expected_raw_shape:
-                print(
-                    f"  Dataset {dataset_idx}: Raw shape mismatch - got: {raw_volume.shape}, expected: {expected_raw_shape}"
-                )
-                continue
-
-            # Store the volumes
-            raw_volumes.append(raw_volume)
-            gt_volumes.append(gt_volume)
-            dataset_sources.append(dataset_idx)
-            volumes_collected += 1
-
-            # Print class distribution for this volume
-            unique_classes, class_counts = np.unique(gt_volume, return_counts=True)
-            class_info = ", ".join(
-                [
-                    f"class {c}: {cnt/gt_volume.size:.3f}"
-                    for c, cnt in zip(unique_classes, class_counts)
-                ]
-            )
-
-            print(
-                f"  ✓ Volume {volumes_collected}/{num_volumes} from dataset {dataset_idx} "
-                f"(total label fraction: {total_label_fraction:.3f}, {class_info})"
-            )
-
-        except Exception as e:
-            error_msg = str(e)
-            if "FAILED_PRECONDITION" in error_msg and "checksum" in error_msg:
-                print(
-                    f"  Dataset {dataset_idx}: TensorStore/Zarr compatibility issue - skipping"
-                )
-                print(
-                    f"    Issue: Zarr file contains unsupported 'checksum' field in compressor"
-                )
-                print(f"    Path: {dataset_dict}")
-                print(
-                    f"    Suggestion: This dataset may need to be re-saved with compatible Zarr format"
-                )
-            elif "Error opening" in error_msg and "zarr" in error_msg.lower():
-                print(f"  Dataset {dataset_idx}: Zarr format issue - skipping")
-                print(f"    Path: {dataset_dict}")
-                print(f"    Error: {error_msg[:200]}...")
-            else:
-                print(f"  Dataset {dataset_idx}: error - {e}")
-            continue
 
     if volumes_collected < num_volumes:
         print(f"Warning: Only collected {volumes_collected}/{num_volumes} volumes")
