@@ -64,6 +64,7 @@ class MemoryEfficientDataLoader3D:
         dinov3_slice_size=896,
         seed=42,
         model_id=None,
+        learn_upsampling=False,  # NEW PARAMETER
     ):
         """
         Initialize memory-efficient 3D data loader.
@@ -113,6 +114,8 @@ class MemoryEfficientDataLoader3D:
         self.target_volume_size = target_volume_size
         self.dinov3_slice_size = dinov3_slice_size
         self.model_id = model_id
+        self.seed = seed  # Store seed for config saving
+        self.learn_upsampling = learn_upsampling  # Store upsampling mode
 
         # Set up random state
         self.rng = np.random.RandomState(seed)
@@ -256,9 +259,11 @@ class MemoryEfficientDataLoader3D:
 
                 # DEBUG: Print feature information (only once per training session)
                 if not hasattr(self, "_debug_printed") and b == 0 and z == 0:
-                    print(f"  - DINOv3 features shape: {dinov3_features.shape}")
-                    print(f"  - DINOv3 features size: {dinov3_features.numel()}")
-                    print(f"  - DINOv3 features type: {type(dinov3_features)}")
+                    from tqdm import tqdm
+
+                    tqdm.write(f"  - DINOv3 features shape: {dinov3_features.shape}")
+                    tqdm.write(f"  - DINOv3 features size: {dinov3_features.numel()}")
+                    tqdm.write(f"  - DINOv3 features type: {type(dinov3_features)}")
                     self._debug_printed = True
 
                 # FIXED: Handle the actual DINOv3 output format
@@ -303,23 +308,46 @@ class MemoryEfficientDataLoader3D:
 
                 # DEBUG: Print reshaped features (only once per training session)
                 if not hasattr(self, "_reshape_debug_printed") and b == 0 and z == 0:
-                    print(f"  - Reshaped features_2d shape: {features_2d.shape}")
+                    from tqdm import tqdm
+
+                    tqdm.write(f"  - Reshaped features_2d shape: {features_2d.shape}")
                     self._reshape_debug_printed = True
 
-                # Resize to target spatial dimensions
-                features_resized = torch.nn.functional.interpolate(
-                    features_2d.unsqueeze(0),  # Add batch dimension
-                    size=(target_h, target_w),
-                    mode="bilinear",
-                    align_corners=False,
-                ).squeeze(
-                    0
-                )  # Remove batch dimension
+                # Resize to target spatial dimensions (skip if learning upsampling)
+                if self.learn_upsampling:
+                    # Keep features at DINOv3 native resolution
+                    features_resized = features_2d
 
-                # DEBUG: Print final features (only once per training session)
-                if not hasattr(self, "_resize_debug_printed") and b == 0 and z == 0:
-                    print(f"  - Final features_resized shape: {features_resized.shape}")
-                    self._resize_debug_printed = True
+                    # DEBUG: Print native resolution features (only once per training session)
+                    if not hasattr(self, "_native_debug_printed") and b == 0 and z == 0:
+                        from tqdm import tqdm
+
+                        tqdm.write(
+                            f"  - Native DINOv3 features shape: {features_resized.shape}"
+                        )
+                        tqdm.write(
+                            f"  - UNet will learn upsampling from {features_resized.shape[-2:]} to ({target_h}, {target_w})"
+                        )
+                        self._native_debug_printed = True
+                else:
+                    # Traditional interpolation upsampling
+                    features_resized = torch.nn.functional.interpolate(
+                        features_2d.unsqueeze(0),  # Add batch dimension
+                        size=(target_h, target_w),
+                        mode="bilinear",
+                        align_corners=False,
+                    ).squeeze(
+                        0
+                    )  # Remove batch dimension
+
+                    # DEBUG: Print interpolated features (only once per training session)
+                    if not hasattr(self, "_resize_debug_printed") and b == 0 and z == 0:
+                        from tqdm import tqdm
+
+                        tqdm.write(
+                            f"  - Interpolated features shape: {features_resized.shape}"
+                        )
+                        self._resize_debug_printed = True
 
                 volume_features.append(features_resized)
 
@@ -333,7 +361,9 @@ class MemoryEfficientDataLoader3D:
 
         # DEBUG: Print final batch shape (only once per training session)
         if not hasattr(self, "_batch_debug_printed"):
-            print(f"  - Final batch features shape: {batch_features.shape}")
+            from tqdm import tqdm
+
+            tqdm.write(f"  - Final batch features shape: {batch_features.shape}")
             self._batch_debug_printed = True
 
         return batch_features.to(device)
@@ -1338,6 +1368,7 @@ def train_3d_unet_memory_efficient_v2(
     use_half_precision=False,
     use_gradient_checkpointing=False,
     memory_efficient_mode="auto",
+    learn_upsampling=False,  # NEW PARAMETER
 ):
     """
     Train 3D UNet using memory-efficient data loading with DINOv3 features.
@@ -1349,7 +1380,8 @@ def train_3d_unet_memory_efficient_v2(
     print(f"  - Batches per epoch: {batches_per_epoch}")
     print(f"  - Total volumes per epoch: {volumes_per_batch * batches_per_epoch}")
     print(f"  - Class weighting: {use_class_weighting}")
-    print(f"  - Mixed precision: {use_mixed_precision}")  # NEW
+    print(f"  - Mixed precision: {use_mixed_precision}")
+    print(f"  - Learn upsampling: {learn_upsampling}")  # NEW
 
     # Initialize mixed precision scaler
     scaler = GradScaler() if use_mixed_precision else None
@@ -1419,11 +1451,26 @@ def train_3d_unet_memory_efficient_v2(
     # Initialize 3D UNet
     from .models import DINOv3UNet3D
 
+    # Calculate DINOv3 feature size if learning upsampling
+    dinov3_feature_size = None
+    if learn_upsampling:
+        # DINOv3 features are typically 1/16 of the slice size
+        slice_size = data_loader_3d.dinov3_slice_size
+        feature_spatial_size = slice_size // 16  # e.g., 896//16 = 56
+        dinov3_feature_size = (
+            data_loader_3d.target_volume_size[0],  # Keep depth dimension
+            feature_spatial_size,
+            feature_spatial_size,
+        )
+
     unet3d = DINOv3UNet3D(
         input_channels=current_output_channels,
         num_classes=num_classes,
         base_channels=base_channels,
         input_size=data_loader_3d.target_volume_size,
+        use_half_precision=use_half_precision,
+        learn_upsampling=learn_upsampling,
+        dinov3_feature_size=dinov3_feature_size,
     ).to(device)
 
     print(
@@ -1472,7 +1519,9 @@ def train_3d_unet_memory_efficient_v2(
             range(batches_per_epoch),
             desc=f"Epoch {epoch+1}/{epochs} - Training",
             leave=False,
-            ncols=120,
+            ncols=100,
+            position=0,
+            dynamic_ncols=True,
         )
 
         for batch_idx in batch_pbar:
@@ -1680,6 +1729,7 @@ def train_3d_unet_memory_efficient_v2(
                     "use_half_precision": use_half_precision,
                     "use_gradient_checkpointing": use_gradient_checkpointing,
                     "memory_efficient_mode": memory_efficient_mode,
+                    "learn_upsampling": learn_upsampling,  # Add upsampling mode
                     "train_volume_pool_size": data_loader_3d.train_volume_pool_size,
                     "val_volume_pool_size": data_loader_3d.val_volume_pool_size,
                 },
@@ -1998,6 +2048,7 @@ def train_3d_unet_with_memory_efficient_loader(
     use_half_precision=False,
     use_gradient_checkpointing=False,
     memory_efficient_mode="auto",  # "auto", "aggressive", "conservative"
+    learn_upsampling=False,  # NEW PARAMETER
 ):
     """
     Memory-efficient 3D UNet training with multiple precision and memory optimization options.
@@ -2096,6 +2147,7 @@ def train_3d_unet_with_memory_efficient_loader(
         dinov3_slice_size=dinov3_slice_size,
         seed=seed,
         model_id=model_id,
+        learn_upsampling=learn_upsampling,
     )
 
     print("Data loader created successfully!")
@@ -2123,6 +2175,7 @@ def train_3d_unet_with_memory_efficient_loader(
         use_half_precision=use_half_precision,  # Pass through additional params
         use_gradient_checkpointing=use_gradient_checkpointing,
         memory_efficient_mode=memory_efficient_mode,
+        learn_upsampling=learn_upsampling,  # Pass through new parameter
     )
 
     print(f"\n3D UNet training completed!")

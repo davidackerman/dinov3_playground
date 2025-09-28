@@ -39,7 +39,6 @@ from .models import (
     ImprovedClassifier,
     DINOv3UNet,  # 2D UNet
     DINOv3UNet3D,  # 3D UNet - This was missing
-    UNetPipeline,  # 2D Pipeline
     DINOv3UNet3DPipeline,  # 3D Pipeline - This was missing
     create_model,
     print_model_summary,
@@ -80,6 +79,15 @@ from .memory_efficient_training import (
     load_checkpoint,
     list_checkpoints,
     restore_model_from_checkpoint,
+)
+
+# Inference
+from .inference import (
+    DINOv3UNetInference,
+    DINOv3UNet3DInference,
+    load_inference_model,
+    demo_2d_inference,
+    demo_3d_inference,
 )
 
 __version__ = "0.1.0"
@@ -130,4 +138,10 @@ __all__ = [
     "load_checkpoint",
     "list_checkpoints",
     "restore_model_from_checkpoint",
+    # Inference
+    "DINOv3UNetInference",
+    "DINOv3UNet3DInference",
+    "load_inference_model",
+    "demo_2d_inference",
+    "demo_3d_inference",
 ]

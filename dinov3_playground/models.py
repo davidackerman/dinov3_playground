@@ -544,7 +544,9 @@ class DINOv3UNet3D(nn.Module):
         num_classes=2,
         base_channels=32,
         input_size=(112, 112, 112),
-        use_half_precision=False,  # NEW PARAMETER
+        use_half_precision=False,
+        learn_upsampling=False,  # NEW PARAMETER
+        dinov3_feature_size=None,  # NEW PARAMETER
     ):
         """
         Initialize DINOv3 3D UNet.
@@ -558,7 +560,15 @@ class DINOv3UNet3D(nn.Module):
         base_channels : int, default=32
             Base number of channels in the UNet (lower than 2D due to memory)
         input_size : tuple, default=(112, 112, 112)
-            Expected input spatial dimensions (D, H, W)
+            Expected output spatial dimensions (D, H, W)
+        use_half_precision : bool, default=False
+            Whether to use half precision (float16)
+        learn_upsampling : bool, default=False
+            If True, UNet learns upsampling from lower-res DINOv3 features
+            If False, DINOv3 features are pre-interpolated to full resolution
+        dinov3_feature_size : tuple, optional
+            Spatial size of DINOv3 features (D, H, W) when learn_upsampling=True
+            If None, assumes same as input_size
         """
         super(DINOv3UNet3D, self).__init__()
 
@@ -567,9 +577,23 @@ class DINOv3UNet3D(nn.Module):
         self.input_size = input_size
         self.base_channels = base_channels
         self.use_half_precision = use_half_precision
+        self.learn_upsampling = learn_upsampling
+        self.dinov3_feature_size = dinov3_feature_size or input_size
 
         # Input projection to reduce channels
         self.input_conv = nn.Conv3d(input_channels, self.base_channels, kernel_size=1)
+
+        # Calculate upsampling factor if needed
+        if self.learn_upsampling:
+            self.upsampling_factor = tuple(
+                int(target / feat)
+                for target, feat in zip(input_size, self.dinov3_feature_size)
+            )
+            # Initial upsampling layers to bring features closer to target resolution
+            self.learned_upsample = self._make_upsampling_layers()
+        else:
+            self.upsampling_factor = (1, 1, 1)
+            self.learned_upsample = None
 
         # Encoder (downsampling path)
         self.enc1 = self._make_encoder_block(self.base_channels, self.base_channels)
@@ -638,6 +662,98 @@ class DINOv3UNet3D(nn.Module):
             nn.Dropout3d(0.1),  # Light dropout in decoder
         )
 
+    def _make_upsampling_layers(self):
+        """Create learned upsampling layers to bring DINOv3 features to target resolution."""
+        layers = []
+        current_channels = self.base_channels
+
+        # Calculate how many upsampling stages we need
+        max_factor = max(self.upsampling_factor)
+
+        if max_factor <= 1:
+            return None
+
+        # Create progressive upsampling layers
+        if max_factor >= 8:
+            # Stage 1: 8x upsampling (if needed)
+            layers.extend(
+                [
+                    nn.ConvTranspose3d(
+                        current_channels,
+                        current_channels,
+                        kernel_size=4,
+                        stride=2,
+                        padding=1,
+                    ),  # 2x
+                    nn.BatchNorm3d(current_channels),
+                    nn.ReLU(inplace=True),
+                    nn.ConvTranspose3d(
+                        current_channels,
+                        current_channels,
+                        kernel_size=4,
+                        stride=2,
+                        padding=1,
+                    ),  # 4x
+                    nn.BatchNorm3d(current_channels),
+                    nn.ReLU(inplace=True),
+                    nn.ConvTranspose3d(
+                        current_channels,
+                        current_channels,
+                        kernel_size=4,
+                        stride=2,
+                        padding=1,
+                    ),  # 8x
+                    nn.BatchNorm3d(current_channels),
+                    nn.ReLU(inplace=True),
+                ]
+            )
+        elif max_factor >= 4:
+            # Stage 2: 4x upsampling
+            layers.extend(
+                [
+                    nn.ConvTranspose3d(
+                        current_channels,
+                        current_channels,
+                        kernel_size=4,
+                        stride=2,
+                        padding=1,
+                    ),  # 2x
+                    nn.BatchNorm3d(current_channels),
+                    nn.ReLU(inplace=True),
+                    nn.ConvTranspose3d(
+                        current_channels,
+                        current_channels,
+                        kernel_size=4,
+                        stride=2,
+                        padding=1,
+                    ),  # 4x
+                    nn.BatchNorm3d(current_channels),
+                    nn.ReLU(inplace=True),
+                ]
+            )
+        elif max_factor >= 2:
+            # Stage 3: 2x upsampling
+            layers.extend(
+                [
+                    nn.ConvTranspose3d(
+                        current_channels,
+                        current_channels,
+                        kernel_size=4,
+                        stride=2,
+                        padding=1,
+                    ),  # 2x
+                    nn.BatchNorm3d(current_channels),
+                    nn.ReLU(inplace=True),
+                ]
+            )
+
+        # Final adjustment layer to match exact target size if needed
+        layers.append(
+            nn.Conv3d(current_channels, current_channels, kernel_size=3, padding=1)
+        )
+
+        return nn.Sequential(*layers)
+
     def forward(self, x):
         """
         Forward pass through the 3D UNet.
@@ -657,6 +773,17 @@ class DINOv3UNet3D(nn.Module):
 
         # Input projection
         x = self.input_conv(x)  # (B, base_channels, D, H, W)
+
+        # Apply learned upsampling if enabled
+        if self.learn_upsampling and self.learned_upsample is not None:
+            x = self.learned_upsample(x)
+
+            # Fine-tune the size to exactly match target if needed
+            current_size = x.shape[2:]  # (D, H, W)
+            if current_size != self.input_size:
+                x = F.interpolate(
+                    x, size=self.input_size, mode="trilinear", align_corners=False
+                )
 
         # Encoder path with skip connections
         enc1_out = self.enc1(x)  # (B, base_channels, D, H, W)
