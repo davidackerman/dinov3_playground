@@ -368,12 +368,33 @@ class DINOv3UNet3DInference:
                 "input_size": target_volume_size,
                 "input_channels": self.training_config.get("input_channels", 384),
                 "dinov3_slice_size": dinov3_slice_size,
+                "learn_upsampling": self.training_config.get(
+                    "learn_upsampling", False
+                ),  # NEW
                 "model_id": self.training_config.get(
                     "model_id", "facebook/dinov3-vitl16-pretrain-sat493m"
                 ),
                 "model_type": self.training_config.get("model_type", "dinov3_unet3d"),
             }
             print(f"Reconstructed 3D model_config from training_config")
+
+        # Detect learned upsampling from state dict if not in config
+        learn_upsampling = self.model_config.get("learn_upsampling", False)
+        if not learn_upsampling:
+            # Check if state dict contains learned upsampling layers
+            state_dict_keys = []
+            if "unet3d_state_dict" in checkpoint:
+                state_dict_keys = list(checkpoint["unet3d_state_dict"].keys())
+            elif "model_state_dict" in checkpoint:
+                state_dict_keys = list(checkpoint["model_state_dict"].keys())
+            elif "state_dict" in checkpoint:
+                state_dict_keys = list(checkpoint["state_dict"].keys())
+
+            # Check for learned upsampling layers
+            if any("learned_upsample" in key for key in state_dict_keys):
+                learn_upsampling = True
+                self.model_config["learn_upsampling"] = True
+                print("Detected learned upsampling from model state dict")
 
         # Initialize DINOv3
         model_id = self.model_config.get(
@@ -398,14 +419,32 @@ class DINOv3UNet3DInference:
         input_size = self.model_config.get("input_size", (128, 128, 128))
         dinov3_slice_size = self.model_config.get("dinov3_slice_size", 512)
 
+        # Calculate DINOv3 feature size for learned upsampling
+        dinov3_feature_size = None
+        if learn_upsampling:
+            # DINOv3 features are typically 1/16 of the slice size
+            feature_spatial_size = dinov3_slice_size // 16
+            dinov3_feature_size = (
+                input_size[0],  # Keep depth dimension
+                feature_spatial_size,
+                feature_spatial_size,
+            )
+
+        upsampling_info = (
+            "with learned upsampling"
+            if learn_upsampling
+            else "with interpolated upsampling"
+        )
         print(
-            f"Creating 3D UNet with {output_channels} input channels, {num_classes} classes"
+            f"Creating 3D UNet with {output_channels} input channels, {num_classes} classes {upsampling_info}"
         )
         self.unet3d = DINOv3UNet3D(
             input_channels=output_channels,
             num_classes=num_classes,
             base_channels=base_channels,
             input_size=input_size,
+            learn_upsampling=learn_upsampling,
+            dinov3_feature_size=dinov3_feature_size,
         ).to(self.device)
 
         # Load model weights - the training saves 3D UNet weights as "unet3d_state_dict"
@@ -442,6 +481,7 @@ class DINOv3UNet3DInference:
             target_volume_size=input_size,
             seed=42,
             model_id=model_id,
+            learn_upsampling=learn_upsampling,  # Match training mode
         )
 
         print(f"✅ 3D Model loaded successfully!")
