@@ -14,6 +14,7 @@ Date: 2025-09-11
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 import numpy as np
 
 from skimage.transform import resize
@@ -547,6 +548,7 @@ class DINOv3UNet3D(nn.Module):
         use_half_precision=False,
         learn_upsampling=False,  # NEW PARAMETER
         dinov3_feature_size=None,  # NEW PARAMETER
+        use_gradient_checkpointing=True,  # NEW PARAMETER for memory efficiency
     ):
         """
         Initialize DINOv3 3D UNet.
@@ -569,6 +571,8 @@ class DINOv3UNet3D(nn.Module):
         dinov3_feature_size : tuple, optional
             Spatial size of DINOv3 features (D, H, W) when learn_upsampling=True
             If None, assumes same as input_size
+        use_gradient_checkpointing : bool, default=True
+            Whether to use gradient checkpointing for memory efficiency
         """
         super(DINOv3UNet3D, self).__init__()
 
@@ -579,6 +583,7 @@ class DINOv3UNet3D(nn.Module):
         self.use_half_precision = use_half_precision
         self.learn_upsampling = learn_upsampling
         self.dinov3_feature_size = dinov3_feature_size or input_size
+        self.use_gradient_checkpointing = use_gradient_checkpointing
 
         # Input projection to reduce channels
         self.input_conv = nn.Conv3d(input_channels, self.base_channels, kernel_size=1)
@@ -785,23 +790,47 @@ class DINOv3UNet3D(nn.Module):
                     x, size=self.input_size, mode="trilinear", align_corners=False
                 )
 
-        # Encoder path with skip connections
-        enc1_out = self.enc1(x)  # (B, base_channels, D, H, W)
-        enc1_pool = self.pool(enc1_out)  # (B, base_channels, D/2, H/2, W/2)
+        # Encoder path with skip connections (use gradient checkpointing if enabled)
+        if self.use_gradient_checkpointing and self.training:
+            enc1_out = checkpoint(self.enc1, x)  # (B, base_channels, D, H, W)
+            enc1_pool = self.pool(enc1_out)  # (B, base_channels, D/2, H/2, W/2)
 
-        enc2_out = self.enc2(enc1_pool)  # (B, base_channels*2, D/2, H/2, W/2)
-        enc2_pool = self.pool(enc2_out)  # (B, base_channels*2, D/4, H/4, W/4)
+            enc2_out = checkpoint(
+                self.enc2, enc1_pool
+            )  # (B, base_channels*2, D/2, H/2, W/2)
+            enc2_pool = self.pool(enc2_out)  # (B, base_channels*2, D/4, H/4, W/4)
 
-        enc3_out = self.enc3(enc2_pool)  # (B, base_channels*4, D/4, H/4, W/4)
-        enc3_pool = self.pool(enc3_out)  # (B, base_channels*4, D/8, H/8, W/8)
+            enc3_out = checkpoint(
+                self.enc3, enc2_pool
+            )  # (B, base_channels*4, D/4, H/4, W/4)
+            enc3_pool = self.pool(enc3_out)  # (B, base_channels*4, D/8, H/8, W/8)
 
-        enc4_out = self.enc4(enc3_pool)  # (B, base_channels*8, D/8, H/8, W/8)
-        enc4_pool = self.pool(enc4_out)  # (B, base_channels*8, D/16, H/16, W/16)
+            enc4_out = checkpoint(
+                self.enc4, enc3_pool
+            )  # (B, base_channels*8, D/8, H/8, W/8)
+            enc4_pool = self.pool(enc4_out)  # (B, base_channels*8, D/16, H/16, W/16)
 
-        # Bottleneck
-        bottleneck_out = self.bottleneck(
-            enc4_pool
-        )  # (B, base_channels*16, D/16, H/16, W/16)
+            # Bottleneck
+            bottleneck_out = checkpoint(
+                self.bottleneck, enc4_pool
+            )  # (B, base_channels*16, D/16, H/16, W/16)
+        else:
+            enc1_out = self.enc1(x)  # (B, base_channels, D, H, W)
+            enc1_pool = self.pool(enc1_out)  # (B, base_channels, D/2, H/2, W/2)
+
+            enc2_out = self.enc2(enc1_pool)  # (B, base_channels*2, D/2, H/2, W/2)
+            enc2_pool = self.pool(enc2_out)  # (B, base_channels*2, D/4, H/4, W/4)
+
+            enc3_out = self.enc3(enc2_pool)  # (B, base_channels*4, D/4, H/4, W/4)
+            enc3_pool = self.pool(enc3_out)  # (B, base_channels*4, D/8, H/8, W/8)
+
+            enc4_out = self.enc4(enc3_pool)  # (B, base_channels*8, D/8, H/8, W/8)
+            enc4_pool = self.pool(enc4_out)  # (B, base_channels*8, D/16, H/16, W/16)
+
+            # Bottleneck
+            bottleneck_out = self.bottleneck(
+                enc4_pool
+            )  # (B, base_channels*16, D/16, H/16, W/16)
         bottleneck_out = self.dropout(
             bottleneck_out
         )  # Apply stronger dropout at bottleneck
@@ -812,28 +841,40 @@ class DINOv3UNet3D(nn.Module):
             bottleneck_out, scale_factor=2, mode="trilinear", align_corners=False
         )
         dec4_concat = torch.cat([dec4_up, enc4_out], dim=1)
-        dec4_out = self.dec4(dec4_concat)
+        if self.use_gradient_checkpointing and self.training:
+            dec4_out = checkpoint(self.dec4, dec4_concat)
+        else:
+            dec4_out = self.dec4(dec4_concat)
 
         # Dec3: upsample dec4 and concatenate with enc3
         dec3_up = F.interpolate(
             dec4_out, scale_factor=2, mode="trilinear", align_corners=False
         )
         dec3_concat = torch.cat([dec3_up, enc3_out], dim=1)
-        dec3_out = self.dec3(dec3_concat)
+        if self.use_gradient_checkpointing and self.training:
+            dec3_out = checkpoint(self.dec3, dec3_concat)
+        else:
+            dec3_out = self.dec3(dec3_concat)
 
         # Dec2: upsample dec3 and concatenate with enc2
         dec2_up = F.interpolate(
             dec3_out, scale_factor=2, mode="trilinear", align_corners=False
         )
         dec2_concat = torch.cat([dec2_up, enc2_out], dim=1)
-        dec2_out = self.dec2(dec2_concat)
+        if self.use_gradient_checkpointing and self.training:
+            dec2_out = checkpoint(self.dec2, dec2_concat)
+        else:
+            dec2_out = self.dec2(dec2_concat)
 
         # Dec1: upsample dec2 and concatenate with enc1
         dec1_up = F.interpolate(
             dec2_out, scale_factor=2, mode="trilinear", align_corners=False
         )
         dec1_concat = torch.cat([dec1_up, enc1_out], dim=1)
-        dec1_out = self.dec1(dec1_concat)
+        if self.use_gradient_checkpointing and self.training:
+            dec1_out = checkpoint(self.dec1, dec1_concat)
+        else:
+            dec1_out = self.dec1(dec1_concat)
 
         # Final output
         output = self.final_conv(dec1_out)  # (B, num_classes, D, H, W)

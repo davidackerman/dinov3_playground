@@ -1491,22 +1491,24 @@ def train_3d_unet_memory_efficient_v2(
         print(f"  - Export base: {export_base_dir}")
         print(f"  - Checkpoints will be saved to: {checkpoint_dir}")
 
-    # Get validation data (fixed throughout training)
+    # Get validation data (keep on CPU for memory efficiency)
     val_volumes, val_gt_volumes = data_loader_3d.get_validation_data()
 
-    # Pre-compute validation labels (small memory footprint)
-    val_labels = torch.tensor(val_gt_volumes, dtype=torch.long).to(device)
-
     print(f"Validation set: {len(val_volumes)} volumes prepared")
-    print(f"Validation labels shape: {val_labels.shape}")
+    print(f"Validation labels will be processed volume-by-volume for memory efficiency")
+    print(f"Expected validation shape per volume: {val_gt_volumes[0].shape}")
     print(
-        "Note: Validation features will be computed on-demand each epoch for memory efficiency"
+        "Note: Validation features and labels will be computed volume-by-volume on-demand"
     )
 
-    # Calculate class weights from validation data
+    # Calculate class weights from validation data (process on CPU to avoid GPU memory issues)
     if use_class_weighting:
         print("Calculating class weights from validation data...")
-        val_labels_flat = val_labels.view(-1).cpu().numpy()
+        # Process validation volumes on CPU to calculate class distribution
+        all_val_labels = []
+        for vol_gt in val_gt_volumes:
+            all_val_labels.append(vol_gt.flatten())
+        val_labels_flat = np.concatenate(all_val_labels)
 
         unique_classes, class_counts = np.unique(val_labels_flat, return_counts=True)
         total_voxels = len(val_labels_flat)
@@ -1529,6 +1531,9 @@ def train_3d_unet_memory_efficient_v2(
                 print(
                     f"  Class {class_id}: {count:,} voxels ({percentage:.2f}%), weight: {weight:.3f}"
                 )
+
+        # Clean up temporary data
+        del all_val_labels, val_labels_flat
     else:
         class_weights_tensor = None
         print("Using unweighted loss (no class balancing)")
@@ -1708,28 +1713,91 @@ def train_3d_unet_memory_efficient_v2(
             else:
                 train_class_acc.append(0.0)
 
-        # Validation phase with timing
+        # Validation phase with timing - VOLUME-BY-VOLUME for memory efficiency
+        # This approach processes each validation volume independently to avoid GPU memory spikes
         val_start_time = time.time()
         unet3d.eval()
         with torch.no_grad():
-            # Extract validation features on-demand for memory efficiency
-            val_features = data_loader_3d.extract_dinov3_features_3d(
-                val_volumes, epoch=epoch
-            )
+            # Initialize validation metrics accumulators
+            val_total_loss = 0.0
+            val_total_correct = 0
+            val_total_voxels = 0
 
-            if use_mixed_precision:
-                with autocast(device_type="cuda" if device.type == "cuda" else "cpu"):
-                    val_logits = unet3d(val_features)
-                    val_loss = criterion(val_logits, val_labels).item()
-            else:
-                val_logits = unet3d(val_features)
-                val_loss = criterion(val_logits, val_labels).item()
+            # Per-class metrics accumulators
+            val_class_true_positives = np.zeros(num_classes)
+            val_class_false_positives = np.zeros(num_classes)
+            val_class_false_negatives = np.zeros(num_classes)
+            val_class_total_gt = np.zeros(num_classes)  # For recall calculation
+            val_class_total_pred = np.zeros(num_classes)  # For precision calculation
 
-            # Convert to float32 for metric calculations
-            val_predictions = torch.argmax(val_logits.float(), dim=1)
-            val_correct = (val_predictions == val_labels).sum().item()
-            val_total = val_labels.numel()
-            val_acc = val_correct / val_total
+            # Process each validation volume independently
+            for vol_idx in range(len(val_volumes)):
+                # Extract features for single volume (keeps GPU memory minimal)
+                single_vol = [val_volumes[vol_idx]]  # Make it a list for consistency
+                vol_features = data_loader_3d.extract_dinov3_features_3d(
+                    single_vol, epoch=epoch
+                )
+
+                # Get ground truth for this volume and move to GPU
+                vol_gt = (
+                    torch.tensor(val_gt_volumes[vol_idx], dtype=torch.long)
+                    .unsqueeze(0)
+                    .to(device)
+                )
+
+                # Run inference on single volume
+                if use_mixed_precision:
+                    with autocast(
+                        device_type="cuda" if device.type == "cuda" else "cpu"
+                    ):
+                        vol_logits = unet3d(vol_features)
+                        vol_loss = criterion(vol_logits, vol_gt).item()
+                else:
+                    vol_logits = unet3d(vol_features)
+                    vol_loss = criterion(vol_logits, vol_gt).item()
+
+                # Convert to predictions
+                vol_predictions = torch.argmax(vol_logits.float(), dim=1)
+
+                # Accumulate basic metrics
+                vol_correct = (vol_predictions == vol_gt).sum().item()
+                vol_voxels = vol_gt.numel()
+
+                val_total_loss += vol_loss * vol_voxels
+                val_total_correct += vol_correct
+                val_total_voxels += vol_voxels
+
+                # Accumulate per-class metrics (convert to CPU for efficiency)
+                vol_gt_cpu = vol_gt.cpu().numpy()
+                vol_pred_cpu = vol_predictions.cpu().numpy()
+
+                for class_id in range(num_classes):
+                    # Ground truth and prediction masks
+                    gt_mask = vol_gt_cpu == class_id
+                    pred_mask = vol_pred_cpu == class_id
+
+                    # Confusion matrix components
+                    true_positives = np.sum(gt_mask & pred_mask)
+                    false_positives = np.sum(~gt_mask & pred_mask)
+                    false_negatives = np.sum(gt_mask & ~pred_mask)
+
+                    # Accumulate
+                    val_class_true_positives[class_id] += true_positives
+                    val_class_false_positives[class_id] += false_positives
+                    val_class_false_negatives[class_id] += false_negatives
+                    val_class_total_gt[class_id] += np.sum(gt_mask)
+                    val_class_total_pred[class_id] += np.sum(pred_mask)
+
+                # Immediately free GPU memory for this volume
+                del vol_features, vol_logits, vol_predictions, vol_gt
+
+                # Clear GPU cache after each volume
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+
+            # Calculate final validation metrics from accumulated values
+            val_loss = val_total_loss / val_total_voxels
+            val_acc = val_total_correct / val_total_voxels
 
             # Calculate comprehensive per-class validation metrics
             val_class_acc = []  # Recall/Sensitivity
@@ -1738,25 +1806,19 @@ def train_3d_unet_memory_efficient_v2(
             val_class_iou = []
 
             for class_id in range(num_classes):
-                # Ground truth mask for this class
-                gt_mask = val_labels == class_id
-                # Prediction mask for this class
-                pred_mask = val_predictions == class_id
-
-                # Calculate confusion matrix components
-                true_positives = (gt_mask & pred_mask).sum().item()
-                false_positives = (~gt_mask & pred_mask).sum().item()
-                false_negatives = (gt_mask & ~pred_mask).sum().item()
+                tp = val_class_true_positives[class_id]
+                fp = val_class_false_positives[class_id]
+                fn = val_class_false_negatives[class_id]
 
                 # Recall (Sensitivity) = TP / (TP + FN)
-                if gt_mask.sum() > 0:
-                    recall = true_positives / gt_mask.sum().item()
+                if val_class_total_gt[class_id] > 0:
+                    recall = tp / val_class_total_gt[class_id]
                 else:
                     recall = 0.0
 
                 # Precision = TP / (TP + FP)
-                if pred_mask.sum() > 0:
-                    precision = true_positives / pred_mask.sum().item()
+                if val_class_total_pred[class_id] > 0:
+                    precision = tp / val_class_total_pred[class_id]
                 else:
                     precision = 0.0
 
@@ -1767,9 +1829,9 @@ def train_3d_unet_memory_efficient_v2(
                     f1 = 0.0
 
                 # IoU (Intersection over Union) = TP / (TP + FP + FN)
-                union = true_positives + false_positives + false_negatives
+                union = tp + fp + fn
                 if union > 0:
-                    iou = true_positives / union
+                    iou = tp / union
                 else:
                     iou = 0.0
 
@@ -1777,13 +1839,6 @@ def train_3d_unet_memory_efficient_v2(
                 val_class_precision.append(precision)
                 val_class_f1.append(f1)
                 val_class_iou.append(iou)
-
-            # Explicitly delete validation features to free memory (after all calculations)
-            del val_features, val_logits, val_predictions
-
-            # Clear GPU cache after validation
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
 
         val_time = time.time() - val_start_time
         total_epoch_time = time.time() - epoch_start_time
@@ -1857,13 +1912,10 @@ def train_3d_unet_memory_efficient_v2(
         print(f"  Mean IoU: {current_mean_iou:.4f}")
 
         # Print class distribution to understand accuracy weighting
-        val_class_counts = []
-        for class_id in range(num_classes):
-            class_mask = val_labels == class_id
-            class_count = class_mask.sum().item()
-            val_class_counts.append(class_count)
-
-        val_class_percentages = [count / val_total * 100 for count in val_class_counts]
+        val_class_counts = val_class_total_gt  # Use the counts we already calculated
+        val_class_percentages = [
+            count / val_total_voxels * 100 for count in val_class_counts
+        ]
         print(
             f"  Val Class Dist:   ["
             + ", ".join([f"{pct:.1f}%" for pct in val_class_percentages])
