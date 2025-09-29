@@ -331,9 +331,9 @@ class MemoryEfficientDataLoader3D:
                         stride=self.dinov3_stride,  # Sliding window inference enabled
                     )
 
-                # Convert to torch tensor if it's numpy
+                # Convert to torch tensor if it's numpy (ensure float32 for model compatibility)
                 if isinstance(dinov3_features, np.ndarray):
-                    dinov3_features = torch.from_numpy(dinov3_features)
+                    dinov3_features = torch.from_numpy(dinov3_features).float()
 
                 # DEBUG: Print feature information (only once per training session)
                 if not hasattr(self, "_debug_printed") and b == 0 and z == 0:
@@ -412,10 +412,8 @@ class MemoryEfficientDataLoader3D:
                     )
 
                 # DEBUG: Print reshaped features (only once per training session)
+                # Debug output suppressed during training to show progress bars clearly
                 if not hasattr(self, "_reshape_debug_printed") and b == 0 and z == 0:
-                    from tqdm import tqdm
-
-                    tqdm.write(f"  - Reshaped features_2d shape: {features_2d.shape}")
                     self._reshape_debug_printed = True
 
                 # Resize to target spatial dimensions (skip if learning upsampling)
@@ -424,15 +422,8 @@ class MemoryEfficientDataLoader3D:
                     features_resized = features_2d
 
                     # DEBUG: Print native resolution features (only once per training session)
+                    # Debug output suppressed during training to show progress bars clearly
                     if not hasattr(self, "_native_debug_printed") and b == 0 and z == 0:
-                        from tqdm import tqdm
-
-                        tqdm.write(
-                            f"  - Native DINOv3 features shape: {features_resized.shape}"
-                        )
-                        tqdm.write(
-                            f"  - UNet will learn upsampling from {features_resized.shape[-2:]} to ({target_h}, {target_w})"
-                        )
                         self._native_debug_printed = True
                 else:
                     # Traditional interpolation upsampling
@@ -1503,15 +1494,14 @@ def train_3d_unet_memory_efficient_v2(
     # Get validation data (fixed throughout training)
     val_volumes, val_gt_volumes = data_loader_3d.get_validation_data()
 
-    # Process validation data to get features
-    print("Processing validation data...")
-    val_features = data_loader_3d.extract_dinov3_features_3d(val_volumes)
+    # Pre-compute validation labels (small memory footprint)
     val_labels = torch.tensor(val_gt_volumes, dtype=torch.long).to(device)
 
-    print(
-        f"Validation set: {val_features.shape} features from {len(val_volumes)} volumes"
-    )
+    print(f"Validation set: {len(val_volumes)} volumes prepared")
     print(f"Validation labels shape: {val_labels.shape}")
+    print(
+        "Note: Validation features will be computed on-demand each epoch for memory efficiency"
+    )
 
     # Calculate class weights from validation data
     if use_class_weighting:
@@ -1576,6 +1566,7 @@ def train_3d_unet_memory_efficient_v2(
         use_half_precision=use_half_precision,
         learn_upsampling=learn_upsampling,
         dinov3_feature_size=dinov3_feature_size,
+        use_gradient_checkpointing=True,  # Enable gradient checkpointing for memory efficiency
     ).to(device)
 
     print(
@@ -1603,7 +1594,8 @@ def train_3d_unet_memory_efficient_v2(
     train_losses, val_losses = [], []
     train_accs, val_accs = [], []
     train_class_accs, val_class_accs = [], []
-    best_val_acc = 0.0
+    val_class_precisions, val_class_f1s, val_class_ious = [], [], []
+    best_mean_iou = 0.0  # Changed from best_val_acc to best_mean_iou
     epochs_without_improvement = 0
 
     print(f"Starting memory-efficient 3D UNet training for up to {epochs} epochs...")
@@ -1665,6 +1657,10 @@ def train_3d_unet_memory_efficient_v2(
                 torch.nn.utils.clip_grad_norm_(unet3d.parameters(), max_norm=1.0)
                 optimizer.step()
 
+            # Clear GPU cache to prevent memory accumulation
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
             # Track metrics
             with autocast(
                 device_type="cuda" if device.type == "cuda" else "cpu", enabled=False
@@ -1716,6 +1712,11 @@ def train_3d_unet_memory_efficient_v2(
         val_start_time = time.time()
         unet3d.eval()
         with torch.no_grad():
+            # Extract validation features on-demand for memory efficiency
+            val_features = data_loader_3d.extract_dinov3_features_3d(
+                val_volumes, epoch=epoch
+            )
+
             if use_mixed_precision:
                 with autocast(device_type="cuda" if device.type == "cuda" else "cpu"):
                     val_logits = unet3d(val_features)
@@ -1730,19 +1731,59 @@ def train_3d_unet_memory_efficient_v2(
             val_total = val_labels.numel()
             val_acc = val_correct / val_total
 
-            # Calculate per-class validation accuracies
-            val_class_acc = []
+            # Calculate comprehensive per-class validation metrics
+            val_class_acc = []  # Recall/Sensitivity
+            val_class_precision = []
+            val_class_f1 = []
+            val_class_iou = []
+
             for class_id in range(num_classes):
-                class_mask = val_labels == class_id
-                if class_mask.sum() > 0:
-                    class_correct = (
-                        (val_predictions[class_mask] == class_id).sum().item()
-                    )
-                    class_total = class_mask.sum().item()
-                    class_acc = class_correct / class_total
-                    val_class_acc.append(class_acc)
+                # Ground truth mask for this class
+                gt_mask = val_labels == class_id
+                # Prediction mask for this class
+                pred_mask = val_predictions == class_id
+
+                # Calculate confusion matrix components
+                true_positives = (gt_mask & pred_mask).sum().item()
+                false_positives = (~gt_mask & pred_mask).sum().item()
+                false_negatives = (gt_mask & ~pred_mask).sum().item()
+
+                # Recall (Sensitivity) = TP / (TP + FN)
+                if gt_mask.sum() > 0:
+                    recall = true_positives / gt_mask.sum().item()
                 else:
-                    val_class_acc.append(0.0)
+                    recall = 0.0
+
+                # Precision = TP / (TP + FP)
+                if pred_mask.sum() > 0:
+                    precision = true_positives / pred_mask.sum().item()
+                else:
+                    precision = 0.0
+
+                # F1-Score = 2 * (Precision * Recall) / (Precision + Recall)
+                if precision + recall > 0:
+                    f1 = 2 * (precision * recall) / (precision + recall)
+                else:
+                    f1 = 0.0
+
+                # IoU (Intersection over Union) = TP / (TP + FP + FN)
+                union = true_positives + false_positives + false_negatives
+                if union > 0:
+                    iou = true_positives / union
+                else:
+                    iou = 0.0
+
+                val_class_acc.append(recall)
+                val_class_precision.append(precision)
+                val_class_f1.append(f1)
+                val_class_iou.append(iou)
+
+            # Explicitly delete validation features to free memory (after all calculations)
+            del val_features, val_logits, val_predictions
+
+            # Clear GPU cache after validation
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
 
         val_time = time.time() - val_start_time
         total_epoch_time = time.time() - epoch_start_time
@@ -1753,17 +1794,23 @@ def train_3d_unet_memory_efficient_v2(
         train_accs.append(train_acc)
         val_accs.append(val_acc)
         train_class_accs.append(train_class_acc)
-        val_class_accs.append(val_class_acc)  # This line should now work
+        val_class_accs.append(val_class_acc)
+        val_class_precisions.append(val_class_precision)
+        val_class_f1s.append(val_class_f1)
+        val_class_ious.append(val_class_iou)
+
+        # Calculate mean IoU for both scheduler and best model selection
+        current_mean_iou = np.mean(val_class_iou)
 
         # Learning rate scheduling
         old_lr = optimizer.param_groups[0]["lr"]
-        scheduler.step(val_acc)
+        scheduler.step(current_mean_iou)
         new_lr = optimizer.param_groups[0]["lr"]
 
-        # Check if this is the best validation accuracy so far
+        # Check if this is the best mean IoU so far
         is_best_model = False
-        if val_acc > best_val_acc + min_delta:
-            best_val_acc = val_acc
+        if current_mean_iou > best_mean_iou + min_delta:
+            best_mean_iou = current_mean_iou
             epochs_without_improvement = 0
             is_best_model = True
         else:
@@ -1777,19 +1824,37 @@ def train_3d_unet_memory_efficient_v2(
         print(
             f"  Train: Loss={train_loss:.4f}, Acc={train_acc:.4f} (from {epoch_train_total} voxels)"
         )
-        print(f"  Val:   Loss={val_loss:.4f}, Acc={val_acc:.4f}")
-
-        # Print per-class accuracies with class distribution
         print(
-            f"  Train Class Accs: ["
+            f"  Val:   Loss={val_loss:.4f}, IoU={current_mean_iou:.4f}, Acc={val_acc:.4f}"
+        )
+
+        # Print comprehensive per-class metrics
+        print(
+            f"  Train Class Recall: ["
             + ", ".join([f"{acc:.3f}" for acc in train_class_acc])
             + "]"
         )
         print(
-            f"  Val Class Accs:   ["
+            f"  Val Class Recall:   ["
             + ", ".join([f"{acc:.3f}" for acc in val_class_acc])
             + "]"
         )
+        print(
+            f"  Val Class Precision:["
+            + ", ".join([f"{prec:.3f}" for prec in val_class_precision])
+            + "]"
+        )
+        print(
+            f"  Val Class F1:       ["
+            + ", ".join([f"{f1:.3f}" for f1 in val_class_f1])
+            + "]"
+        )
+        print(
+            f"  Val Class IoU:      ["
+            + ", ".join([f"{iou:.3f}" for iou in val_class_iou])
+            + "]"
+        )
+        print(f"  Mean IoU: {current_mean_iou:.4f}")
 
         # Print class distribution to understand accuracy weighting
         val_class_counts = []
@@ -1805,13 +1870,15 @@ def train_3d_unet_memory_efficient_v2(
             + "]"
         )
 
-        print(f"  Best Val Acc: {best_val_acc:.4f}, LR: {current_lr:.6f}")
+        print(f"  Best Mean IoU: {best_mean_iou:.4f}, LR: {current_lr:.6f}")
         print(f"  Epochs without improvement: {epochs_without_improvement}")
         if new_lr < old_lr:
             print(f"  Learning rate reduced: {old_lr:.6f} -> {new_lr:.6f}")
 
         # Save checkpoints
         if save_checkpoints:
+            # For backward compatibility with checkpoint system, alias the best metric
+            best_val_acc = best_mean_iou
             stats_data = {
                 "epoch": epoch + 1,
                 "train_losses": train_losses,
@@ -1886,7 +1953,9 @@ def train_3d_unet_memory_efficient_v2(
                 with open(best_path, "wb") as f:
                     pickle.dump(checkpoint_data, f)
 
-                print(f"  *** NEW BEST 3D MODEL SAVED: {val_acc:.4f} ***")
+                print(
+                    f"  *** NEW BEST 3D MODEL SAVED: IoU={current_mean_iou:.4f} (Acc={val_acc:.4f}) ***"
+                )
 
             print(f"  Stats saved: {os.path.basename(stats_path)}")
 
@@ -1907,7 +1976,10 @@ def train_3d_unet_memory_efficient_v2(
         "val_accs": val_accs,
         "train_class_accs": train_class_accs,
         "val_class_accs": val_class_accs,
-        "best_val_acc": best_val_acc,
+        "val_class_precisions": val_class_precisions,
+        "val_class_f1s": val_class_f1s,
+        "val_class_ious": val_class_ious,
+        "best_mean_iou": best_mean_iou,
         "epochs_trained": len(train_losses),
         "checkpoint_dir": checkpoint_dir,
         "export_base_dir": export_base_dir,

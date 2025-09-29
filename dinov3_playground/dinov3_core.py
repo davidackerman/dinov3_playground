@@ -290,8 +290,10 @@ def _combine_shifted_features(
     # Debug output suppressed during training to show progress bars clearly
     # print(f"Combining features: {patch_h}x{patch_w} -> {high_res_h}x{high_res_w} (scale: {scale_factor}x)")
 
-    # Initialize high resolution feature map
-    high_res_features = np.zeros((output_channels, batch_size, high_res_h, high_res_w))
+    # Initialize high resolution feature map (use float32 for model compatibility)
+    high_res_features = np.zeros(
+        (output_channels, batch_size, high_res_h, high_res_w), dtype=np.float32
+    )
 
     # Interleave features from different shifts to create high resolution output
     shift_idx = 0
@@ -517,7 +519,7 @@ def _process_single_standard(data, image_size):
         )
 
         # Rearrange to (hidden_size, batch_size, patch_h, patch_w) to match expected output format
-        output = spatial_features.permute(3, 0, 1, 2).cpu().numpy()
+        output = spatial_features.permute(3, 0, 1, 2).cpu().numpy().astype(np.float32)
 
     return output
 
