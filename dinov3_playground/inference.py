@@ -460,6 +460,10 @@ class DINOv3UNet3DInference:
 
         self.unet3d.eval()
 
+        # Get orthogonal planes setting from training config
+        use_orthogonal_planes = self.training_config.get("use_orthogonal_planes", True)
+        print(f"Using orthogonal planes processing: {use_orthogonal_planes}")
+
         # Create pipeline for easier inference
         self.pipeline = DINOv3UNet3DPipeline(
             num_classes=num_classes,
@@ -467,6 +471,7 @@ class DINOv3UNet3DInference:
             dinov3_slice_size=dinov3_slice_size,
             base_channels=base_channels,
             input_channels=output_channels,  # Pass the input channels explicitly
+            use_orthogonal_planes=use_orthogonal_planes,  # Use training config setting
             device=self.device,
         )
         # Replace the pipeline's UNet with our trained model
@@ -493,6 +498,7 @@ class DINOv3UNet3DInference:
             model_id=model_id,
             learn_upsampling=learn_upsampling,  # Match training mode
             dinov3_stride=dinov3_stride,  # Match training stride
+            use_orthogonal_planes=use_orthogonal_planes,  # Match training orthogonal setting
         )
 
         print(f"✅ 3D Model loaded successfully!")
