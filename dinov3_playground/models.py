@@ -942,7 +942,8 @@ class DINOv3UNet3DPipeline(nn.Module):
         input_size=(112, 112, 112),
         dinov3_slice_size=896,
         base_channels=32,
-        input_channels=None,  # Add input_channels parameter
+        input_channels=1024,  # DINOv3 ViT-L/16 features = 1024 channels
+        use_orthogonal_planes=True,  # Process all 3 orthogonal planes
         device=None,
     ):
         """
@@ -960,6 +961,9 @@ class DINOv3UNet3DPipeline(nn.Module):
             Base number of channels in 3D UNet
         input_channels : int, optional
             Number of input channels for the 3D UNet (DINOv3 feature channels)
+        use_orthogonal_planes : bool, default=True
+            If True, processes slices in all 3 orthogonal planes (XY, XZ, YZ) and averages them.
+            If False, processes only XY planes (original behavior).
         device : torch.device, optional
             Device for processing
         """
@@ -968,6 +972,7 @@ class DINOv3UNet3DPipeline(nn.Module):
         self.num_classes = num_classes
         self.input_size = input_size
         self.dinov3_slice_size = dinov3_slice_size
+        self.use_orthogonal_planes = use_orthogonal_planes
         self.device = device or torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
         )
@@ -988,14 +993,20 @@ class DINOv3UNet3DPipeline(nn.Module):
             input_size=input_size,
         )
 
-    def extract_dinov3_features_3d(self, volume):
+    def extract_dinov3_features_3d(
+        self, volume, use_orthogonal_planes=None, enable_timing=False
+    ):
         """
-        Extract DINOv3 features from a 3D volume by processing each slice.
+        Extract DINOv3 features from a 3D volume by processing slices in orthogonal planes.
 
         Parameters:
         -----------
         volume : numpy.ndarray or torch.Tensor
             Volume of shape (batch_size, D, H, W) or (D, H, W)
+        use_orthogonal_planes : bool, optional
+            If True, processes slices in all 3 orthogonal planes (XY, XZ, YZ) and averages them.
+            If False, uses only XY planes (original behavior).
+            If None (default), uses the instance's use_orthogonal_planes setting.
 
         Returns:
         --------
@@ -1024,65 +1035,483 @@ class DINOv3UNet3DPipeline(nn.Module):
                 anti_aliasing=True,
             ).astype(volume.dtype)
 
-        # Process each slice with DINOv3
+        # Use instance variable if parameter not provided
+        if use_orthogonal_planes is None:
+            use_orthogonal_planes = self.use_orthogonal_planes
+
+        # Clear previous timing info if enabling timing
+        if enable_timing:
+            self._plane_timing_info = {}
+
+        if use_orthogonal_planes:
+            # Process all 3 orthogonal planes and average them
+            plane_features = []
+
+            # XY planes (slice along Z-axis) - original implementation
+            xy_features = self._extract_features_plane(
+                resized_volume,
+                "xy",
+                target_d,
+                target_h,
+                target_w,
+                slice_batch_size=1024,
+                enable_timing=enable_timing,
+            )
+            plane_features.append(xy_features)
+
+            # XZ planes (slice along Y-axis)
+            xz_features = self._extract_features_plane(
+                resized_volume,
+                "xz",
+                target_d,
+                target_h,
+                target_w,
+                slice_batch_size=1024,
+                enable_timing=enable_timing,
+            )
+            plane_features.append(xz_features)
+
+            # YZ planes (slice along X-axis)
+            yz_features = self._extract_features_plane(
+                resized_volume,
+                "yz",
+                target_d,
+                target_h,
+                target_w,
+                slice_batch_size=1024,
+                enable_timing=enable_timing,
+            )
+            plane_features.append(yz_features)
+
+            # Average the features from all three planes
+            batch_features = torch.stack(plane_features, dim=0).mean(dim=0)
+
+        else:
+            # Original behavior - only XY planes
+            batch_features = self._extract_features_plane(
+                resized_volume,
+                "xy",
+                target_d,
+                target_h,
+                target_w,
+                slice_batch_size=1024,
+                enable_timing=enable_timing,
+            )
+
+        result = batch_features.to(self.device)
+
+        if enable_timing:
+            return result, self._get_aggregated_timing_info()
+        else:
+            return result
+
+    def _extract_features_plane(
+        self,
+        resized_volume,
+        plane_type,
+        target_d,
+        target_h,
+        target_w,
+        slice_batch_size=1024,
+        enable_timing=False,
+    ):
+        """
+        Extract DINOv3 features from a specific plane orientation with batching.
+
+        Parameters:
+        -----------
+        resized_volume : numpy.ndarray
+            Volume of shape (batch_size, D, H, W)
+        plane_type : str
+            'xy', 'xz', or 'yz' indicating which plane to slice
+        target_d, target_h, target_w : int
+            Target dimensions
+        slice_batch_size : int, default=1
+            Number of slices to process simultaneously for efficiency
+
+        Returns:
+        --------
+        torch.Tensor: Features (batch_size, output_channels, D, H, W)
+        """
+        volume_batch_size = resized_volume.shape[0]
         all_features = []
 
-        for b in range(batch_size):
-            volume_features = []
+        for b in range(volume_batch_size):
+            # Collect all slices for this volume
+            all_slices = []
+            slice_dims = []
 
-            for z in range(target_d):
-                # Get slice and upsample for DINOv3
-                slice_2d = resized_volume[b, z]
+            if plane_type == "xy":
+                # Slice along Z-axis (XY planes)
+                for z in range(target_d):
+                    slice_2d = resized_volume[b, z]  # (H, W)
+                    all_slices.append(slice_2d)
+                    slice_dims.append((target_h, target_w))
 
-                # Upsample slice to DINOv3 input size
-                slice_upsampled = resize(
-                    slice_2d,
-                    (self.dinov3_slice_size, self.dinov3_slice_size),
-                    preserve_range=True,
-                    anti_aliasing=True,
-                ).astype(volume.dtype)
+            elif plane_type == "xz":
+                # Slice along Y-axis (XZ planes)
+                for y in range(target_h):
+                    slice_2d = resized_volume[b, :, y, :]  # (D, W)
+                    all_slices.append(slice_2d)
+                    slice_dims.append((target_d, target_w))
 
-                # Extract DINOv3 features for this slice
-                # Add batch dimension for DINOv3 processing
-                slice_batch = slice_upsampled[np.newaxis, ...]
-                dinov3_features = process(
-                    slice_batch
-                )  # (output_channels, 1, H_feat, W_feat)
+            elif plane_type == "yz":
+                # Slice along X-axis (YZ planes)
+                for x in range(target_w):
+                    slice_2d = resized_volume[b, :, :, x]  # (D, H)
+                    all_slices.append(slice_2d)
+                    slice_dims.append((target_d, target_h))
 
-                # Remove batch dimension and rearrange
-                slice_features = dinov3_features[
-                    :, 0, :, :
-                ]  # (output_channels, H_feat, W_feat)
+            # Process slices in batches
+            if enable_timing:
+                volume_features, batch_timing = self._process_slice_batch(
+                    all_slices, slice_dims, slice_batch_size, enable_timing=True
+                )
+                # Store timing info for this volume (we'll aggregate later)
+                if not hasattr(self, "_plane_timing_info"):
+                    self._plane_timing_info = {}
+                if plane_type not in self._plane_timing_info:
+                    self._plane_timing_info[plane_type] = []
+                self._plane_timing_info[plane_type].append(batch_timing)
+            else:
+                volume_features = self._process_slice_batch(
+                    all_slices, slice_dims, slice_batch_size
+                )
 
-                # Resize features back to target spatial size
-                slice_features_tensor = torch.tensor(
-                    slice_features, dtype=torch.float32
-                ).unsqueeze(
-                    0
-                )  # (1, output_channels, H_feat, W_feat)
-                slice_features_resized = F.interpolate(
-                    slice_features_tensor,
-                    size=(target_h, target_w),
-                    mode="bilinear",
-                    align_corners=False,
-                )  # (1, output_channels, target_h, target_w)
+            # Stack slices and reshape appropriately for each plane type
+            if plane_type == "xy":
+                # (output_channels, target_d, target_h, target_w)
+                volume_features_3d = torch.stack(volume_features, dim=1)
+            elif plane_type == "xz":
+                # Stack along H dimension, reshape to (output_channels, target_d, target_h, target_w)
+                stacked = torch.stack(
+                    volume_features, dim=2
+                )  # (output_channels, target_d, target_h, target_w)
+                volume_features_3d = stacked
+            elif plane_type == "yz":
+                # Stack along W dimension, reshape to (output_channels, target_d, target_h, target_w)
+                stacked = torch.stack(
+                    volume_features, dim=3
+                )  # (output_channels, target_d, target_h, target_w)
+                volume_features_3d = stacked
 
-                volume_features.append(
-                    slice_features_resized.squeeze(0)
-                )  # (output_channels, target_h, target_w)
-
-            # Stack slices to form 3D volume
-            volume_features_3d = torch.stack(
-                volume_features, dim=1
-            )  # (output_channels, target_d, target_h, target_w)
             all_features.append(volume_features_3d)
 
         # Stack batch
         batch_features = torch.stack(
             all_features, dim=0
         )  # (batch_size, output_channels, target_d, target_h, target_w)
+        return batch_features
 
-        return batch_features.to(self.device)
+    def _process_slice(self, slice_2d, target_dim1, target_dim2):
+        """
+        Process a 2D slice through DINOv3 and resize back to target dimensions.
+
+        Parameters:
+        -----------
+        slice_2d : numpy.ndarray
+            2D slice of shape (dim1, dim2)
+        target_dim1, target_dim2 : int
+            Target dimensions for the output
+
+        Returns:
+        --------
+        torch.Tensor: Features (output_channels, target_dim1, target_dim2)
+        """
+        # Upsample slice to DINOv3 input size
+        slice_upsampled = resize(
+            slice_2d,
+            (self.dinov3_slice_size, self.dinov3_slice_size),
+            preserve_range=True,
+            anti_aliasing=True,
+        ).astype(slice_2d.dtype)
+
+        # Extract DINOv3 features for this slice
+        slice_batch = slice_upsampled[np.newaxis, ...]
+        dinov3_features = process(slice_batch)  # (output_channels, 1, H_feat, W_feat)
+
+        # Remove batch dimension
+        slice_features = dinov3_features[
+            :, 0, :, :
+        ]  # (output_channels, H_feat, W_feat)
+
+        # Resize features back to target spatial size
+        slice_features_tensor = torch.tensor(
+            slice_features, dtype=torch.float32
+        ).unsqueeze(0)
+        slice_features_resized = F.interpolate(
+            slice_features_tensor,
+            size=(target_dim1, target_dim2),
+            mode="bilinear",
+            align_corners=False,
+        )
+
+        return slice_features_resized.squeeze(
+            0
+        )  # (output_channels, target_dim1, target_dim2)
+
+    def _process_slice_batch(
+        self, all_slices, slice_dims, batch_size, enable_timing=False
+    ):
+        """
+        Process multiple slices in batches for efficiency.
+
+        Parameters:
+        -----------
+        all_slices : list
+            List of 2D numpy arrays to process
+        slice_dims : list
+            List of (target_dim1, target_dim2) tuples for each slice
+        batch_size : int
+            Number of slices to process simultaneously
+        enable_timing : bool, default=False
+            Whether to enable detailed timing measurements
+
+        Returns:
+        --------
+        tuple: (all_features, timing_info) if enable_timing else all_features
+        """
+        from dinov3_playground.dinov3_core import process
+        from skimage.transform import resize
+        import torch.nn.functional as F
+        import time
+
+        all_features = []
+        num_slices = len(all_slices)
+
+        # Initialize timing info
+        timing_info = (
+            {
+                "total_upsampling_time": 0.0,
+                "total_stacking_time": 0.0,
+                "total_dinov3_inference_time": 0.0,
+                "total_feature_extraction_time": 0.0,
+                "total_downsampling_time": 0.0,
+                "num_batches": 0,
+                "avg_batch_size": 0.0,
+            }
+            if enable_timing
+            else None
+        )
+
+        for start_idx in range(0, num_slices, batch_size):
+            end_idx = min(start_idx + batch_size, num_slices)
+            batch_slices = all_slices[start_idx:end_idx]
+            batch_dims = slice_dims[start_idx:end_idx]
+
+            if enable_timing:
+                timing_info["num_batches"] += 1
+                timing_info["avg_batch_size"] += len(batch_slices)
+
+            # TIMING: Start upsampling
+            upsample_start = time.time() if enable_timing else None
+
+            # Prepare batch of upsampled slices
+            batch_upsampled = []
+            for slice_2d in batch_slices:
+                slice_upsampled = resize(
+                    slice_2d,
+                    (self.dinov3_slice_size, self.dinov3_slice_size),
+                    preserve_range=True,
+                    anti_aliasing=True,
+                ).astype(slice_2d.dtype)
+                batch_upsampled.append(slice_upsampled)
+
+            # TIMING: End upsampling, start stacking
+            if enable_timing:
+                upsample_end = time.time()
+                timing_info["total_upsampling_time"] += upsample_end - upsample_start
+                stack_start = time.time()
+
+            # Stack into batch: (batch_size, H, W)
+            batch_array = np.stack(batch_upsampled, axis=0)
+
+            # TIMING: End stacking, start DINOv3 inference
+            if enable_timing:
+                stack_end = time.time()
+                timing_info["total_stacking_time"] += stack_end - stack_start
+                dinov3_start = time.time()
+
+            # Process entire batch through DINOv3
+            batch_features = process(
+                batch_array
+            )  # (output_channels, batch_size, H_feat, W_feat)
+
+            # TIMING: End DINOv3 inference, start feature extraction
+            if enable_timing:
+                dinov3_end = time.time()
+                timing_info["total_dinov3_inference_time"] += dinov3_end - dinov3_start
+                extraction_start = time.time()
+
+            # OPTIMIZED: Convert entire batch_features to tensor at once
+            batch_features_tensor = torch.tensor(batch_features, dtype=torch.float32)
+            # batch_features_tensor shape: (output_channels, batch_size, H_feat, W_feat)
+            # Rearrange to: (batch_size, output_channels, H_feat, W_feat)
+            batch_features_tensor = batch_features_tensor.permute(1, 0, 2, 3)
+
+            # TIMING: End feature extraction, start batched downsampling
+            if enable_timing:
+                extraction_end = time.time()
+                timing_info["total_feature_extraction_time"] += (
+                    extraction_end - extraction_start
+                )
+                downsample_start = time.time()
+
+            # Group slices by target dimensions for efficient batch processing
+            dim_groups = {}
+            for i, (target_dim1, target_dim2) in enumerate(batch_dims):
+                dim_key = (target_dim1, target_dim2)
+                if dim_key not in dim_groups:
+                    dim_groups[dim_key] = []
+                dim_groups[dim_key].append(i)
+
+            # Process each dimension group in batch
+            slice_results = [None] * len(batch_slices)
+            for (target_dim1, target_dim2), indices in dim_groups.items():
+                if len(indices) > 1:
+                    # Multiple slices with same target dimensions - batch process
+                    group_features = batch_features_tensor[
+                        indices
+                    ]  # (group_size, output_channels, H_feat, W_feat)
+                    group_resized = F.interpolate(
+                        group_features,
+                        size=(target_dim1, target_dim2),
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                    # Store results back to original positions
+                    for j, idx in enumerate(indices):
+                        slice_results[idx] = group_resized[j]
+                else:
+                    # Single slice - process individually (still more efficient than before)
+                    idx = indices[0]
+                    single_feature = batch_features_tensor[
+                        idx : idx + 1
+                    ]  # (1, output_channels, H_feat, W_feat)
+                    single_resized = F.interpolate(
+                        single_feature,
+                        size=(target_dim1, target_dim2),
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                    slice_results[idx] = single_resized[0]
+
+            # Add all processed slices to results
+            for result in slice_results:
+                all_features.append(result)
+
+            # TIMING: End downsampling
+            if enable_timing:
+                downsample_end = time.time()
+                timing_info["total_downsampling_time"] += (
+                    downsample_end - downsample_start
+                )
+
+        # Calculate average batch size
+        if enable_timing and timing_info["num_batches"] > 0:
+            timing_info["avg_batch_size"] = (
+                timing_info["avg_batch_size"] / timing_info["num_batches"]
+            )
+
+        if enable_timing:
+            return all_features, timing_info
+        else:
+            return all_features
+
+    def _get_aggregated_timing_info(self):
+        """
+        Aggregate timing information from all planes and batches.
+
+        Returns:
+        --------
+        dict: Aggregated timing information with detailed breakdown
+        """
+        if not hasattr(self, "_plane_timing_info") or not self._plane_timing_info:
+            return {}
+
+        aggregated = {
+            "total_upsampling_time": 0.0,
+            "total_stacking_time": 0.0,
+            "total_dinov3_inference_time": 0.0,
+            "total_feature_extraction_time": 0.0,
+            "total_downsampling_time": 0.0,
+            "total_batches": 0,
+            "total_slices": 0,
+            "plane_breakdown": {},
+        }
+
+        for plane_type, batch_timings in self._plane_timing_info.items():
+            plane_total = {
+                "upsampling_time": 0.0,
+                "stacking_time": 0.0,
+                "dinov3_inference_time": 0.0,
+                "feature_extraction_time": 0.0,
+                "downsampling_time": 0.0,
+                "num_batches": 0,
+                "total_slices": 0,
+            }
+
+            for timing in batch_timings:
+                plane_total["upsampling_time"] += timing["total_upsampling_time"]
+                plane_total["stacking_time"] += timing["total_stacking_time"]
+                plane_total["dinov3_inference_time"] += timing[
+                    "total_dinov3_inference_time"
+                ]
+                plane_total["feature_extraction_time"] += timing[
+                    "total_feature_extraction_time"
+                ]
+                plane_total["downsampling_time"] += timing["total_downsampling_time"]
+                plane_total["num_batches"] += timing["num_batches"]
+                plane_total["total_slices"] += (
+                    timing["avg_batch_size"] * timing["num_batches"]
+                )
+
+                # Add to overall totals
+                aggregated["total_upsampling_time"] += timing["total_upsampling_time"]
+                aggregated["total_stacking_time"] += timing["total_stacking_time"]
+                aggregated["total_dinov3_inference_time"] += timing[
+                    "total_dinov3_inference_time"
+                ]
+                aggregated["total_feature_extraction_time"] += timing[
+                    "total_feature_extraction_time"
+                ]
+                aggregated["total_downsampling_time"] += timing[
+                    "total_downsampling_time"
+                ]
+                aggregated["total_batches"] += timing["num_batches"]
+
+            aggregated["total_slices"] += plane_total["total_slices"]
+            aggregated["plane_breakdown"][plane_type] = plane_total
+
+        # Calculate total time and percentages
+        total_time = (
+            aggregated["total_upsampling_time"]
+            + aggregated["total_stacking_time"]
+            + aggregated["total_dinov3_inference_time"]
+            + aggregated["total_feature_extraction_time"]
+            + aggregated["total_downsampling_time"]
+        )
+
+        aggregated["total_time"] = total_time
+
+        if total_time > 0:
+            aggregated["upsampling_percentage"] = (
+                aggregated["total_upsampling_time"] / total_time
+            ) * 100
+            aggregated["stacking_percentage"] = (
+                aggregated["total_stacking_time"] / total_time
+            ) * 100
+            aggregated["dinov3_inference_percentage"] = (
+                aggregated["total_dinov3_inference_time"] / total_time
+            ) * 100
+            aggregated["feature_extraction_percentage"] = (
+                aggregated["total_feature_extraction_time"] / total_time
+            ) * 100
+            aggregated["downsampling_percentage"] = (
+                aggregated["total_downsampling_time"] / total_time
+            ) * 100
+
+        return aggregated
 
     def forward(self, volume):
         """
@@ -1098,7 +1527,9 @@ class DINOv3UNet3DPipeline(nn.Module):
         torch.Tensor: 3D segmentation logits (batch_size, num_classes, D, H, W)
         """
         # Extract DINOv3 features
-        features = self.extract_dinov3_features_3d(volume)
+        features = self.extract_dinov3_features_3d(
+            volume, use_orthogonal_planes=self.use_orthogonal_planes
+        )
 
         # Pass through 3D UNet
         segmentation_logits = self.unet3d(features)
