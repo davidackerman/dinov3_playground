@@ -324,6 +324,19 @@ class MemoryEfficientDataLoader3D:
                     device_type="cuda" if device.type == "cuda" else "cpu",
                     enabled=False,
                 ):  # Disable autocast for metric calculations
+                    # DEBUG: Print stride processing info
+                    if not hasattr(self, "_stride_debug_printed") and b == 0 and z == 0:
+                        from tqdm import tqdm
+
+                        tqdm.write(
+                            f"  - DEBUG: Calling process() with stride={self.dinov3_stride}"
+                        )
+                        tqdm.write(f"  - DEBUG: Input slice shape: {slice_batch.shape}")
+                        tqdm.write(
+                            f"  - DEBUG: Expected feature size with stride={self.dinov3_stride}: {self.dinov3_slice_size // self.dinov3_stride if self.dinov3_stride else self.dinov3_slice_size // 16}x{self.dinov3_slice_size // self.dinov3_stride if self.dinov3_stride else self.dinov3_slice_size // 16}"
+                        )
+                        self._stride_debug_printed = True
+
                     dinov3_features = process(
                         slice_batch,
                         model_id=self.model_id,
@@ -376,7 +389,18 @@ class MemoryEfficientDataLoader3D:
                             tqdm.write(
                                 f"  - Sliding window context handled at ROI level"
                             )
-                            tqdm.write(f"  - Feature size: {patch_h}x{patch_w}")
+                            expected_size = (
+                                self.dinov3_slice_size // self.dinov3_stride
+                                if self.dinov3_stride
+                                else self.dinov3_slice_size // 16
+                            )
+                            tqdm.write(
+                                f"  - Feature size: {patch_h}x{patch_w} (expected: {expected_size}x{expected_size})"
+                            )
+                            if patch_h != expected_size:
+                                tqdm.write(
+                                    f"  - ⚠️  WARNING: Feature size mismatch! Stride processing may not be working."
+                                )
                             self._size_debug_printed = True
 
                         # Don't crop the features - keep the higher resolution
@@ -1733,7 +1757,9 @@ def train_3d_unet_memory_efficient_v2(
             # Process each validation volume independently
             for vol_idx in range(len(val_volumes)):
                 # Extract features for single volume (keeps GPU memory minimal)
-                single_vol = [val_volumes[vol_idx]]  # Make it a list for consistency
+                single_vol = np.array(
+                    [val_volumes[vol_idx]]
+                )  # Convert to numpy array with batch dimension
                 vol_features = data_loader_3d.extract_dinov3_features_3d(
                     single_vol, epoch=epoch
                 )

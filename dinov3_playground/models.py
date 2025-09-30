@@ -942,6 +942,7 @@ class DINOv3UNet3DPipeline(nn.Module):
         input_size=(112, 112, 112),
         dinov3_slice_size=896,
         base_channels=32,
+        input_channels=None,  # Add input_channels parameter
         device=None,
     ):
         """
@@ -957,6 +958,8 @@ class DINOv3UNet3DPipeline(nn.Module):
             Size for DINOv3 processing per slice (should be multiple of 16)
         base_channels : int, default=32
             Base number of channels in 3D UNet
+        input_channels : int, optional
+            Number of input channels for the 3D UNet (DINOv3 feature channels)
         device : torch.device, optional
             Device for processing
         """
@@ -969,9 +972,17 @@ class DINOv3UNet3DPipeline(nn.Module):
             "cuda" if torch.cuda.is_available() else "cpu"
         )
 
+        # Determine input channels (DINOv3 feature channels)
+        if input_channels is None:
+            # Fall back to getting from dinov3_core if not provided
+            from .dinov3_core import get_current_model_info
+
+            model_info = get_current_model_info()
+            input_channels = model_info["output_channels"]
+
         # 3D UNet for processing DINOv3 features
         self.unet3d = DINOv3UNet3D(
-            input_channels=output_channels,  # from .dinov3_core
+            input_channels=input_channels,
             num_classes=num_classes,
             base_channels=base_channels,
             input_size=input_size,

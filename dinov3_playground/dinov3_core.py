@@ -377,36 +377,37 @@ def _process_sliding_window(data, stride, patch_size, image_size):
     test_features = _process_single_standard(data[:1], image_size)  # Just first image
     output_channels = test_features.shape[0]
 
-    # Process shifts with progress bar and batching
+    # Collect all shifted data for batched processing
+    all_shifted_data = []
+
+    for dy, dx in shifts:
+        # Extract shifted windows from pre-padded data
+        shifted_data = np.zeros((batch_size, height, width), dtype=data.dtype)
+        for b in range(batch_size):
+            # Extract the shifted region
+            start_y = dy
+            start_x = dx
+            end_y = start_y + height
+            end_x = start_x + width
+            shifted_data[b] = padded_data[b, start_y:end_y, start_x:end_x]
+
+        all_shifted_data.append(shifted_data)
+
+    # Combine all shifts into one big batch for efficient processing
+    # Shape: (num_shifts * batch_size, height, width)
+    combined_shifted_data = np.concatenate(all_shifted_data, axis=0)
+
+    # Process all shifts in one DINOv3 call
+    combined_features = _process_single_standard(combined_shifted_data, image_size)
+
+    # Split the results back into individual shifts
+    # combined_features shape: (output_channels, num_shifts * batch_size, patch_h, patch_w)
     all_shift_features = []
-
-    # Group shifts into batches for more efficient processing
-    shift_batch_size = min(len(shifts), 4)  # Process up to 4 shifts at once
-
-    # Process shifts in batches (progress shown at higher level)
-    for batch_start in range(0, len(shifts), shift_batch_size):
-        batch_end = min(batch_start + shift_batch_size, len(shifts))
-        batch_shifts = shifts[batch_start:batch_end]
-
-        # Process this batch of shifts
-        batch_shift_features = []
-
-        for dy, dx in batch_shifts:
-            # Extract shifted windows from pre-padded data
-            shifted_data = np.zeros((batch_size, height, width), dtype=data.dtype)
-            for b in range(batch_size):
-                # Extract the shifted region
-                start_y = dy
-                start_x = dx
-                end_y = start_y + height
-                end_x = start_x + width
-                shifted_data[b] = padded_data[b, start_y:end_y, start_x:end_x]
-
-            # Process the shifted images through standard DINOv3
-            shift_features = _process_single_standard(shifted_data, image_size)
-            batch_shift_features.append(shift_features)
-
-        all_shift_features.extend(batch_shift_features)
+    for i in range(len(shifts)):
+        start_idx = i * batch_size
+        end_idx = start_idx + batch_size
+        shift_features = combined_features[:, start_idx:end_idx, :, :]
+        all_shift_features.append(shift_features)
 
     # Now we need to combine the shifted features into a higher resolution grid
     # Each shift gives us features at positions that are stride apart
@@ -419,8 +420,6 @@ def _process_sliding_window(data, stride, patch_size, image_size):
             all_shift_features, stride, patch_size, output_channels, batch_size
         )
 
-    # Debug output suppressed during training to show progress bars clearly
-    # print(f"Final high resolution features shape: {high_res_features.shape}")
     return high_res_features
 
 
@@ -564,6 +563,7 @@ def process(data, model_id=None, image_size=896, stride=None):
 
     # If stride is specified and different from patch size, use sliding window inference
     patch_size = model.config.patch_size
+
     if stride is not None and stride != patch_size:
         return _process_sliding_window(data, stride, patch_size, image_size)
 

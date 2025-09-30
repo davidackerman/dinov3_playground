@@ -371,6 +371,7 @@ class DINOv3UNet3DInference:
                 "learn_upsampling": self.training_config.get(
                     "learn_upsampling", False
                 ),  # NEW
+                "dinov3_stride": self.training_config.get("dinov3_stride", None),  # NEW
                 "model_id": self.training_config.get(
                     "model_id", "facebook/dinov3-vitl16-pretrain-sat493m"
                 ),
@@ -465,10 +466,18 @@ class DINOv3UNet3DInference:
             input_size=input_size,
             dinov3_slice_size=dinov3_slice_size,
             base_channels=base_channels,
+            input_channels=output_channels,  # Pass the input channels explicitly
             device=self.device,
         )
         # Replace the pipeline's UNet with our trained model
         self.pipeline.unet3d = self.unet3d
+
+        # Get stride parameter from training config (backward compatibility)
+        dinov3_stride = self.training_config.get("dinov3_stride", None)
+        if dinov3_stride is not None:
+            print(f"Using sliding window stride: {dinov3_stride}")
+        else:
+            print("Using standard DINOv3 inference (stride=16)")
 
         # Create minimal data loader for feature extraction compatibility
         # Use dummy 4D data with correct shape
@@ -479,9 +488,11 @@ class DINOv3UNet3DInference:
             train_volume_pool_size=1,
             val_volume_pool_size=1,
             target_volume_size=input_size,
+            dinov3_slice_size=dinov3_slice_size,
             seed=42,
             model_id=model_id,
             learn_upsampling=learn_upsampling,  # Match training mode
+            dinov3_stride=dinov3_stride,  # Match training stride
         )
 
         print(f"✅ 3D Model loaded successfully!")
@@ -491,6 +502,8 @@ class DINOv3UNet3DInference:
         print(f"   - DINOv3 channels: {output_channels}")
         print(f"   - DINOv3 image size: {image_size}")
         print(f"   - DINOv3 slice size: {dinov3_slice_size}")
+        print(f"   - DINOv3 stride: {dinov3_stride}")
+        print(f"   - Learn upsampling: {learn_upsampling}")
         print(f"   - Model config keys: {list(self.model_config.keys())}")
         print(f"   - Training config keys: {list(self.training_config.keys())}")
 
