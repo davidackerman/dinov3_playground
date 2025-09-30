@@ -66,6 +66,7 @@ class MemoryEfficientDataLoader3D:
         model_id=None,
         learn_upsampling=False,  # NEW PARAMETER
         dinov3_stride=None,  # NEW PARAMETER for sliding window inference
+        use_orthogonal_planes=True,  # NEW PARAMETER for 3-plane processing
     ):
         """
         Initialize memory-efficient 3D data loader.
@@ -93,6 +94,9 @@ class MemoryEfficientDataLoader3D:
         dinov3_stride : int, optional
             Stride for DINOv3 sliding window inference. If None, uses patch_size (16).
             Use smaller values (e.g., 8, 4) for higher resolution features.
+        use_orthogonal_planes : bool, default=True
+            If True, processes slices in all 3 orthogonal planes (XY, XZ, YZ) and averages them.
+            If False, processes only XY planes (original behavior).
         """
 
         # Validate inputs with ROI-level padding support
@@ -145,6 +149,9 @@ class MemoryEfficientDataLoader3D:
         self.seed = seed  # Store seed for config saving
         self.learn_upsampling = learn_upsampling  # Store upsampling mode
         self.dinov3_stride = dinov3_stride  # Store sliding window stride
+        self.use_orthogonal_planes = (
+            use_orthogonal_planes  # Store orthogonal planes mode
+        )
 
         # Calculate padding requirements for sliding window
         self._calculate_padding_requirements()
@@ -234,12 +241,15 @@ class MemoryEfficientDataLoader3D:
 
         return val_volumes, val_gt
 
-    def extract_dinov3_features_3d(self, volumes, epoch=None, batch=None):
+    def extract_dinov3_features_3d(
+        self, volumes, epoch=None, batch=None, enable_detailed_timing=False
+    ):
         """
-        Extract DINOv3 features from 3D volumes by processing each slice.
+        Extract DINOv3 features from 3D volumes by processing slices.
+        Uses orthogonal planes if enabled.
         """
-        from .dinov3_core import process, get_current_model_info
-        from skimage.transform import resize
+        from .models import DINOv3UNet3DPipeline
+        from .dinov3_core import get_current_model_info
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -247,246 +257,73 @@ class MemoryEfficientDataLoader3D:
             volumes = volumes[np.newaxis, ...]
 
         batch_size, depth, height, width = volumes.shape
-        target_d, target_h, target_w = self.target_volume_size
 
         # Get current model info to determine output channels
         model_info = get_current_model_info()
         current_output_channels = model_info["output_channels"]
 
-        # Check if input has ROI-level padding
-        has_roi_padding = (height != target_h) or (width != target_w)
-        if has_roi_padding:
-            roi_padding = max((height - target_h) // 2, (width - target_w) // 2)
-            # print(f"Detected ROI-level padding: {roi_padding} pixels, input {(height, width)} -> target {(target_h, target_w)}")
+        # Create a temporary pipeline instance for feature extraction
+        temp_pipeline = DINOv3UNet3DPipeline(
+            num_classes=2,  # Dummy value, only using for feature extraction
+            input_size=self.target_volume_size,
+            dinov3_slice_size=self.dinov3_slice_size,
+            base_channels=32,  # Dummy value
+            input_channels=current_output_channels,
+            use_orthogonal_planes=self.use_orthogonal_planes,
+            device=device,
+        )
 
-        # if epoch is not None and batch is not None:
-        #     print(f"Epoch {epoch}, Batch {batch}:")
-        # print(f"Processing {batch_size} volumes for DINOv3 feature extraction...")
-        # print(f"  - Volume shape: {volumes.shape}")
-        # print(f"  - Target volume size: {self.target_volume_size}")
-        # print(f"  - Expected output channels: {current_output_channels}")
-        # print(f"  - DINOv3 slice size: {self.dinov3_slice_size}")
-
+        # Process each volume through the pipeline's feature extractor
         all_features = []
 
         for b in range(batch_size):
-            volume_features = []
+            # Extract a single volume
+            single_volume = volumes[b : b + 1]  # Keep batch dimension
 
-            for z in range(target_d):
-                # Extract slice from potentially padded volume
-                if volumes.shape[1] == target_d:
-                    slice_2d = volumes[b, z]
-                else:
-                    # Need to resize the volume first (depth dimension)
-                    volume_resized = resize(
-                        volumes[b],
-                        (target_d, height, width),  # Keep spatial dimensions for now
-                        preserve_range=True,
-                        anti_aliasing=True,
+            # Use the pipeline's orthogonal feature extraction
+            if enable_detailed_timing:
+                volume_features, volume_timing = (
+                    temp_pipeline.extract_dinov3_features_3d(
+                        single_volume,
+                        use_orthogonal_planes=self.use_orthogonal_planes,
+                        enable_timing=True,
                     )
-                    slice_2d = volume_resized[z]
+                )
+                # Store timing for this volume
+                if b == 0:  # First volume, initialize timing aggregation
+                    detailed_timing = volume_timing
+                else:  # Subsequent volumes, aggregate timing
+                    for key in [
+                        "total_upsampling_time",
+                        "total_stacking_time",
+                        "total_dinov3_inference_time",
+                        "total_feature_extraction_time",
+                        "total_downsampling_time",
+                        "total_batches",
+                        "total_slices",
+                    ]:
+                        if key in detailed_timing:
+                            detailed_timing[key] += volume_timing.get(key, 0)
+            else:
+                volume_features = temp_pipeline.extract_dinov3_features_3d(
+                    single_volume, use_orthogonal_planes=self.use_orthogonal_planes
+                )
 
-                # Handle ROI-level padding: crop to target spatial size
-                if has_roi_padding:
-                    # Crop from center of padded slice
-                    start_h = (height - target_h) // 2
-                    start_w = (width - target_w) // 2
-                    slice_2d = slice_2d[
-                        start_h : start_h + target_h, start_w : start_w + target_w
-                    ]
+            # volume_features shape: (1, output_channels, D, H, W)
+            # Remove batch dimension and add to results
+            all_features.append(
+                volume_features.squeeze(0)
+            )  # (output_channels, D, H, W)
 
-                # Ensure slice is exactly the target spatial size
-                if slice_2d.shape != (target_h, target_w):
-                    slice_2d = resize(
-                        slice_2d,
-                        (target_h, target_w),
-                        preserve_range=True,
-                        anti_aliasing=True,
-                    ).astype(volumes.dtype)
+        # Stack all volumes back into batch format
+        batch_features = torch.stack(
+            all_features, dim=0
+        )  # (batch_size, output_channels, D, H, W)
 
-                # FIXED: Upsample to the correct DINOv3 input size
-                # The issue was here - we need to match the size that DINOv3 was initialized with
-                slice_upsampled = resize(
-                    slice_2d,
-                    (self.dinov3_slice_size, self.dinov3_slice_size),
-                    preserve_range=True,
-                    anti_aliasing=True,
-                ).astype(volumes.dtype)
-
-                # Note: Sliding window padding is now handled at ROI level, not per-slice
-                # No additional padding needed here since ROI-level padding already provides context
-
-                # Extract features
-                slice_batch = slice_upsampled[np.newaxis, ...]
-
-                # Use updated autocast
-                with autocast(
-                    device_type="cuda" if device.type == "cuda" else "cpu",
-                    enabled=False,
-                ):  # Disable autocast for metric calculations
-                    # DEBUG: Print stride processing info
-                    if not hasattr(self, "_stride_debug_printed") and b == 0 and z == 0:
-                        from tqdm import tqdm
-
-                        tqdm.write(
-                            f"  - DEBUG: Calling process() with stride={self.dinov3_stride}"
-                        )
-                        tqdm.write(f"  - DEBUG: Input slice shape: {slice_batch.shape}")
-                        tqdm.write(
-                            f"  - DEBUG: Expected feature size with stride={self.dinov3_stride}: {self.dinov3_slice_size // self.dinov3_stride if self.dinov3_stride else self.dinov3_slice_size // 16}x{self.dinov3_slice_size // self.dinov3_stride if self.dinov3_stride else self.dinov3_slice_size // 16}"
-                        )
-                        self._stride_debug_printed = True
-
-                    dinov3_features = process(
-                        slice_batch,
-                        model_id=self.model_id,
-                        image_size=self.dinov3_slice_size,  # Use original size - ROI padding handles context
-                        stride=self.dinov3_stride,  # Sliding window inference enabled
-                    )
-
-                # Convert to torch tensor if it's numpy (ensure float32 for model compatibility)
-                if isinstance(dinov3_features, np.ndarray):
-                    dinov3_features = torch.from_numpy(dinov3_features).float()
-
-                # DEBUG: Print feature information (only once per training session)
-                if not hasattr(self, "_debug_printed") and b == 0 and z == 0:
-                    from tqdm import tqdm
-
-                    tqdm.write(f"  - DINOv3 features shape: {dinov3_features.shape}")
-                    tqdm.write(f"  - DINOv3 features size: {dinov3_features.numel()}")
-                    tqdm.write(f"  - DINOv3 features type: {type(dinov3_features)}")
-                    self._debug_printed = True
-
-                # FIXED: Handle the actual DINOv3 output format
-                # DINOv3 returns (channels, batch_size, patch_h, patch_w)
-                if len(dinov3_features.shape) == 4:
-                    # Expected format: (channels, batch_size, patch_h, patch_w)
-                    channels, batch_dim, patch_h, patch_w = dinov3_features.shape
-
-                    if batch_dim != 1:
-                        raise ValueError(f"Expected batch size 1, got {batch_dim}")
-
-                    # Remove batch dimension: (channels, patch_h, patch_w)
-                    features_2d = dinov3_features.squeeze(1)
-
-                    # With sliding window inference, we get higher resolution features
-                    if self.dinov3_stride is not None and self.dinov3_stride < 16:
-                        # Higher resolution due to sliding window (ROI-level padding provides context)
-                        expected_features_size = (
-                            self.dinov3_slice_size // self.dinov3_stride
-                        )
-
-                        # DEBUG: Print sizing information
-                        if (
-                            not hasattr(self, "_size_debug_printed")
-                            and b == 0
-                            and z == 0
-                        ):
-                            from tqdm import tqdm
-
-                            tqdm.write(f"  - Slice size: {self.dinov3_slice_size}")
-                            tqdm.write(f"  - Stride: {self.dinov3_stride}")
-                            tqdm.write(
-                                f"  - Sliding window context handled at ROI level"
-                            )
-                            expected_size = (
-                                self.dinov3_slice_size // self.dinov3_stride
-                                if self.dinov3_stride
-                                else self.dinov3_slice_size // 16
-                            )
-                            tqdm.write(
-                                f"  - Feature size: {patch_h}x{patch_w} (expected: {expected_size}x{expected_size})"
-                            )
-                            if patch_h != expected_size:
-                                tqdm.write(
-                                    f"  - ⚠️  WARNING: Feature size mismatch! Stride processing may not be working."
-                                )
-                            self._size_debug_printed = True
-
-                        # Don't crop the features - keep the higher resolution
-                        # The UNet will handle the size differences through learned upsampling
-                        pass  # Keep features_2d as is
-
-                elif len(dinov3_features.shape) == 3:
-                    # Alternative format: (batch_size, tokens, channels) or similar
-                    # This shouldn't happen with the current process() function, but handle just in case
-                    if dinov3_features.shape[0] == 1:
-                        # Batch first format
-                        features_flat = dinov3_features.squeeze(0)  # Remove batch dim
-                        # Reshape based on expected channels
-                        if features_flat.shape[1] == current_output_channels:
-                            # (tokens, channels) -> need to reshape to spatial
-                            tokens = features_flat.shape[0]
-                            spatial_size = int(np.sqrt(tokens))
-                            features_2d = features_flat.transpose(0, 1).reshape(
-                                current_output_channels, spatial_size, spatial_size
-                            )
-                        else:
-                            raise ValueError(
-                                f"Unexpected feature shape: {dinov3_features.shape}"
-                            )
-                    else:
-                        raise ValueError(
-                            f"Unexpected feature shape: {dinov3_features.shape}"
-                        )
-
-                else:
-                    raise ValueError(
-                        f"Unexpected DINOv3 features shape: {dinov3_features.shape}"
-                    )
-
-                # DEBUG: Print reshaped features (only once per training session)
-                # Debug output suppressed during training to show progress bars clearly
-                if not hasattr(self, "_reshape_debug_printed") and b == 0 and z == 0:
-                    self._reshape_debug_printed = True
-
-                # Resize to target spatial dimensions (skip if learning upsampling)
-                if self.learn_upsampling:
-                    # Keep features at DINOv3 native resolution
-                    features_resized = features_2d
-
-                    # DEBUG: Print native resolution features (only once per training session)
-                    # Debug output suppressed during training to show progress bars clearly
-                    if not hasattr(self, "_native_debug_printed") and b == 0 and z == 0:
-                        self._native_debug_printed = True
-                else:
-                    # Traditional interpolation upsampling
-                    features_resized = torch.nn.functional.interpolate(
-                        features_2d.unsqueeze(0),  # Add batch dimension
-                        size=(target_h, target_w),
-                        mode="bilinear",
-                        align_corners=False,
-                    ).squeeze(
-                        0
-                    )  # Remove batch dimension
-
-                    # DEBUG: Print interpolated features (only once per training session)
-                    if not hasattr(self, "_resize_debug_printed") and b == 0 and z == 0:
-                        from tqdm import tqdm
-
-                        tqdm.write(
-                            f"  - Interpolated features shape: {features_resized.shape}"
-                        )
-                        self._resize_debug_printed = True
-
-                volume_features.append(features_resized)
-
-            # Stack along depth dimension
-            volume_features_3d = torch.stack(
-                volume_features, dim=1
-            )  # (channels, depth, height, width)
-            all_features.append(volume_features_3d)
-
-        batch_features = torch.stack(all_features, dim=0)
-
-        # DEBUG: Print final batch shape (only once per training session)
-        if not hasattr(self, "_batch_debug_printed"):
-            from tqdm import tqdm
-
-            tqdm.write(f"  - Final batch features shape: {batch_features.shape}")
-            self._batch_debug_printed = True
-
-        return batch_features.to(device)
+        if enable_detailed_timing:
+            return batch_features, detailed_timing
+        else:
+            return batch_features
 
     def get_data_info(self):
         """
@@ -1656,11 +1493,22 @@ def train_3d_unet_memory_efficient_v2(
                 volumes_per_batch
             )
 
-            # Extract DINOv3 features for 3D UNet
-            train_features = data_loader_3d.extract_dinov3_features_3d(
-                train_volumes, epoch, batch_idx
+            # TIMING: Start DINOv3 feature extraction
+            dinov3_start = time.time()
+
+            # Extract DINOv3 features for 3D UNet with detailed timing
+            train_features, detailed_timing = data_loader_3d.extract_dinov3_features_3d(
+                train_volumes, epoch, batch_idx, enable_detailed_timing=True
             )
+
+            # TIMING: End DINOv3 feature extraction
+            dinov3_end = time.time()
+            dinov3_time = dinov3_end - dinov3_start
+
             train_labels = torch.tensor(train_gt_volumes, dtype=torch.long).to(device)
+
+            # TIMING: Start training step (UNet forward/backward)
+            training_start = time.time()
 
             # Training step
             optimizer.zero_grad()
@@ -1690,6 +1538,10 @@ def train_3d_unet_memory_efficient_v2(
             if device.type == "cuda":
                 torch.cuda.empty_cache()
 
+            # TIMING: End training step
+            training_end = time.time()
+            training_time = training_end - training_start
+
             # Track metrics
             with autocast(
                 device_type="cuda" if device.type == "cuda" else "cpu", enabled=False
@@ -1710,6 +1562,44 @@ def train_3d_unet_memory_efficient_v2(
                     class_total = class_mask.sum().item()
                     epoch_train_class_correct[class_id] += class_correct
                     epoch_train_class_total[class_id] += class_total
+
+            # TIMING: Print timing breakdown for this batch
+            total_batch_time = dinov3_time + training_time
+            dinov3_pct = (dinov3_time / total_batch_time) * 100
+            training_pct = (training_time / total_batch_time) * 100
+
+            # Print timing every 5 batches or on first batch
+            if batch_idx % 5 == 0 or batch_idx == 0:
+                tqdm.write(f"  Batch {batch_idx+1} Timing:")
+                tqdm.write(
+                    f"    DINOv3 extraction: {dinov3_time:.3f}s ({dinov3_pct:.1f}%)"
+                )
+                tqdm.write(
+                    f"    UNet training:      {training_time:.3f}s ({training_pct:.1f}%)"
+                )
+                tqdm.write(f"    Total batch time:   {total_batch_time:.3f}s")
+
+                # Print detailed DINOv3 timing breakdown if available
+                if "detailed_timing" in locals() and detailed_timing:
+                    tqdm.write(f"    DINOv3 Detailed Breakdown:")
+                    tqdm.write(
+                        f"      Slice upsampling:    {detailed_timing.get('total_upsampling_time', 0):.3f}s ({detailed_timing.get('upsampling_percentage', 0):.1f}%)"
+                    )
+                    tqdm.write(
+                        f"      Batch stacking:      {detailed_timing.get('total_stacking_time', 0):.3f}s ({detailed_timing.get('stacking_percentage', 0):.1f}%)"
+                    )
+                    tqdm.write(
+                        f"      DINOv3 inference:    {detailed_timing.get('total_dinov3_inference_time', 0):.3f}s ({detailed_timing.get('dinov3_inference_percentage', 0):.1f}%)"
+                    )
+                    tqdm.write(
+                        f"      Feature extraction:  {detailed_timing.get('total_feature_extraction_time', 0):.3f}s ({detailed_timing.get('feature_extraction_percentage', 0):.1f}%)"
+                    )
+                    tqdm.write(
+                        f"      Feature downsampling:{detailed_timing.get('total_downsampling_time', 0):.3f}s ({detailed_timing.get('downsampling_percentage', 0):.1f}%)"
+                    )
+                    tqdm.write(
+                        f"      Total slices processed: {detailed_timing.get('total_slices', 0)} in {detailed_timing.get('total_batches', 0)} batches"
+                    )
 
             # Update progress bar with current metrics
             current_loss = epoch_train_loss / max(epoch_train_total, 1)
@@ -1754,15 +1644,36 @@ def train_3d_unet_memory_efficient_v2(
             val_class_total_gt = np.zeros(num_classes)  # For recall calculation
             val_class_total_pred = np.zeros(num_classes)  # For precision calculation
 
+            # Initialize validation timing accumulators
+            total_val_dinov3_time = 0.0
+            total_val_inference_time = 0.0
+
             # Process each validation volume independently
             for vol_idx in range(len(val_volumes)):
+                # TIMING: Start DINOv3 validation feature extraction
+                val_dinov3_start = time.time()
+
                 # Extract features for single volume (keeps GPU memory minimal)
                 single_vol = np.array(
                     [val_volumes[vol_idx]]
                 )  # Convert to numpy array with batch dimension
-                vol_features = data_loader_3d.extract_dinov3_features_3d(
-                    single_vol, epoch=epoch
-                )
+                # Extract features with detailed timing for first validation volume
+                if (
+                    vol_idx == 0
+                ):  # Only get detailed timing for first volume to avoid spam
+                    vol_features, val_detailed_timing = (
+                        data_loader_3d.extract_dinov3_features_3d(
+                            single_vol, epoch=epoch, enable_detailed_timing=True
+                        )
+                    )
+                else:
+                    vol_features = data_loader_3d.extract_dinov3_features_3d(
+                        single_vol, epoch=epoch
+                    )
+
+                # TIMING: End DINOv3 validation feature extraction
+                val_dinov3_end = time.time()
+                val_dinov3_time = val_dinov3_end - val_dinov3_start
 
                 # Get ground truth for this volume and move to GPU
                 vol_gt = (
@@ -1770,6 +1681,9 @@ def train_3d_unet_memory_efficient_v2(
                     .unsqueeze(0)
                     .to(device)
                 )
+
+                # TIMING: Start validation inference
+                val_inference_start = time.time()
 
                 # Run inference on single volume
                 if use_mixed_precision:
@@ -1781,6 +1695,14 @@ def train_3d_unet_memory_efficient_v2(
                 else:
                     vol_logits = unet3d(vol_features)
                     vol_loss = criterion(vol_logits, vol_gt).item()
+
+                # TIMING: End validation inference
+                val_inference_end = time.time()
+                val_inference_time = val_inference_end - val_inference_start
+
+                # Accumulate validation timing
+                total_val_dinov3_time += val_dinov3_time
+                total_val_inference_time += val_inference_time
 
                 # Convert to predictions
                 vol_predictions = torch.argmax(vol_logits.float(), dim=1)
@@ -1824,6 +1746,58 @@ def train_3d_unet_memory_efficient_v2(
             # Calculate final validation metrics from accumulated values
             val_loss = val_total_loss / val_total_voxels
             val_acc = val_total_correct / val_total_voxels
+
+            # TIMING: Print validation timing summary
+            total_val_time = total_val_dinov3_time + total_val_inference_time
+            val_dinov3_pct = (
+                (total_val_dinov3_time / total_val_time) * 100
+                if total_val_time > 0
+                else 0
+            )
+            val_inference_pct = (
+                (total_val_inference_time / total_val_time) * 100
+                if total_val_time > 0
+                else 0
+            )
+            avg_val_dinov3_time = (
+                total_val_dinov3_time / len(val_volumes) if len(val_volumes) > 0 else 0
+            )
+            avg_val_inference_time = (
+                total_val_inference_time / len(val_volumes)
+                if len(val_volumes) > 0
+                else 0
+            )
+
+            print(f"\n  Validation Timing Summary ({len(val_volumes)} volumes):")
+            print(
+                f"    Total DINOv3 extraction: {total_val_dinov3_time:.3f}s ({val_dinov3_pct:.1f}%) - Avg: {avg_val_dinov3_time:.3f}s/vol"
+            )
+            print(
+                f"    Total UNet inference:     {total_val_inference_time:.3f}s ({val_inference_pct:.1f}%) - Avg: {avg_val_inference_time:.3f}s/vol"
+            )
+            print(f"    Total validation time:    {total_val_time:.3f}s")
+
+            # Print detailed DINOv3 breakdown if available (from first validation volume)
+            if "val_detailed_timing" in locals() and val_detailed_timing:
+                print(f"    DINOv3 Detailed Breakdown (first volume):")
+                print(
+                    f"      Slice upsampling:    {val_detailed_timing.get('total_upsampling_time', 0):.3f}s ({val_detailed_timing.get('upsampling_percentage', 0):.1f}%)"
+                )
+                print(
+                    f"      Batch stacking:      {val_detailed_timing.get('total_stacking_time', 0):.3f}s ({val_detailed_timing.get('stacking_percentage', 0):.1f}%)"
+                )
+                print(
+                    f"      DINOv3 inference:    {val_detailed_timing.get('total_dinov3_inference_time', 0):.3f}s ({val_detailed_timing.get('dinov3_inference_percentage', 0):.1f}%)"
+                )
+                print(
+                    f"      Feature extraction:  {val_detailed_timing.get('total_feature_extraction_time', 0):.3f}s ({val_detailed_timing.get('feature_extraction_percentage', 0):.1f}%)"
+                )
+                print(
+                    f"      Feature downsampling:{val_detailed_timing.get('total_downsampling_time', 0):.3f}s ({val_detailed_timing.get('downsampling_percentage', 0):.1f}%)"
+                )
+                print(
+                    f"      Total slices processed: {val_detailed_timing.get('total_slices', 0)} in {val_detailed_timing.get('total_batches', 0)} batches"
+                )
 
             # Calculate comprehensive per-class validation metrics
             val_class_acc = []  # Recall/Sensitivity
@@ -1994,6 +1968,7 @@ def train_3d_unet_memory_efficient_v2(
                     "use_gradient_checkpointing": use_gradient_checkpointing,
                     "memory_efficient_mode": memory_efficient_mode,
                     "learn_upsampling": learn_upsampling,  # Add upsampling mode
+                    "use_orthogonal_planes": data_loader_3d.use_orthogonal_planes,  # Add orthogonal planes setting
                     "train_volume_pool_size": data_loader_3d.train_volume_pool_size,
                     "val_volume_pool_size": data_loader_3d.val_volume_pool_size,
                 },
@@ -2319,6 +2294,7 @@ def train_3d_unet_with_memory_efficient_loader(
     memory_efficient_mode="auto",  # "auto", "aggressive", "conservative"
     learn_upsampling=False,  # NEW PARAMETER
     dinov3_stride=None,  # NEW PARAMETER for sliding window inference
+    use_orthogonal_planes=False,  # NEW PARAMETER for orthogonal plane processing
 ):
     """
     Memory-efficient 3D UNet training with multiple precision and memory optimization options.
@@ -2331,6 +2307,10 @@ def train_3d_unet_with_memory_efficient_loader(
         - stride=8: 4x more features, 4x slower
         - stride=4: 16x more features, 16x slower
         Best used with learn_upsampling=True to avoid downsampling high-res features.
+    use_orthogonal_planes : bool, optional
+        Whether to use orthogonal plane processing (XY, XZ, YZ slices) for more comprehensive 3D features.
+        When True, processes slices in all three orientations and averages the features.
+        Default is False (standard Z-slice only processing).
     """
 
     # Auto-detect best memory settings
@@ -2458,6 +2438,7 @@ def train_3d_unet_with_memory_efficient_loader(
         model_id=model_id,
         learn_upsampling=learn_upsampling,
         dinov3_stride=dinov3_stride,  # NEW: Sliding window parameter
+        use_orthogonal_planes=use_orthogonal_planes,  # NEW: Orthogonal planes parameter
     )
 
     print("Data loader created successfully!")
