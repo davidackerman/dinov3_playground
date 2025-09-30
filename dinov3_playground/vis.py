@@ -1,4 +1,5 @@
 # from dacapo_toolbox vis
+# %%
 import matplotlib.pyplot as plt
 from funlib.geometry import Coordinate
 from matplotlib import animation
@@ -49,9 +50,9 @@ def pca_nd(emb: Array, n_components: int = 3) -> Array:
     )
 
 
-def get_cmap(seed: int = 1) -> ListedColormap:
+def get_cmap(seed: int = 47) -> ListedColormap:
     np.random.seed(seed)
-    colors = [[0, 0, 0]] + [
+    colors = [[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1]] + [
         list(np.random.choice(range(256), size=3) / 255.0) for _ in range(255)
     ]
     return ListedColormap(colors)
@@ -65,22 +66,63 @@ def gif_2d(
     fps: int = 10,
     overwrite: bool = False,
 ):
+    """
+    Create a 2D animated GIF from 3D arrays.
+
+    Parameters:
+    -----------
+    arrays : dict[str, Array]
+        Dictionary of arrays to visualize. For "combined" type, the value should be
+        a tuple/list of (raw_array, labels_array).
+    array_types : dict[str, str]
+        Dictionary specifying the type of each array. Supported types:
+        - "raw": Raw data displayed in grayscale
+        - "labels": Label data with random colormap
+        - "pca": PCA-transformed data
+        - "affs": Affinity data
+        - "combined": Overlay labels on raw data with transparency (requires tuple of arrays)
+    filename : str
+        Output filename for the GIF
+    title : str
+        Title for the visualization
+    fps : int, default=10
+        Frames per second for the animation
+    overwrite : bool, default=False
+        Whether to overwrite existing files
+    """
     if Path(filename).exists() and not overwrite:
         return
     transformed_arrays = {}
     for key, arr in arrays.items():
-        assert (
-            arr.voxel_size.dims == 3
-        ), f"Array {key} must be 3D, got {arr.voxel_size.dims}D"
-        if array_types[key] == "pca":
-            transformed_arrays[key] = pca_nd(arr)
+        if array_types[key] == "combined":
+            # For combined type, expect arr to be a tuple/list of (raw_array, labels_array)
+            raw_arr, labels_arr = arr
+            assert (
+                raw_arr.voxel_size.dims == 3
+            ), f"Raw array for {key} must be 3D, got {raw_arr.voxel_size.dims}D"
+            assert (
+                labels_arr.voxel_size.dims == 3
+            ), f"Labels array for {key} must be 3D, got {labels_arr.voxel_size.dims}D"
+            transformed_arrays[key] = (raw_arr, labels_arr)
         else:
-            transformed_arrays[key] = arr
+            assert (
+                arr.voxel_size.dims == 3
+            ), f"Array {key} must be 3D, got {arr.voxel_size.dims}D"
+            if array_types[key] == "pca":
+                transformed_arrays[key] = pca_nd(arr)
+            else:
+                transformed_arrays[key] = arr
     arrays = transformed_arrays
 
     z_slices = None
-    for arr in arrays.values():
-        arr_z_slices = arr.roi.shape[0] // arr.voxel_size[0]
+    for key, arr in arrays.items():
+        if array_types[key] == "combined":
+            # For combined type, use the raw array (first element) for z_slices calculation
+            raw_arr, _ = arr
+            arr_z_slices = raw_arr.roi.shape[0] // raw_arr.voxel_size[0]
+        else:
+            arr_z_slices = arr.roi.shape[0] // arr.voxel_size[0]
+
         if z_slices is None:
             z_slices = arr_z_slices
         else:
@@ -97,21 +139,22 @@ def gif_2d(
     for ii in range(z_slices):
         slice_ims = []
         for jj, (key, arr) in enumerate(arrays.items()):
-            roi = arr.roi.copy()
-            roi.offset += Coordinate((ii,) + (0,) * (roi.dims - 1)) * arr.voxel_size
-            roi.shape = Coordinate((arr.voxel_size[0], *roi.shape[1:]))
-            # Show the raw data
-            x = arr[roi].squeeze(-arr.voxel_size.dims)  # squeeze out z dim
-            shape = x.shape
-            scale_factor = shape[-2] // 256 if shape[-2] > 256 else 1
-            # only show 256x256 pixels, more resolution not needed for gif
-            if len(shape) == 2:
-                x = x[::scale_factor, ::scale_factor]
-            elif len(shape) == 3:
-                x = x[:, ::scale_factor, ::scale_factor]
-            else:
-                raise ValueError("Array must be 2D with or without channels")
             if array_types[key] == "labels":
+                roi = arr.roi.copy()
+                roi.offset += Coordinate((ii,) + (0,) * (roi.dims - 1)) * arr.voxel_size
+                roi.shape = Coordinate((arr.voxel_size[0], *roi.shape[1:]))
+                # Show the raw data
+                x = arr[roi].squeeze(-arr.voxel_size.dims)  # squeeze out z dim
+                shape = x.shape
+                scale_factor = shape[-2] // 256 if shape[-2] > 256 else 1
+                # only show 256x256 pixels, more resolution not needed for gif
+                if len(shape) == 2:
+                    x = x[::scale_factor, ::scale_factor]
+                elif len(shape) == 3:
+                    x = x[:, ::scale_factor, ::scale_factor]
+                else:
+                    raise ValueError("Array must be 2D with or without channels")
+
                 im = axes[jj].imshow(
                     x % 256,
                     vmin=0,
@@ -120,7 +163,105 @@ def gif_2d(
                     interpolation="none",
                     animated=ii != 0,
                 )
+            elif array_types[key] == "combined":
+                # Expected format: arrays[key] should be a tuple/list of (raw_array, labels_array)
+                raw_arr, labels_arr = arrays[key]
+
+                # Get the raw and labels slices for this z position
+                raw_roi = raw_arr.roi.copy()
+                raw_roi.offset += (
+                    Coordinate((ii,) + (0,) * (raw_roi.dims - 1)) * raw_arr.voxel_size
+                )
+                raw_roi.shape = Coordinate((raw_arr.voxel_size[0], *raw_roi.shape[1:]))
+                raw_x = raw_arr[raw_roi].squeeze(-raw_arr.voxel_size.dims)
+
+                labels_roi = labels_arr.roi.copy()
+                labels_roi.offset += (
+                    Coordinate((ii,) + (0,) * (labels_roi.dims - 1))
+                    * labels_arr.voxel_size
+                )
+                labels_roi.shape = Coordinate(
+                    (labels_arr.voxel_size[0], *labels_roi.shape[1:])
+                )
+                labels_x = labels_arr[labels_roi].squeeze(-labels_arr.voxel_size.dims)
+
+                # Apply same scaling as done above
+                shape = raw_x.shape
+                scale_factor = shape[-2] // 256 if shape[-2] > 256 else 1
+                if len(shape) == 2:
+                    raw_x = raw_x[::scale_factor, ::scale_factor]
+                    labels_x = labels_x[::scale_factor, ::scale_factor]
+                elif len(shape) == 3:
+                    raw_x = raw_x[:, ::scale_factor, ::scale_factor]
+                    labels_x = labels_x[:, ::scale_factor, ::scale_factor]
+
+                # Normalize raw data for display
+                if raw_x.ndim == 2:
+                    # Normalize and convert to RGB (not RGBA)
+                    normalized = (raw_x - raw_x.min()) / (
+                        raw_x.max() - raw_x.min() + 1e-8
+                    )
+                    raw_display = np.stack([normalized] * 3, axis=-1)  # Convert to RGB
+                elif raw_x.ndim == 3:
+                    raw_display = raw_x.transpose(1, 2, 0)
+                    if raw_display.shape[2] == 1:
+                        raw_display = np.repeat(raw_display, 3, axis=2)
+                    raw_display = (raw_display - raw_display.min()) / (
+                        raw_display.max() - raw_display.min() + 1e-8
+                    )
+
+                # Create labels overlay with transparency
+                labels_colored = label_cmap((labels_x % 256) / 255.0)
+                # Extract only RGB channels (drop alpha channel)
+                labels_rgb = labels_colored[..., :3]
+
+                # Create alpha mask (transparent where labels are 0/background)
+                alpha_mask = (labels_x > 0).astype(
+                    float
+                ) * 0.4  # 40% opacity for labels
+
+                # Ensure raw_display is RGB (3 channels)
+                if raw_display.ndim == 3:
+                    if raw_display.shape[2] == 4:  # RGBA -> RGB
+                        raw_rgb = raw_display[..., :3]
+                    elif raw_display.shape[2] == 3:  # Already RGB
+                        raw_rgb = raw_display
+                    elif raw_display.shape[2] == 1:  # Single channel -> RGB
+                        raw_rgb = np.repeat(raw_display, 3, axis=2)
+                    else:
+                        raw_rgb = raw_display  # Hope for the best
+                else:
+                    # 2D grayscale -> RGB
+                    raw_rgb = np.stack([raw_display] * 3, axis=-1)
+
+                # Combine raw and labels
+                combined = raw_rgb.copy()
+                mask = alpha_mask > 0
+                if mask.any():
+                    combined[mask] = (1 - alpha_mask[mask][..., np.newaxis]) * raw_rgb[
+                        mask
+                    ] + alpha_mask[mask][..., np.newaxis] * labels_rgb[mask]
+
+                im = axes[jj].imshow(
+                    combined,
+                    animated=ii != 0,
+                )
             elif array_types[key] == "raw" or array_types[key] == "pca":
+                roi = arr.roi.copy()
+                roi.offset += Coordinate((ii,) + (0,) * (roi.dims - 1)) * arr.voxel_size
+                roi.shape = Coordinate((arr.voxel_size[0], *roi.shape[1:]))
+                # Show the raw data
+                x = arr[roi].squeeze(-arr.voxel_size.dims)  # squeeze out z dim
+                shape = x.shape
+                scale_factor = shape[-2] // 256 if shape[-2] > 256 else 1
+                # only show 256x256 pixels, more resolution not needed for gif
+                if len(shape) == 2:
+                    x = x[::scale_factor, ::scale_factor]
+                elif len(shape) == 3:
+                    x = x[:, ::scale_factor, ::scale_factor]
+                else:
+                    raise ValueError("Array must be 2D with or without channels")
+
                 if x.ndim == 2:
                     im = axes[jj].imshow(
                         x,
@@ -133,6 +274,21 @@ def gif_2d(
                         animated=ii != 0,
                     )
             elif array_types[key] == "affs":
+                roi = arr.roi.copy()
+                roi.offset += Coordinate((ii,) + (0,) * (roi.dims - 1)) * arr.voxel_size
+                roi.shape = Coordinate((arr.voxel_size[0], *roi.shape[1:]))
+                # Show the raw data
+                x = arr[roi].squeeze(-arr.voxel_size.dims)  # squeeze out z dim
+                shape = x.shape
+                scale_factor = shape[-2] // 256 if shape[-2] > 256 else 1
+                # only show 256x256 pixels, more resolution not needed for gif
+                if len(shape) == 2:
+                    x = x[::scale_factor, ::scale_factor]
+                elif len(shape) == 3:
+                    x = x[:, ::scale_factor, ::scale_factor]
+                else:
+                    raise ValueError("Array must be 2D with or without channels")
+
                 # Show the affinities
                 im = axes[jj].imshow(
                     x.transpose(1, 2, 0),
@@ -163,6 +319,36 @@ def cube(
     light_altdeg: float = 20,
     overwrite: bool = False,
 ):
+    """
+    Create a 3D cube visualization from 3D arrays.
+
+    Parameters:
+    -----------
+    arrays : dict[str, Array]
+        Dictionary of arrays to visualize. For "combined" type, the value should be
+        a tuple/list of (raw_array, labels_array).
+    array_types : dict[str, str]
+        Dictionary specifying the type of each array. Supported types:
+        - "raw": Raw data displayed in grayscale
+        - "labels": Label data with random colormap
+        - "pca": PCA-transformed data
+        - "affs": Affinity data
+        - "combined": Overlay labels on raw data with transparency (requires tuple of arrays)
+    filename : str
+        Output filename for the image
+    title : str
+        Title for the visualization
+    elev : float, default=30
+        Elevation angle for 3D view
+    azim : float, default=-60
+        Azimuth angle for 3D view
+    light_azdeg : float, default=205
+        Light source azimuth angle
+    light_altdeg : float, default=20
+        Light source altitude angle
+    overwrite : bool, default=False
+        Whether to overwrite existing files
+    """
     if Path(filename).exists() and not overwrite:
         return
 
@@ -170,33 +356,66 @@ def cube(
 
     transformed_arrays = {}
     for key, arr in arrays.items():
-        assert (
-            arr.voxel_size.dims == 3
-        ), f"Array {key} must be 3D, got {arr.voxel_size.dims}D"
-        if array_types[key] == "pca":
-            transformed_arrays[key] = pca_nd(arr)
-        elif array_types[key] == "labels":
-            normalized = Array(
-                arr.data % 256 / 255.0,
-                voxel_size=arr.voxel_size,
-                offset=arr.offset,
-                units=arr.units,
-                axis_names=arr.axis_names,
-                types=arr.types,
+        if array_types[key] == "combined":
+            # For combined type, expect arr to be a tuple/list of (raw_array, labels_array)
+            raw_arr, labels_arr = arr
+            assert (
+                raw_arr.voxel_size.dims == 3
+            ), f"Raw array for {key} must be 3D, got {raw_arr.voxel_size.dims}D"
+            assert (
+                labels_arr.voxel_size.dims == 3
+            ), f"Labels array for {key} must be 3D, got {labels_arr.voxel_size.dims}D"
+
+            # Normalize raw data
+            raw_normalized = Array(
+                (raw_arr.data - raw_arr.data.min())
+                / (raw_arr.data.max() - raw_arr.data.min()),
+                voxel_size=raw_arr.voxel_size,
+                offset=raw_arr.offset,
+                units=raw_arr.units,
+                axis_names=raw_arr.axis_names,
+                types=raw_arr.types,
             )
-            transformed_arrays[key] = normalized
-        elif array_types[key] == "raw":
-            normalized = Array(
-                (arr.data - arr.data.min()) / (arr.data.max() - arr.data.min()),
-                voxel_size=arr.voxel_size,
-                offset=arr.offset,
-                units=arr.units,
-                axis_names=arr.axis_names,
-                types=arr.types,
+
+            # Normalize labels data
+            labels_normalized = Array(
+                labels_arr.data % 256 / 255.0,
+                voxel_size=labels_arr.voxel_size,
+                offset=labels_arr.offset,
+                units=labels_arr.units,
+                axis_names=labels_arr.axis_names,
+                types=labels_arr.types,
             )
-            transformed_arrays[key] = normalized
+
+            transformed_arrays[key] = (raw_normalized, labels_normalized)
         else:
-            transformed_arrays[key] = arr
+            assert (
+                arr.voxel_size.dims == 3
+            ), f"Array {key} must be 3D, got {arr.voxel_size.dims}D"
+            if array_types[key] == "pca":
+                transformed_arrays[key] = pca_nd(arr)
+            elif array_types[key] == "labels":
+                normalized = Array(
+                    arr.data % 256 / 255.0,
+                    voxel_size=arr.voxel_size,
+                    offset=arr.offset,
+                    units=arr.units,
+                    axis_names=arr.axis_names,
+                    types=arr.types,
+                )
+                transformed_arrays[key] = normalized
+            elif array_types[key] == "raw":
+                normalized = Array(
+                    (arr.data - arr.data.min()) / (arr.data.max() - arr.data.min()),
+                    voxel_size=arr.voxel_size,
+                    offset=arr.offset,
+                    units=arr.units,
+                    axis_names=arr.axis_names,
+                    types=arr.types,
+                )
+                transformed_arrays[key] = normalized
+            else:
+                transformed_arrays[key] = arr
     arrays = transformed_arrays
 
     fig, axes = plt.subplots(
@@ -257,7 +476,46 @@ def cube(
     for jj, (key, arr) in enumerate(arrays.items()):
         ax = axes[jj]
 
-        if array_types[key] == "labels":
+        if array_types[key] == "combined":
+            # For combined type, create overlay of raw and labels
+            raw_arr, labels_arr = arr
+
+            # Create combined visualization by blending raw and labels
+            raw_data = raw_arr.data
+            labels_data = labels_arr.data
+
+            # Convert raw to RGB if it's grayscale
+            if raw_data.ndim == 3:
+                raw_rgb = np.stack([raw_data] * 3, axis=-1)
+            else:
+                raw_rgb = raw_data
+
+            # Get colored labels
+            labels_colored = label_cmap(labels_data)[..., :3]  # Remove alpha channel
+
+            # Create alpha mask (transparent where labels are 0/background)
+            alpha_mask = (labels_data > 0).astype(float) * 0.6  # 60% opacity
+
+            # Blend raw and labels
+            combined_data = raw_rgb.copy()
+            mask = alpha_mask > 0
+            if mask.any():
+                combined_data[mask] = (1 - alpha_mask[mask][..., np.newaxis]) * raw_rgb[
+                    mask
+                ] + alpha_mask[mask][..., np.newaxis] * labels_colored[mask]
+
+            # Create combined array for drawing
+            combined_arr = Array(
+                combined_data,
+                voxel_size=raw_arr.voxel_size,
+                offset=raw_arr.offset,
+                units=raw_arr.units,
+                axis_names=raw_arr.axis_names,
+                types=raw_arr.types,
+            )
+
+            draw_cube(ax, combined_arr)
+        elif array_types[key] == "labels":
             draw_cube(ax, arr, cmap=label_cmap, interpolation="none")
         elif array_types[key] == "raw" or array_types[key] == "pca":
             if arr.data.ndim == 3:
@@ -277,3 +535,8 @@ def cube(
     plt.tight_layout()
     plt.savefig(filename, bbox_inches="tight", pad_inches=0.1)
     plt.close(fig)
+
+
+# %%
+get_cmap()
+# %%
