@@ -947,6 +947,7 @@ class DINOv3UNet3DPipeline(nn.Module):
         input_channels=1024,  # DINOv3 ViT-L/16 features = 1024 channels
         use_orthogonal_planes=True,  # Process all 3 orthogonal planes
         device=None,
+        verbose=True,  # Control verbose output
     ):
         """
         Initialize the complete 3D DINOv3-UNet pipeline.
@@ -974,9 +975,11 @@ class DINOv3UNet3DPipeline(nn.Module):
         self.num_classes = num_classes
         self.input_size = input_size
         self.dinov3_slice_size = dinov3_slice_size
-        print(
-            f"DINOv3UNet3DPipeline initialized with dinov3_slice_size: {self.dinov3_slice_size}"
-        )
+        self.verbose = verbose
+        if self.verbose:
+            print(
+                f"DINOv3UNet3DPipeline initialized with dinov3_slice_size: {self.dinov3_slice_size}"
+            )
         self.use_orthogonal_planes = use_orthogonal_planes
         self.device = device or torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
@@ -1058,12 +1061,13 @@ class DINOv3UNet3DPipeline(nn.Module):
             print(f"Input dtype: {volume.dtype}")
             print(f"Input memory: {volume.nbytes / 1e6:.2f} MB")
         else:
-            print(f"Multi-resolution DINOv3 processing:")
-            print(f"  Input volume: {(depth, height, width)}")
-            print(
-                f"  Processing at: {(processing_d, processing_h, processing_w)} (native resolution)"
-            )
-            print(f"  Output target: {(output_d, output_h, output_w)}")
+            if self.verbose:
+                print(f"Multi-resolution DINOv3 processing:")
+                print(f"  Input volume: {(depth, height, width)}")
+                print(
+                    f"  Processing at: {(processing_d, processing_h, processing_w)} (native resolution)"
+                )
+                print(f"  Output target: {(output_d, output_h, output_w)}")
 
         # Use volume at native resolution - selective downsampling will happen per plane
         processing_volume = volume
@@ -1181,10 +1185,25 @@ class DINOv3UNet3DPipeline(nn.Module):
                 print(f"XZ features after downsampling: {tuple(xz_features.shape)}")
                 print(f"YZ features after downsampling: {tuple(yz_features.shape)}")
             else:
-                print(f"Orthogonal plane feature shapes after downsampling:")
-                print(f"  XY features: {xy_features.shape}")
-                print(f"  XZ features: {xz_features.shape}")
-                print(f"  YZ features: {yz_features.shape}")
+                if self.verbose:
+                    print(f"Orthogonal plane feature shapes after downsampling:")
+                    print(f"  XY features: {xy_features.shape}")
+                    print(f"  XZ features: {xz_features.shape}")
+                    print(f"  YZ features: {yz_features.shape}")
+
+            # Ensure all plane features are on the same device before averaging
+            if enable_timing:
+                print("  Checking device consistency...")
+                for i, feat in enumerate(["XY", "XZ", "YZ"]):
+                    print(f"    {feat} features device: {plane_features[i].device}")
+
+            # Move all features to the same device (preferably GPU if available)
+            target_device = plane_features[0].device
+            for i in range(len(plane_features)):
+                if plane_features[i].device != target_device:
+                    plane_features[i] = plane_features[i].to(target_device)
+                    if enable_timing:
+                        print(f"    Moved plane {i} to {target_device}")
 
             # Now we can safely average the features from all three planes
             averaging_start = time.time()
@@ -1203,8 +1222,9 @@ class DINOv3UNet3DPipeline(nn.Module):
                 # Store plane timings in detailed timing
                 detailed_timing.update(plane_timings)
             else:
-                print(f"  Averaged features: {batch_features.shape}")
-                print("  Individual plane features freed to save memory")
+                if self.verbose:
+                    print(f"  Averaged features: {batch_features.shape}")
+                    print("  Individual plane features freed to save memory")
 
         else:
             # Original behavior - only XY planes
@@ -1279,6 +1299,183 @@ class DINOv3UNet3DPipeline(nn.Module):
                 return result, detailed_timing
         else:
             return result
+
+    def extract_dinov3_features_3d_batch(
+        self,
+        volume_batch,
+        use_orthogonal_planes=None,
+        enable_timing=False,
+        target_output_size=None,
+    ):
+        """
+        GPU-optimized batch processing of multiple 3D volumes simultaneously.
+        This method processes all volumes in the batch together for maximum efficiency.
+
+        Parameters:
+        -----------
+        volume_batch : numpy.ndarray
+            Batch of volumes of shape (batch_size, D, H, W)
+        use_orthogonal_planes : bool, optional
+            If True, processes slices in all 3 orthogonal planes (XY, XZ, YZ) and averages them.
+        target_output_size : tuple, optional
+            Target size (D, H, W) for the output features.
+
+        Returns:
+        --------
+        torch.Tensor: DINOv3 features (batch_size, output_channels, D, H, W)
+        """
+        if isinstance(volume_batch, torch.Tensor):
+            volume_batch = volume_batch.cpu().numpy()
+
+        batch_size, depth, height, width = volume_batch.shape
+
+        # Determine processing size and output size
+        if target_output_size is not None:
+            output_d, output_h, output_w = target_output_size
+        else:
+            output_d, output_h, output_w = self.input_size
+
+        import time
+
+        detailed_timing = {}
+        start_time = time.time()
+
+        if enable_timing:
+            print(f"\n=== GPU-Optimized Batch DINOv3 Processing ===")
+            print(f"Batch size: {batch_size}")
+            print(f"Input volume per batch: {(depth, height, width)}")
+            print(f"Output target: {(output_d, output_h, output_w)}")
+
+        # Use instance variable if parameter not provided
+        if use_orthogonal_planes is None:
+            use_orthogonal_planes = self.use_orthogonal_planes
+
+        # Pre-allocate output tensor on GPU for maximum efficiency
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        from .dinov3_core import get_current_model_info
+
+        model_info = get_current_model_info()
+        output_channels = model_info["output_channels"]
+
+        batch_output_shape = (batch_size, output_channels, output_d, output_h, output_w)
+        batch_features = torch.zeros(
+            batch_output_shape, device=device, dtype=torch.float32
+        )
+
+        if use_orthogonal_planes:
+            # GPU-optimized batch processing for all 3 planes
+            plane_features = []
+            plane_timings = {}
+
+            if enable_timing:
+                print(f"Processing {batch_size} volumes across 3 orthogonal planes...")
+
+            # Process all volumes for each plane type
+            for plane_name in ["xy", "xz", "yz"]:
+                plane_start = time.time()
+
+                # Process all volumes in batch for this plane
+                plane_batch_features = torch.zeros(
+                    batch_output_shape, device=device, dtype=torch.float32
+                )
+
+                for b in range(batch_size):
+                    single_volume_features = self._extract_features_plane(
+                        volume_batch[b : b + 1],
+                        plane_name,
+                        depth,
+                        height,
+                        width,
+                        slice_batch_size=512,
+                        enable_timing=False,
+                        output_d=output_d,
+                        output_h=output_h,
+                        output_w=output_w,
+                    )
+
+                    # Direct GPU assignment
+                    if (
+                        single_volume_features.dim() == 5
+                        and single_volume_features.shape[0] == 1
+                    ):
+                        plane_batch_features[b] = single_volume_features.squeeze(0).to(
+                            device
+                        )
+                    else:
+                        plane_batch_features[b] = single_volume_features.to(device)
+
+                plane_features.append(plane_batch_features)
+                plane_timings[f"{plane_name}_extraction"] = time.time() - plane_start
+
+                if enable_timing:
+                    print(
+                        f"  {plane_name.upper()} plane batch: {tuple(plane_batch_features.shape)} in {plane_timings[f'{plane_name}_extraction']:.3f}s"
+                    )
+
+            # GPU-accelerated averaging across all planes
+            averaging_start = time.time()
+            # Stack all plane features: (3, batch_size, channels, D, H, W)
+            all_planes_stacked = torch.stack(plane_features, dim=0)
+            # Average across planes: (batch_size, channels, D, H, W)
+            batch_features = all_planes_stacked.mean(dim=0)
+            plane_timings["averaging"] = time.time() - averaging_start
+
+            # Free memory
+            del plane_features, all_planes_stacked
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+            if enable_timing:
+                print(
+                    f"  Averaged all planes: {tuple(batch_features.shape)} in {plane_timings['averaging']:.3f}s"
+                )
+                detailed_timing.update(plane_timings)
+
+        else:
+            # Single XY plane batch processing
+            if enable_timing:
+                print(f"Processing {batch_size} volumes for XY plane only...")
+
+            xy_start = time.time()
+            for b in range(batch_size):
+                single_features = self._extract_features_plane(
+                    volume_batch[b : b + 1],
+                    "xy",
+                    depth,
+                    height,
+                    width,
+                    slice_batch_size=512,
+                    enable_timing=False,
+                    output_d=output_d,
+                    output_h=output_h,
+                    output_w=output_w,
+                )
+
+                if single_features.dim() == 5 and single_features.shape[0] == 1:
+                    batch_features[b] = single_features.squeeze(0).to(device)
+                else:
+                    batch_features[b] = single_features.to(device)
+
+            detailed_timing["xy_batch_extraction"] = time.time() - xy_start
+
+        # Final timing
+        detailed_timing["total_batch_time"] = time.time() - start_time
+        detailed_timing["batch_size"] = batch_size
+        detailed_timing["processing_method"] = "gpu_batch_optimized"
+
+        if enable_timing:
+            print(f"\n=== Batch Processing Summary ===")
+            print(f"Total batch time: {detailed_timing['total_batch_time']:.3f}s")
+            print(
+                f"Average time per volume: {detailed_timing['total_batch_time']/batch_size:.3f}s"
+            )
+            print(f"Final batch shape: {tuple(batch_features.shape)}")
+            print(
+                f"GPU memory used: {batch_features.element_size() * batch_features.nelement() / 1e6:.2f} MB"
+            )
+
+            return batch_features, detailed_timing
+        else:
+            return batch_features
 
     def _extract_features_plane(
         self,
@@ -1364,19 +1561,41 @@ class DINOv3UNet3DPipeline(nn.Module):
                     )
 
                 downsample_start = time.time()
-                downsampled_volumes = []
-                for b in range(volume_batch_size):
-                    vol_downsampled = resize(
-                        resized_volume[b],
-                        target_dims,
-                        preserve_range=True,
-                        anti_aliasing=True,
-                        order=1,
-                    ).astype(resized_volume.dtype)
-                    downsampled_volumes.append(vol_downsampled)
 
-                resized_volume = np.stack(downsampled_volumes, axis=0)
+                # Use GPU-accelerated torch interpolation instead of skimage.resize
+                import torch.nn.functional as F
+
+                # Convert to torch tensor and move to GPU if available
+                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                torch_volume = torch.from_numpy(resized_volume).float().to(device)
+
+                if enable_timing:
+                    conversion_time = time.time() - downsample_start
+                    print(f"  NumPy → Torch conversion: {conversion_time:.3f}s")
+                    torch_start = time.time()
+
+                # Add channel dimension for interpolation: (B, 1, D, H, W)
+                torch_volume = torch_volume.unsqueeze(1)
+
+                # GPU-accelerated trilinear interpolation
+                torch_downsampled = F.interpolate(
+                    torch_volume,
+                    size=target_dims,
+                    mode="trilinear",
+                    align_corners=False,
+                ).squeeze(
+                    1
+                )  # Remove channel dimension
+
+                # Convert back to numpy
+                resized_volume = (
+                    torch_downsampled.cpu().numpy().astype(resized_volume.dtype)
+                )
                 target_d, target_h, target_w = target_dims
+
+                if enable_timing:
+                    torch_time = time.time() - torch_start
+                    print(f"  GPU trilinear interpolation: {torch_time:.3f}s")
 
                 if enable_timing:
                     downsample_time = time.time() - downsample_start
@@ -1386,6 +1605,8 @@ class DINOv3UNet3DPipeline(nn.Module):
                     print(f"New dimensions: {target_dims}")
 
         all_features = []
+
+        slice_collection_start = time.time()
 
         for b in range(volume_batch_size):
             # Collect all slices for this volume
@@ -1427,11 +1648,21 @@ class DINOv3UNet3DPipeline(nn.Module):
                     # Use final output dimensions for DINOv3 feature resizing
                     slice_dims.append((final_d, final_h))
 
+            if enable_timing:
+                slice_collection_time = time.time() - slice_collection_start
+                print(
+                    f"  Slice collection for volume {b+1}: {slice_collection_time:.3f}s ({len(all_slices)} slices)"
+                )
+
             # Process slices in batches
             if enable_timing:
+                processing_start = time.time()
                 volume_features, batch_timing = self._process_slice_batch(
                     all_slices, slice_dims, slice_batch_size, enable_timing=True
                 )
+                processing_time = time.time() - processing_start
+                print(f"  DINOv3 processing for volume {b+1}: {processing_time:.3f}s")
+
                 # Store timing info for this volume (we'll aggregate later)
                 if not hasattr(self, "_plane_timing_info"):
                     self._plane_timing_info = {}
@@ -1445,30 +1676,87 @@ class DINOv3UNet3DPipeline(nn.Module):
 
             # Stack slices and reshape appropriately for each plane type
             # Features are now at final output dimensions (final_d, final_h, final_w)
+            if enable_timing:
+                stacking_start = time.time()
+
             if plane_type == "xy":
+                # GPU-accelerated stacking for XY plane
+                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                if volume_features[0].device != device:
+                    volume_features = [f.to(device) for f in volume_features]
+                    if enable_timing:
+                        print(f"    {plane_type.upper()} moved to {device}")
+
                 # (output_channels, final_d, final_h, final_w)
                 volume_features_3d = torch.stack(volume_features, dim=1)
+
+                if enable_timing:
+                    print(
+                        f"    {plane_type.upper()} stacking on device: {volume_features_3d.device}"
+                    )
+
             elif plane_type == "xz":
+                # GPU-accelerated stacking for XZ plane
+                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                if volume_features[0].device != device:
+                    volume_features = [f.to(device) for f in volume_features]
+                    if enable_timing:
+                        print(f"    {plane_type.upper()} moved to {device}")
+
                 # Stack along H dimension, reshape to (output_channels, final_d, final_h, final_w)
-                stacked = torch.stack(
-                    volume_features, dim=2
-                )  # (output_channels, final_d, final_h, final_w)
-                volume_features_3d = stacked
+                volume_features_3d = torch.stack(volume_features, dim=2)
+
+                if enable_timing:
+                    print(
+                        f"    {plane_type.upper()} stacking on device: {volume_features_3d.device}"
+                    )
             elif plane_type == "yz":
-                # Stack along W dimension, reshape to (output_channels, final_d, final_h, final_w)
-                stacked = torch.stack(
-                    volume_features, dim=3
-                )  # (output_channels, final_d, final_h, final_w)
-                volume_features_3d = stacked
+                # Try a fundamentally different approach: reduce tensor size first
+                first_feature = volume_features[0]  # (1024, 128, 128)
+                channels, height, width = first_feature.shape
+                num_slices = len(volume_features)
+
+                if enable_timing:
+                    print(
+                        f"    YZ stacking: {num_slices} features of shape {first_feature.shape}"
+                    )
+                    print(
+                        f"    Total memory: {num_slices * channels * height * width * 4 / 1e9:.2f} GB"
+                    )
+
+                    # Try immediate GPU processing if available
+                    gpu_start = time.time()
+
+                # Move to GPU if available for faster operations
+                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                if first_feature.device != device:
+                    volume_features = [f.to(device) for f in volume_features]
+
+                # Use the original torch.stack but on GPU
+                volume_features_3d = torch.stack(volume_features, dim=3)
+
+                if enable_timing:
+                    gpu_time = time.time() - gpu_start
+                    print(f"    GPU-accelerated stacking: {gpu_time:.3f}s")
+                    print(f"    Device: {volume_features_3d.device}")
+
+            if enable_timing:
+                stacking_time = time.time() - stacking_start
+                print(f"  Feature stacking for volume {b+1}: {stacking_time:.3f}s")
 
             all_features.append(volume_features_3d)
 
         # Stack batch
+        if enable_timing:
+            final_stacking_start = time.time()
+
         batch_features = torch.stack(
             all_features, dim=0
         )  # (batch_size, output_channels, final_d, final_h, final_w)
 
         if enable_timing:
+            final_stacking_time = time.time() - final_stacking_start
+            print(f"  Final batch stacking: {final_stacking_time:.3f}s")
             print(
                 f"  {plane_type.upper()} features stacked: {tuple(batch_features.shape)} (already at target size)"
             )

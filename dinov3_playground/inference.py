@@ -535,7 +535,11 @@ class DINOv3UNet3DInference:
         volume_batch = volume[np.newaxis, ...]  # (1, D, H, W)
 
         # Extract DINOv3 features
-        features = self.data_loader.extract_dinov3_features_3d(volume_batch)
+        features, timing = self.data_loader.extract_dinov3_features_3d(
+            volume_batch, enable_detailed_timing=True
+        )
+
+        print(f"Feature extraction timing: {timing}")
 
         # Run through 3D UNet
         with torch.no_grad():

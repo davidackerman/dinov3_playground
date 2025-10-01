@@ -67,6 +67,8 @@ class MemoryEfficientDataLoader3D:
         learn_upsampling=False,  # NEW PARAMETER
         dinov3_stride=None,  # NEW PARAMETER for sliding window inference
         use_orthogonal_planes=True,  # NEW PARAMETER for 3-plane processing
+        enable_detailed_timing=True,  # NEW PARAMETER for detailed timing
+        verbose=True,  # NEW PARAMETER to control verbose output
     ):
         """
         Initialize memory-efficient 3D data loader.
@@ -168,6 +170,7 @@ class MemoryEfficientDataLoader3D:
         self.use_orthogonal_planes = (
             use_orthogonal_planes  # Store orthogonal planes mode
         )
+        self.verbose = verbose  # Store verbose output mode
 
         # Calculate padding requirements for sliding window
         self._calculate_padding_requirements()
@@ -287,11 +290,25 @@ class MemoryEfficientDataLoader3D:
             input_channels=current_output_channels,
             use_orthogonal_planes=self.use_orthogonal_planes,
             device=device,
+            verbose=self.verbose,  # Pass verbose flag to suppress messages
         )
 
-        # Process each volume through the pipeline's feature extractor
-        all_features = []
+        # GPU-accelerated batch processing optimization
+        import time
 
+        batch_processing_start = time.time()
+
+        # Simple GPU-optimized stacking - no complex batch processing
+        # Pre-allocate GPU tensor for batch features to avoid repeated memory allocation
+        expected_shape = (
+            batch_size,
+            current_output_channels,
+            *self.target_volume_size,
+        )
+        batch_features = torch.zeros(expected_shape, device=device, dtype=torch.float32)
+
+        # Process each volume through the pipeline's feature extractor
+        # with GPU-optimized direct assignment instead of list append + stack
         for b in range(batch_size):
             # Extract a single volume
             single_volume = volumes[b : b + 1]  # Keep batch dimension
@@ -329,16 +346,25 @@ class MemoryEfficientDataLoader3D:
                     target_output_size=self.target_volume_size,
                 )
 
+            # GPU-optimized direct assignment instead of list append + stack
+            # This is much faster than: all_features.append() + torch.stack(all_features)
             # volume_features shape: (1, output_channels, D, H, W)
-            # Remove batch dimension and add to results
-            all_features.append(
-                volume_features.squeeze(0)
-            )  # (output_channels, D, H, W)
+            if volume_features.dim() == 5 and volume_features.shape[0] == 1:
+                # Direct GPU tensor assignment - eliminates CPU-GPU transfer overhead
+                batch_features[b] = volume_features.squeeze(0).to(device)
+            else:
+                print(
+                    f"WARNING: Unexpected volume_features shape: {volume_features.shape}"
+                )
+                batch_features[b] = volume_features.to(device)
 
-        # Stack all volumes back into batch format
-        batch_features = torch.stack(
-            all_features, dim=0
-        )  # (batch_size, output_channels, D, H, W)
+        batch_processing_time = time.time() - batch_processing_start
+        processing_method = "gpu_optimized_stacking"
+
+        if enable_detailed_timing and "detailed_timing" in locals():
+            detailed_timing["batch_processing_time"] = batch_processing_time
+            detailed_timing["batch_processing_method"] = processing_method
+            detailed_timing["batch_size_processed"] = batch_size
 
         if enable_detailed_timing:
             return batch_features, detailed_timing
@@ -1346,6 +1372,7 @@ def train_3d_unet_memory_efficient_v2(
     use_gradient_checkpointing=False,
     memory_efficient_mode="auto",
     learn_upsampling=False,  # NEW PARAMETER
+    enable_detailed_timing=True,
 ):
     """
     Train 3D UNet using memory-efficient data loading with DINOv3 features.
@@ -1517,9 +1544,23 @@ def train_3d_unet_memory_efficient_v2(
             dinov3_start = time.time()
 
             # Extract DINOv3 features for 3D UNet with detailed timing
-            train_features, detailed_timing = data_loader_3d.extract_dinov3_features_3d(
-                train_volumes, epoch, batch_idx, enable_detailed_timing=True
-            )
+            if enable_detailed_timing:
+                train_features, detailed_timing = (
+                    data_loader_3d.extract_dinov3_features_3d(
+                        train_volumes,
+                        epoch,
+                        batch_idx,
+                        enable_detailed_timing=enable_detailed_timing,
+                    )
+                )
+            else:
+                train_features = data_loader_3d.extract_dinov3_features_3d(
+                    train_volumes,
+                    epoch,
+                    batch_idx,
+                    enable_detailed_timing=enable_detailed_timing,
+                )
+                detailed_timing = {}
 
             # TIMING: End DINOv3 feature extraction
             dinov3_end = time.time()
@@ -1589,7 +1630,7 @@ def train_3d_unet_memory_efficient_v2(
             training_pct = (training_time / total_batch_time) * 100
 
             # Print timing every 5 batches or on first batch
-            if batch_idx % 5 == 0 or batch_idx == 0:
+            if (batch_idx % 5 == 0 or batch_idx == 0) and enable_detailed_timing:
                 tqdm.write(f"  Batch {batch_idx+1} Timing:")
                 tqdm.write(
                     f"    DINOv3 extraction: {dinov3_time:.3f}s ({dinov3_pct:.1f}%)"
@@ -1681,11 +1722,16 @@ def train_3d_unet_memory_efficient_v2(
                 if (
                     vol_idx == 0
                 ):  # Only get detailed timing for first volume to avoid spam
-                    vol_features, val_detailed_timing = (
-                        data_loader_3d.extract_dinov3_features_3d(
-                            single_vol, epoch=epoch, enable_detailed_timing=True
-                        )
+                    result = data_loader_3d.extract_dinov3_features_3d(
+                        single_vol,
+                        epoch=epoch,
+                        enable_detailed_timing=enable_detailed_timing,
                     )
+                    if enable_detailed_timing:
+                        vol_features, val_detailed_timing = result
+                    else:
+                        vol_features = result
+                        val_detailed_timing = None
                 else:
                     vol_features = data_loader_3d.extract_dinov3_features_3d(
                         single_vol, epoch=epoch
@@ -2315,6 +2361,8 @@ def train_3d_unet_with_memory_efficient_loader(
     learn_upsampling=False,  # NEW PARAMETER
     dinov3_stride=None,  # NEW PARAMETER for sliding window inference
     use_orthogonal_planes=False,  # NEW PARAMETER for orthogonal plane processing
+    enable_detailed_timing=True,  # NEW PARAMETER for detailed timing
+    verbose=True,  # NEW PARAMETER to control verbose output
 ):
     """
     Memory-efficient 3D UNet training with multiple precision and memory optimization options.
@@ -2456,6 +2504,7 @@ def train_3d_unet_with_memory_efficient_loader(
         learn_upsampling=learn_upsampling,
         dinov3_stride=dinov3_stride,  # NEW: Sliding window parameter
         use_orthogonal_planes=use_orthogonal_planes,  # NEW: Orthogonal planes parameter
+        verbose=verbose,  # NEW: Verbose output parameter
     )
 
     print("Data loader created successfully!")
@@ -2484,6 +2533,7 @@ def train_3d_unet_with_memory_efficient_loader(
         use_gradient_checkpointing=use_gradient_checkpointing,
         memory_efficient_mode=memory_efficient_mode,
         learn_upsampling=learn_upsampling,  # Pass through new parameter
+        enable_detailed_timing=enable_detailed_timing,  # Pass through new parameter
     )
 
     print(f"\n3D UNet training completed!")
