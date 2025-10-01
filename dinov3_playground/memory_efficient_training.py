@@ -105,27 +105,43 @@ class MemoryEfficientDataLoader3D:
                 f"Number of volumes must match: {raw_data.shape[0]} vs {gt_data.shape[0]}"
             )
 
-        if len(raw_data.shape) >= 2 and raw_data.shape[1] != gt_data.shape[1]:
-            raise ValueError(
-                f"Depth dimension must match: {raw_data.shape[1]} vs {gt_data.shape[1]}"
-            )
+        # Allow different dimensions for multi-resolution training
+        # Raw data can be at higher resolution than GT data
+        if len(raw_data.shape) >= 2:
+            raw_shape = raw_data.shape[1:]  # (D, H, W)
+            gt_shape = gt_data.shape[1:]  # (D, H, W)
 
-        # Allow spatial dimensions to differ due to ROI-level padding
+            if raw_shape == gt_shape:
+                print(f"✓ DataLoader: Same resolution mode - {raw_shape}")
+            else:
+                print(
+                    f"✓ DataLoader: Multi-resolution mode - Raw {raw_shape} → GT {gt_shape}"
+                )
+
+                # Validate that dimensions are reasonable ratios
+                for dim_name, (raw_dim, gt_dim) in zip(
+                    ["D", "H", "W"], zip(raw_shape, gt_shape)
+                ):
+                    ratio = raw_dim / gt_dim
+                    if (
+                        ratio < 0.1 or ratio > 16.0
+                    ):  # Allow wide range but catch obvious errors
+                        print(
+                            f"Warning: {dim_name} dimension ratio ({ratio:.2f}) is very extreme"
+                        )
+
+        # Multi-resolution training allows different spatial dimensions
+        # This replaces the old ROI padding validation with more flexible logic
         if len(raw_data.shape) >= 4:
             raw_spatial = raw_data.shape[2:]
             gt_spatial = gt_data.shape[2:]
             if raw_spatial != gt_spatial:
-                roi_padding = 0
-                if dinov3_stride is not None and dinov3_stride < 16:
-                    roi_padding = 16 - dinov3_stride
-                expected_raw_spatial = tuple(
-                    dim + 2 * roi_padding for dim in gt_spatial
+                print(
+                    f"✓ DataLoader: Different spatial dimensions - Raw {raw_spatial} vs GT {gt_spatial}"
                 )
-                if raw_spatial != expected_raw_spatial:
-                    raise ValueError(
-                        f"Raw spatial dimensions {raw_spatial} don't match GT {gt_spatial} "
-                        f"or expected padded dimensions {expected_raw_spatial} for stride {dinov3_stride}"
-                    )
+                print("  This is expected for multi-resolution training")
+            else:
+                print(f"✓ DataLoader: Same spatial dimensions - {raw_spatial}")
 
         if len(raw_data.shape) != 4:
             raise ValueError(
@@ -281,12 +297,14 @@ class MemoryEfficientDataLoader3D:
             single_volume = volumes[b : b + 1]  # Keep batch dimension
 
             # Use the pipeline's orthogonal feature extraction
+            # Pass target_volume_size as target output to ensure features match GT size
             if enable_detailed_timing:
                 volume_features, volume_timing = (
                     temp_pipeline.extract_dinov3_features_3d(
                         single_volume,
                         use_orthogonal_planes=self.use_orthogonal_planes,
                         enable_timing=True,
+                        target_output_size=self.target_volume_size,
                     )
                 )
                 # Store timing for this volume
@@ -306,7 +324,9 @@ class MemoryEfficientDataLoader3D:
                             detailed_timing[key] += volume_timing.get(key, 0)
             else:
                 volume_features = temp_pipeline.extract_dinov3_features_3d(
-                    single_volume, use_orthogonal_planes=self.use_orthogonal_planes
+                    single_volume,
+                    use_orthogonal_planes=self.use_orthogonal_planes,
+                    target_output_size=self.target_volume_size,
                 )
 
             # volume_features shape: (1, output_channels, D, H, W)
@@ -2385,40 +2405,37 @@ def train_3d_unet_with_memory_efficient_loader(
             f"Need at least {val_volume_pool_size + 2} volumes for training"
         )
 
-    # Validate shapes with ROI-level padding support
+    # Validate shapes with multi-resolution support
     if raw_data.shape[0] != gt_data.shape[0]:
         raise ValueError(
             f"Number of volumes must match: {raw_data.shape[0]} vs {gt_data.shape[0]}"
         )
 
-    if raw_data.shape[1] != gt_data.shape[1]:
-        raise ValueError(
-            f"Depth dimension must match: {raw_data.shape[1]} vs {gt_data.shape[1]}"
-        )
+    # For multi-resolution training, we allow different spatial dimensions
+    # The raw data (high-res) and GT data (base-res) can have different sizes
+    raw_shape = raw_data.shape[1:]  # (D, H, W)
+    gt_shape = gt_data.shape[1:]  # (D, H, W)
 
-    # Check if raw data has ROI-level padding (different spatial dimensions)
-    raw_spatial = raw_data.shape[2:]  # (H, W)
-    gt_spatial = gt_data.shape[2:]  # (H, W)
-
-    if raw_spatial != gt_spatial:
-        # Calculate expected padding based on dinov3_stride
-        roi_padding = 0
-        if dinov3_stride is not None and dinov3_stride < 16:
-            roi_padding = 16 - dinov3_stride
-
-        expected_raw_spatial = tuple(dim + 2 * roi_padding for dim in gt_spatial)
-
-        if raw_spatial != expected_raw_spatial:
-            raise ValueError(
-                f"Raw spatial dimensions {raw_spatial} don't match GT {gt_spatial} "
-                f"or expected padded dimensions {expected_raw_spatial} for stride {dinov3_stride}"
-            )
-
-        print(
-            f"✓ Detected ROI-level padding: Raw {raw_spatial} vs GT {gt_spatial} (padding={roi_padding})"
-        )
+    if raw_shape == gt_shape:
+        print(f"✓ Same resolution: Raw and GT shapes match {raw_data.shape}")
+        resolution_mode = "same"
     else:
-        print(f"✓ No ROI-level padding: Raw and GT shapes match {raw_data.shape}")
+        print(f"✓ Multi-resolution training: Raw {raw_shape} vs GT {gt_shape}")
+        resolution_mode = "multi"
+
+        # Validate that dimensions are reasonable multiples/factors
+        # This helps catch obvious mistakes while allowing intentional multi-resolution
+        for dim_name, (raw_dim, gt_dim) in zip(
+            ["D", "H", "W"], zip(raw_shape, gt_shape)
+        ):
+            ratio = raw_dim / gt_dim
+            if ratio < 0.25 or ratio > 8.0:  # Allow 4x smaller to 8x larger
+                print(
+                    f"Warning: {dim_name} dimension ratio ({ratio:.2f}) is quite extreme"
+                )
+
+        print(f"  - Raw data will be processed at {raw_shape} resolution")
+        print(f"  - Features will be downsampled to match GT at {gt_shape} resolution")
 
     if len(raw_data.shape) != 4:
         raise ValueError(

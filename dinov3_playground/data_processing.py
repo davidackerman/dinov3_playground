@@ -1093,8 +1093,8 @@ def load_random_3d_training_data(
             try:
                 # Initialize raw data interface
                 raw_idi = ImageDataInterface(
-                    raw_path, output_voxel_size=3 * [base_resolution]
-                )
+                    raw_path
+                )  # , output_voxel_size=3 * [base_resolution])
 
                 # Initialize all class data interfaces (any key that's not "raw")
                 class_keys = [k for k in dataset_dict.keys() if k != "raw"]
@@ -1163,9 +1163,6 @@ def load_random_3d_training_data(
                 else:
                     gt_roi = padded_roi  # Same as padded when no padding
 
-                # Sample raw volume with padding (for sliding window context)
-                raw_volume = raw_idi.to_ndarray_ts(padded_roi)
-
                 # Sample all class volumes without padding (maintain target shape)
                 class_volumes = {}
                 for class_key, class_idi in class_idis.items():
@@ -1204,11 +1201,18 @@ def load_random_3d_training_data(
                     )
                     continue
 
+                # Sample raw volume with padding (for sliding window context)
+                raw_volume = raw_idi.to_ndarray_ts(padded_roi)
+
                 # Validate shapes
                 expected_raw_shape = (
-                    tuple(padded_volume_shape_nm // base_resolution)
+                    tuple(padded_volume_shape_nm // raw_idi.voxel_size[0])
                     if roi_padding > 0
-                    else volume_shape
+                    else tuple(
+                        np.array(volume_shape)
+                        * base_resolution
+                        // raw_idi.voxel_size[0]
+                    )
                 )
                 if gt_volume.shape != volume_shape:
                     print(
