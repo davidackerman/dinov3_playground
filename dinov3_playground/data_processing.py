@@ -17,6 +17,7 @@ import random
 from funlib.geometry import Roi
 from cellmap_flow.image_data_interface import ImageDataInterface
 import warnings  # Add this import at the top
+from funlib.geometry import Coordinate
 
 
 def apply_augmentation(raw_patch, gt_patch):
@@ -997,6 +998,7 @@ def load_random_3d_training_data(
     num_volumes=10,
     seed=42,
     dinov3_stride=None,
+    min_resolution_for_raw=None,
 ):
     """
     Load random 3D volumes from multiple datasets for 3D UNet training.
@@ -1020,6 +1022,9 @@ def load_random_3d_training_data(
     dinov3_stride : int, optional
         If provided, will add ROI-level padding for sliding window inference
         to avoid boundary issues. Padding = 16 - stride pixels per spatial dimension.
+    min_resolution_for_raw : int, default=16
+        Minimum resolution (in nm) for raw data. If base_resolution is lower,
+        raw data will be sampled at this minimum resolution to save memory.
 
     Returns:
     --------
@@ -1092,9 +1097,15 @@ def load_random_3d_training_data(
 
             try:
                 # Initialize raw data interface
-                raw_idi = ImageDataInterface(
-                    raw_path
-                )  # , output_voxel_size=3 * [base_resolution])
+                # Initialize raw data interface
+                if min_resolution_for_raw:
+                    raw_idi = ImageDataInterface(
+                        raw_path, output_voxel_size=3 * [min_resolution_for_raw]
+                    )
+                else:
+                    raw_idi = ImageDataInterface(
+                        raw_path, output_voxel_size=3 * [base_resolution]
+                    )
 
                 # Initialize all class data interfaces (any key that's not "raw")
                 class_keys = [k for k in dataset_dict.keys() if k != "raw"]
@@ -1200,7 +1211,9 @@ def load_random_3d_training_data(
                         f"  Dataset {dataset_idx}: total label fraction {total_label_fraction:.3f} too low"
                     )
                     continue
-
+                print(
+                    f"  Dataset {dataset_idx}: total label fraction {total_label_fraction:.3f}, roi {gt_roi}"
+                )
                 # Sample raw volume with padding (for sliding window context)
                 raw_volume = raw_idi.to_ndarray_ts(padded_roi)
 
@@ -1211,7 +1224,7 @@ def load_random_3d_training_data(
                     else tuple(
                         np.array(volume_shape)
                         * base_resolution
-                        // raw_idi.voxel_size[0]
+                        // raw_idi.output_voxel_size[0]
                     )
                 )
                 if gt_volume.shape != volume_shape:
@@ -1288,3 +1301,163 @@ def load_random_3d_training_data(
     print(f"  Classes found in data: {np.unique(gt_volumes)}")
 
     return raw_volumes, gt_volumes, dataset_sources, num_classes
+
+
+def extract_organelle_directories(base_path="/nrs/cellmap/data"):
+    """
+    Extract all organelle directories from the cellmap data structure.
+
+    Searches for directories matching the pattern:
+    /nrs/cellmap/data/{dataset}/{dataset}.zarr/recon-1/labels/groundtruth/crop{number}/{organelle}
+
+    Parameters:
+    -----------
+    base_path : str
+        Base path to search (default: "/nrs/cellmap/data")
+
+    Returns:
+    --------
+    dict: Dictionary with structure:
+        {
+            'dataset_name': {
+                'crop_number': ['organelle1', 'organelle2', ...],
+                ...
+            },
+            ...
+        }
+    list: Flat list of all unique organelles found across all datasets
+    """
+    import os
+    import glob
+    from pathlib import Path
+
+    print(f"Scanning for organelle directories in: {base_path}")
+
+    organelle_data = {}
+    all_organelles = set()
+
+    # Find all dataset directories
+    if not os.path.exists(base_path):
+        print(f"Error: Base path {base_path} does not exist")
+        return {}, []
+
+    dataset_dirs = [
+        d for d in os.listdir(base_path) if os.path.isdir(os.path.join(base_path, d))
+    ]
+
+    print(f"Found {len(dataset_dirs)} potential dataset directories")
+
+    for dataset in dataset_dirs:
+        dataset_path = os.path.join(base_path, dataset)
+        zarr_path = os.path.join(dataset_path, f"{dataset}.zarr")
+
+        # Check if .zarr directory exists
+        if not os.path.exists(zarr_path):
+            continue
+
+        groundtruth_base = os.path.join(zarr_path, "recon-1", "labels", "groundtruth")
+
+        # Check if groundtruth path exists
+        if not os.path.exists(groundtruth_base):
+            continue
+
+        print(f"  Processing dataset: {dataset}")
+        organelle_data[dataset] = {}
+
+        # Find all crop directories
+        crop_pattern = os.path.join(groundtruth_base, "crop*")
+        crop_dirs = glob.glob(crop_pattern)
+
+        for crop_dir in crop_dirs:
+            crop_name = os.path.basename(crop_dir)  # e.g., "crop001", "crop002"
+
+            # Extract crop number
+            crop_number = crop_name.replace("crop", "")
+
+            # Find all organelle directories in this crop
+            if os.path.isdir(crop_dir):
+                organelles = [
+                    d
+                    for d in os.listdir(crop_dir)
+                    if os.path.isdir(os.path.join(crop_dir, d))
+                ]
+
+                if organelles:
+                    organelle_data[dataset][crop_number] = sorted(organelles)
+                    all_organelles.update(organelles)
+                    print(
+                        f"    {crop_name}: {len(organelles)} organelles - {', '.join(sorted(organelles))}"
+                    )
+
+    # Convert set to sorted list
+    all_organelles = sorted(list(all_organelles))
+
+    print(f"\nSummary:")
+    print(f"  Total datasets with organelles: {len(organelle_data)}")
+    print(f"  Unique organelles found: {len(all_organelles)}")
+    print(f"  All organelles: {', '.join(all_organelles)}")
+
+    return organelle_data, all_organelles
+
+
+def get_organelle_paths(
+    dataset_name, crop_number=None, organelle=None, base_path="/nrs/cellmap/data"
+):
+    """
+    Get full paths to specific organelle directories.
+
+    Parameters:
+    -----------
+    dataset_name : str
+        Name of the dataset
+    crop_number : str or int, optional
+        Specific crop number (e.g., "001" or 1). If None, returns all crops.
+    organelle : str, optional
+        Specific organelle name. If None, returns all organelles.
+    base_path : str
+        Base path to search (default: "/nrs/cellmap/data")
+
+    Returns:
+    --------
+    list: List of full paths matching the criteria
+    """
+    import os
+
+    paths = []
+    zarr_path = os.path.join(base_path, dataset_name, f"{dataset_name}.zarr")
+    groundtruth_base = os.path.join(zarr_path, "recon-1", "labels", "groundtruth")
+
+    if not os.path.exists(groundtruth_base):
+        print(f"Warning: Groundtruth path does not exist: {groundtruth_base}")
+        return paths
+
+    # Handle crop number formatting
+    if crop_number is not None:
+        if isinstance(crop_number, int):
+            crop_number = f"{crop_number:03d}"  # Convert to "001" format
+        crop_dirs = [os.path.join(groundtruth_base, f"crop{crop_number}")]
+    else:
+        import glob
+
+        crop_dirs = glob.glob(os.path.join(groundtruth_base, "crop*"))
+
+    for crop_dir in crop_dirs:
+        if not os.path.exists(crop_dir):
+            continue
+
+        if organelle is not None:
+            # Specific organelle
+            organelle_path = os.path.join(crop_dir, organelle)
+            if os.path.exists(organelle_path):
+                paths.append(organelle_path)
+        else:
+            # All organelles in this crop
+            organelles = [
+                d
+                for d in os.listdir(crop_dir)
+                if os.path.isdir(os.path.join(crop_dir, d))
+            ]
+            for org in organelles:
+                paths.append(os.path.join(crop_dir, org))
+
+    return sorted(paths)

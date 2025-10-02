@@ -366,6 +366,11 @@ class MemoryEfficientDataLoader3D:
             detailed_timing["batch_processing_method"] = processing_method
             detailed_timing["batch_size_processed"] = batch_size
 
+        # Clear temporary pipeline and input volumes from GPU memory
+        del temp_pipeline
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
         if enable_detailed_timing:
             return batch_features, detailed_timing
         else:
@@ -1669,8 +1674,17 @@ def train_3d_unet_memory_efficient_v2(
                 {"Loss": f"{current_loss:.4f}", "Acc": f"{current_acc:.4f}"}
             )
 
+            # Clear processed volumes from GPU memory after each batch
+            del train_features, train_labels, logits, predictions
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
         batch_pbar.close()
         training_time = time.time() - epoch_start_time
+
+        # Clear all training-related GPU memory before validation
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
         # Average training metrics for this epoch
         train_loss = epoch_train_loss / epoch_train_total
@@ -1909,6 +1923,10 @@ def train_3d_unet_memory_efficient_v2(
         val_time = time.time() - val_start_time
         total_epoch_time = time.time() - epoch_start_time
 
+        # Clear all validation-related GPU memory after validation phase
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
         # Record metrics
         train_losses.append(train_loss)
         val_losses.append(val_loss)
@@ -2079,6 +2097,10 @@ def train_3d_unet_memory_efficient_v2(
             print(f"  Stats saved: {os.path.basename(stats_path)}")
 
         print()
+
+        # Final GPU cleanup at end of epoch to ensure fresh start for next epoch
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
         # Early stopping
         if epochs_without_improvement >= patience:
