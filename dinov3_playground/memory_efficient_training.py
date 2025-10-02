@@ -1368,6 +1368,7 @@ def train_3d_unet_memory_efficient_v2(
     volumes_per_batch=1,
     batches_per_epoch=10,
     save_checkpoints=True,
+    checkpoint_every_n_epochs=None,
     model_id=None,
     export_base_dir=None,
     use_class_weighting=True,
@@ -1378,6 +1379,9 @@ def train_3d_unet_memory_efficient_v2(
     memory_efficient_mode="auto",
     learn_upsampling=False,  # NEW PARAMETER
     enable_detailed_timing=True,
+    # Data resolution parameters
+    min_resolution_for_raw=None,
+    base_resolution=None,
 ):
     """
     Train 3D UNet using memory-efficient data loading with DINOv3 features.
@@ -1973,6 +1977,17 @@ def train_3d_unet_memory_efficient_v2(
             + ", ".join([f"{acc:.3f}" for acc in train_class_acc])
             + "]"
         )
+
+        # Print training class distribution
+        train_class_percentages = [
+            count / epoch_train_total * 100 for count in epoch_train_class_total
+        ]
+        print(
+            f"  Train Class Dist:   ["
+            + ", ".join([f"{pct:.1f}%" for pct in train_class_percentages])
+            + "]"
+        )
+
         print(
             f"  Val Class Recall:   ["
             + ", ".join([f"{acc:.3f}" for acc in val_class_acc])
@@ -2039,6 +2054,7 @@ def train_3d_unet_memory_efficient_v2(
                     "base_channels": base_channels,
                     "volumes_per_batch": volumes_per_batch,
                     "batches_per_epoch": batches_per_epoch,
+                    "epochs": epochs,  # Add total epochs
                     "model_type": "dinov3_unet3d",
                     "model_id": model_id,
                     "input_channels": current_output_channels,
@@ -2055,6 +2071,18 @@ def train_3d_unet_memory_efficient_v2(
                     "use_orthogonal_planes": data_loader_3d.use_orthogonal_planes,  # Add orthogonal planes setting
                     "train_volume_pool_size": data_loader_3d.train_volume_pool_size,
                     "val_volume_pool_size": data_loader_3d.val_volume_pool_size,
+                    "checkpoint_every_n_epochs": checkpoint_every_n_epochs,  # Add checkpoint frequency
+                    "enable_detailed_timing": enable_detailed_timing,  # Add timing control
+                    # Data resolution parameters
+                    "min_resolution_for_raw": min_resolution_for_raw,  # Add raw data resolution
+                    "base_resolution": base_resolution,  # Add ground truth resolution
+                    # Additional data loader parameters
+                    "dinov3_stride": getattr(
+                        data_loader_3d, "dinov3_stride", None
+                    ),  # Add DINOv3 stride if available
+                    "verbose": getattr(
+                        data_loader_3d, "verbose", True
+                    ),  # Add verbose setting
                 },
                 "model_config": {
                     "num_classes": num_classes,
@@ -2064,6 +2092,13 @@ def train_3d_unet_memory_efficient_v2(
                     "model_id": model_id,
                     "model_type": "dinov3_unet3d",
                     "dinov3_slice_size": data_loader_3d.dinov3_slice_size,
+                    "learn_upsampling": learn_upsampling,  # Add upsampling mode to model config
+                    "use_orthogonal_planes": data_loader_3d.use_orthogonal_planes,  # Add orthogonal planes
+                    "use_half_precision": use_half_precision,  # Add precision settings
+                    "use_gradient_checkpointing": use_gradient_checkpointing,
+                    # Data resolution parameters for model recreation
+                    "min_resolution_for_raw": min_resolution_for_raw,
+                    "base_resolution": base_resolution,
                 },
             }
 
@@ -2077,7 +2112,7 @@ def train_3d_unet_memory_efficient_v2(
             with open(latest_stats_path, "wb") as f:
                 pickle.dump(stats_data, f)
 
-            # Only save full model checkpoint if this is the best performance
+            # Save full model checkpoint if this is the best performance
             if is_best_model:
                 checkpoint_data = {
                     **stats_data,
@@ -2092,6 +2127,28 @@ def train_3d_unet_memory_efficient_v2(
 
                 print(
                     f"  *** NEW BEST 3D MODEL SAVED: IoU={current_mean_iou:.4f} (Acc={val_acc:.4f}) ***"
+                )
+
+            # Also save model checkpoint every N epochs if specified
+            elif (
+                checkpoint_every_n_epochs is not None
+                and (epoch + 1) % checkpoint_every_n_epochs == 0
+            ):
+                checkpoint_data = {
+                    **stats_data,
+                    "unet3d_state_dict": unet3d.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
+                }
+
+                epoch_path = os.path.join(
+                    checkpoint_dir, f"checkpoint_epoch_{epoch+1:04d}.pkl"
+                )
+                with open(epoch_path, "wb") as f:
+                    pickle.dump(checkpoint_data, f)
+
+                print(
+                    f"  *** PERIODIC CHECKPOINT SAVED: Epoch {epoch+1} (IoU={current_mean_iou:.4f}) ***"
                 )
 
             print(f"  Stats saved: {os.path.basename(stats_path)}")
@@ -2374,6 +2431,7 @@ def train_3d_unet_with_memory_efficient_loader(
     model_id=None,
     export_base_dir=None,
     save_checkpoints=True,
+    checkpoint_every_n_epochs=None,  # Save model checkpoint every N epochs (in addition to best)
     use_class_weighting=True,
     # NEW MEMORY EFFICIENCY PARAMETERS
     use_mixed_precision=True,
@@ -2385,12 +2443,20 @@ def train_3d_unet_with_memory_efficient_loader(
     use_orthogonal_planes=False,  # NEW PARAMETER for orthogonal plane processing
     enable_detailed_timing=True,  # NEW PARAMETER for detailed timing
     verbose=True,  # NEW PARAMETER to control verbose output
+    # DATA RESOLUTION PARAMETERS
+    min_resolution_for_raw=None,  # NEW PARAMETER for raw data resolution
+    base_resolution=None,  # NEW PARAMETER for ground truth resolution
 ):
     """
     Memory-efficient 3D UNet training with multiple precision and memory optimization options.
 
     Parameters:
     -----------
+    checkpoint_every_n_epochs : int, optional
+        Save full model checkpoint every N epochs, regardless of performance.
+        In addition to always saving the best model, this allows periodic backups.
+        If None (default), only saves the best model and training statistics every epoch.
+        Example: checkpoint_every_n_epochs=10 saves model every 10 epochs.
     dinov3_stride : int, optional
         Stride for DINOv3 sliding window inference. If None, uses patch_size (16) for standard inference.
         Use smaller values (e.g., 8, 4) for higher resolution features at the cost of increased computation:
@@ -2466,6 +2532,8 @@ def train_3d_unet_with_memory_efficient_loader(
     print(f"  Model ID: {model_id}")
     print(f"  Export directory: {export_base_dir}")
     print(f"  Save checkpoints: {save_checkpoints}")
+    if save_checkpoints and checkpoint_every_n_epochs is not None:
+        print(f"  Periodic checkpoint saving: Every {checkpoint_every_n_epochs} epochs")
     print(f"  Use class weighting: {use_class_weighting}")
     print()
 
@@ -2547,6 +2615,7 @@ def train_3d_unet_with_memory_efficient_loader(
         volumes_per_batch=volumes_per_batch,
         batches_per_epoch=batches_per_epoch,
         save_checkpoints=save_checkpoints,
+        checkpoint_every_n_epochs=checkpoint_every_n_epochs,
         model_id=model_id,
         export_base_dir=export_base_dir,
         use_class_weighting=use_class_weighting,
@@ -2556,6 +2625,8 @@ def train_3d_unet_with_memory_efficient_loader(
         memory_efficient_mode=memory_efficient_mode,
         learn_upsampling=learn_upsampling,  # Pass through new parameter
         enable_detailed_timing=enable_detailed_timing,  # Pass through new parameter
+        min_resolution_for_raw=min_resolution_for_raw,  # Pass through data resolution parameters
+        base_resolution=base_resolution,
     )
 
     print(f"\n3D UNet training completed!")
