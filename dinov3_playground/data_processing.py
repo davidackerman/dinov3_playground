@@ -632,8 +632,17 @@ def _sample_single_orientation(
 
         # try:
         # Initialize data interfaces
-        raw_idi = ImageDataInterface(raw_path, output_voxel_size=3 * [base_resolution])
-        gt_idi = ImageDataInterface(gt_path, output_voxel_size=3 * [base_resolution])
+        raw_idi = ImageDataInterface(
+            raw_path,
+            output_voxel_size=3 * [base_resolution],
+            force_pseudo_isotropic=True,
+        )
+        gt_idi = ImageDataInterface(
+            gt_path,
+            output_voxel_size=3 * [base_resolution],
+            force_pseudo_isotropic=True,
+            is_segmentation=True,
+        )
 
         # Get bounds
         raw_begin = np.array(raw_idi.roi.begin)
@@ -1000,6 +1009,7 @@ def load_random_3d_training_data(
     seed=42,
     dinov3_stride=None,
     min_resolution_for_raw=None,
+    allow_gt_extension=False,  # NEW PARAMETER
 ):
     """
     Load random 3D volumes from multiple datasets for 3D UNet training.
@@ -1026,15 +1036,20 @@ def load_random_3d_training_data(
     min_resolution_for_raw : int, default=16
         Minimum resolution (in nm) for raw data. If base_resolution is lower,
         raw data will be sampled at this minimum resolution to save memory.
+    allow_gt_extension : bool, default=False
+        If True, allows sampling of raw volumes that extend beyond ground truth regions.
+        This provides more context for training but requires using masks for loss calculation.
+        When True, returns gt_masks indicating valid ground truth regions.
 
     Returns:
     --------
-    tuple: (raw_volumes, gt_volumes, dataset_sources, num_classes)
+    tuple: (raw_volumes, gt_volumes, dataset_sources, num_classes) or
+           (raw_volumes, gt_volumes, gt_masks, dataset_sources, num_classes)
         - raw_volumes: np.array of shape (num_volumes, D, H, W) or (num_volumes, D+pad, H+pad, W+pad) if padded
         - gt_volumes: np.array of shape (num_volumes, D, H, W) with class indices (always unpadded)
+        - gt_masks: np.array of shape (num_volumes, D, H, W) with 1 where GT is valid, 0 elsewhere (only if allow_gt_extension=True)
         - dataset_sources: list of dataset indices
         - num_classes: int, total number of classes including background
-           Each has shape (num_volumes, D, H, W)
     """
     if seed is not None:
         np.random.seed(seed)
@@ -1074,6 +1089,9 @@ def load_random_3d_training_data(
 
     raw_volumes = []
     gt_volumes = []
+    gt_masks = (
+        []
+    )  # Masks indicating valid GT regions (only used if allow_gt_extension=True)
     dataset_sources = []
 
     print(
@@ -1101,7 +1119,9 @@ def load_random_3d_training_data(
             # Initialize raw data interface
             if min_resolution_for_raw:
                 raw_idi = ImageDataInterface(
-                    raw_path, output_voxel_size=3 * [min_resolution_for_raw]
+                    raw_path,
+                    output_voxel_size=3 * [min_resolution_for_raw],
+                    force_pseudo_isotropic=True,
                 )
             else:
                 raw_idi = ImageDataInterface(
@@ -1113,24 +1133,61 @@ def load_random_3d_training_data(
             class_idis = {}
             for class_key in class_keys:
                 class_idis[class_key] = ImageDataInterface(
-                    dataset_dict[class_key], output_voxel_size=3 * [base_resolution]
+                    dataset_dict[class_key],
+                    output_voxel_size=3 * [base_resolution],
+                    force_pseudo_isotropic=True,
+                    is_segmentation=True,
                 )
 
             # Get bounds from raw data
             raw_begin = np.array(raw_idi.roi.begin)
             raw_end = np.array(raw_idi.roi.end)
 
-            # Find overlapping region across all datasets
-            overlap_begin = raw_begin.copy()
-            overlap_end = raw_end.copy()
+            if allow_gt_extension:
+                # When allowing GT extension, use raw data bounds for sampling
+                # but ensure center of volume intersects with GT regions
+                raw_overlap_begin = raw_begin.copy()
+                raw_overlap_end = raw_end.copy()
 
-            for class_key, class_idi in class_idis.items():
-                class_begin = np.array(class_idi.roi.begin)
-                class_end = np.array(class_idi.roi.end)
-                overlap_begin = np.maximum(overlap_begin, class_begin)
-                overlap_end = np.minimum(overlap_end, class_end)
+                # Find GT overlap region (intersection of all GT datasets)
+                gt_overlap_begin = raw_begin.copy()
+                gt_overlap_end = raw_end.copy()
+                for class_key, class_idi in class_idis.items():
+                    class_begin = np.array(class_idi.roi.begin)
+                    class_end = np.array(class_idi.roi.end)
+                    gt_overlap_begin = np.maximum(gt_overlap_begin, class_begin)
+                    gt_overlap_end = np.minimum(gt_overlap_end, class_end)
 
-            overlap_shape = overlap_end - overlap_begin
+                gt_overlap_shape = gt_overlap_end - gt_overlap_begin
+
+                # Check if GT overlap region exists (center constraint only needs a single voxel)
+                if np.any(gt_overlap_shape <= 0):
+                    print(
+                        f"  Dataset {dataset_idx}: No GT overlap region found - GT regions don't intersect"
+                    )
+                    continue
+
+                # Use raw bounds for sampling, but constrain center to GT region
+                overlap_begin = raw_overlap_begin
+                overlap_end = raw_overlap_end
+                overlap_shape = overlap_end - overlap_begin
+
+                # Store GT bounds for mask creation later
+                dataset_gt_bounds = (gt_overlap_begin, gt_overlap_end)
+
+            else:
+                # Original behavior: find overlapping region across all datasets
+                overlap_begin = raw_begin.copy()
+                overlap_end = raw_end.copy()
+
+                for class_key, class_idi in class_idis.items():
+                    class_begin = np.array(class_idi.roi.begin)
+                    class_end = np.array(class_idi.roi.end)
+                    overlap_begin = np.maximum(overlap_begin, class_begin)
+                    overlap_end = np.minimum(overlap_end, class_end)
+
+                overlap_shape = overlap_end - overlap_begin
+                dataset_gt_bounds = None
 
             # Check if overlap is large enough for our volume (use padded shape for ROI)
             required_shape = padded_volume_shape_nm
@@ -1148,15 +1205,46 @@ def load_random_3d_training_data(
                 print(f"  Dataset {dataset_idx}: no valid sampling region")
                 continue
 
-            # Generate random offset (aligned to base_resolution)
-            random_offset = []
-            for i in range(3):
-                min_mult = int(min_offset[i] // base_resolution)
-                max_mult = int(max_offset[i] // base_resolution)
-                offset_mult = np.random.randint(min_mult, max_mult + 1)
-                random_offset.append(offset_mult * base_resolution)
+            if allow_gt_extension and dataset_gt_bounds is not None:
+                # Generate random offset ensuring volume center falls within GT bounds
+                gt_begin, gt_end = dataset_gt_bounds
+                volume_center_offset = np.array(padded_volume_shape_nm) // 2
 
-            random_offset = np.array(random_offset)
+                # Calculate constraints for center to be within GT region
+                center_min = gt_begin
+                center_max = gt_end
+
+                # Calculate corresponding volume start constraints
+                vol_min = center_min - volume_center_offset
+                vol_max = center_max - volume_center_offset
+
+                # Intersect with original sampling bounds
+                vol_min = np.maximum(vol_min, min_offset)
+                vol_max = np.minimum(vol_max, max_offset)
+
+                # Generate random offset (aligned to base_resolution)
+                random_offset = []
+                for i in range(3):
+                    min_mult = int(vol_min[i] // base_resolution)
+                    max_mult = int(vol_max[i] // base_resolution)
+                    if max_mult < min_mult:
+                        # Fallback to original bounds if constraints are too tight
+                        min_mult = int(min_offset[i] // base_resolution)
+                        max_mult = int(max_offset[i] // base_resolution)
+                    offset_mult = np.random.randint(min_mult, max_mult + 1)
+                    random_offset.append(offset_mult * base_resolution)
+
+                random_offset = np.array(random_offset)
+            else:
+                # Original behavior: generate random offset (aligned to base_resolution)
+                random_offset = []
+                for i in range(3):
+                    min_mult = int(min_offset[i] // base_resolution)
+                    max_mult = int(max_offset[i] // base_resolution)
+                    offset_mult = np.random.randint(min_mult, max_mult + 1)
+                    random_offset.append(offset_mult * base_resolution)
+
+                random_offset = np.array(random_offset)
 
             # Create ROIs for 3D volume
             # Use padded ROI for raw data (to include boundary context for sliding window)
@@ -1173,17 +1261,21 @@ def load_random_3d_training_data(
                 )
                 gt_roi = Roi(gt_offset, volume_shape_nm)
             else:
+                # No padding, so GT offset is the same as random offset
+                gt_offset = random_offset
                 gt_roi = padded_roi  # Same as padded when no padding
 
             # Sample all class volumes without padding (maintain target shape)
             class_volumes = {}
             failed_classes = []
 
+            crop_failed = False
             for class_key, class_idi in class_idis.items():
                 try:
                     class_volumes[class_key] = class_idi.to_ndarray_ts(gt_roi)
-                except (ValueError, RuntimeError, OSError) as e:
-                    # Extract dataset info for warning
+                except (ValueError, RuntimeError, OSError, IndexError) as e:
+                    # Any error with any class should skip the entire crop attempt
+                    # since we need all classes present per ROI
                     dataset_name = "unknown"
                     crop_info = "unknown"
 
@@ -1203,14 +1295,22 @@ def load_random_3d_training_data(
                                 crop_num = crop_parts[-1].split("/")[0]
                                 crop_info = f"crop{crop_num}"
 
-                    print(
-                        f"    ⚠️  WARNING: Skipping '{class_key}' in dataset '{dataset_name}', {crop_info}"
+                    error_type = (
+                        "Invalid ROI coordinates"
+                        if isinstance(e, IndexError)
+                        else "TensorStore/zarr compatibility error"
                     )
                     print(
-                        f"       TensorStore/zarr compatibility error: {str(e)[:100]}..."
+                        f"  Dataset {dataset_idx}: {error_type} for '{class_key}' in '{dataset_name}', {crop_info} - skipping this crop"
                     )
-                    failed_classes.append(class_key)
-                    continue
+                    print(f"    ROI: {gt_roi}")
+                    print(f"    Error: {str(e)[:100]}...")
+                    crop_failed = True
+                    break
+
+            # Skip this attempt if any class failed
+            if crop_failed:
+                continue
 
             # Skip this dataset entirely if no classes could be loaded
             if not class_volumes:
@@ -1229,7 +1329,9 @@ def load_random_3d_training_data(
                 key for key in class_keys if key in class_volumes
             ]
             sorted_class_keys = sorted(successfully_loaded_keys)
-            total_label_fraction = 0.0
+            class_fractions = (
+                {}
+            )  # Store class masks for later label fraction calculation
 
             if failed_classes:
                 print(
@@ -1290,21 +1392,18 @@ def load_random_3d_training_data(
                 # Later classes override earlier ones in overlapping regions
                 gt_volume[class_mask] = class_idx
 
-                # Update total label fraction
-                class_fraction = np.sum(class_mask) / class_mask.size
-                total_label_fraction += class_fraction
-
-            # Check minimum label fraction across all classes
-            if total_label_fraction < min_label_fraction:
-                print(
-                    f"  Dataset {dataset_idx}: total label fraction {total_label_fraction:.3f} too low"
-                )
-                continue
-            print(
-                f"  Dataset {dataset_idx}: total label fraction {total_label_fraction:.3f}, roi {gt_roi}"
-            )
+                # Store class fraction for later calculation (after GT mask is created)
+                class_fractions[class_key] = class_mask
             # Sample raw volume with padding (for sliding window context)
-            raw_volume = raw_idi.to_ndarray_ts(padded_roi)
+            try:
+                raw_volume = raw_idi.to_ndarray_ts(padded_roi)
+            except (ValueError, RuntimeError, OSError, IndexError) as e:
+                print(
+                    f"  Dataset {dataset_idx}: Invalid ROI coordinates - skipping this crop"
+                )
+                print(f"    ROI: {padded_roi}")
+                print(f"    Error: {str(e)[:100]}...")
+                continue
 
             # Validate shapes
             expected_raw_shape = (
@@ -1323,12 +1422,160 @@ def load_random_3d_training_data(
                 continue
 
             if raw_volume.shape != expected_raw_shape:
+                # Extract dataset info for warning
+                dataset_name = "unknown"
+                crop_info = "unknown"
+
+                if "raw" in dataset_dict:
+                    raw_path = dataset_dict["raw"]
+                    path_parts = raw_path.split("/")
+                    for part in path_parts:
+                        if part.startswith("jrc_") or "cellmap" in part:
+                            dataset_name = part
+                            break
+
                 print(
-                    f"  Dataset {dataset_idx}: Raw shape mismatch - got: {raw_volume.shape}, expected: {expected_raw_shape}"
+                    f"    ⚠️  WARNING: Raw data shape mismatch in dataset '{dataset_name}':"
                 )
+                print(f"       Expected: {expected_raw_shape}, Got: {raw_volume.shape}")
+                print(
+                    f"       Likely due to asymmetric voxel dimensions in zarr data - resizing to match target shape"
+                )
+
+                # Resize to match expected shape
+                from scipy.ndimage import zoom
+
+                zoom_factors = np.array(expected_raw_shape) / np.array(raw_volume.shape)
+                raw_volume = zoom(raw_volume.astype(float), zoom_factors, order=1)
+                raw_volume = raw_volume.astype(
+                    np.uint8
+                )  # Convert back to uint8 for raw data
+
+            # Create GT mask if GT extension is allowed
+            if allow_gt_extension:
+                # ROBUST APPROACH: Create mask based on actual presence of GT data
+                # This accounts for any resizing that occurred and ensures perfect alignment
+                gt_mask = np.zeros(volume_shape, dtype=np.uint8)
+
+                # Method 1: Use the final GT volume to determine valid regions
+                # Any non-background voxel indicates a valid GT region
+                valid_gt_regions = gt_volume > 0  # Any foreground class
+
+                if np.sum(valid_gt_regions) > 0:
+                    # We have some valid GT data - create mask around it
+                    # Find bounding box of all valid GT data
+                    nonzero_coords = np.where(valid_gt_regions)
+
+                    if len(nonzero_coords[0]) > 0:
+                        min_coords = [np.min(coords) for coords in nonzero_coords]
+                        max_coords = [np.max(coords) for coords in nonzero_coords]
+
+                        # Create a slightly expanded bounding box to be conservative
+                        padding = 2
+                        min_coords = [max(0, c - padding) for c in min_coords]
+                        max_coords = [
+                            min(s - 1, c + padding)
+                            for c, s in zip(max_coords, volume_shape)
+                        ]
+
+                        # Set mask to 1 in regions where we have actual GT data
+                        gt_mask[
+                            min_coords[0] : max_coords[0] + 1,
+                            min_coords[1] : max_coords[1] + 1,
+                            min_coords[2] : max_coords[2] + 1,
+                        ] = 1
+
+                        print(
+                            f"    GT mask created from actual data: {np.sum(gt_mask)} / {gt_mask.size} voxels valid"
+                        )
+                    else:
+                        # Fallback: no valid data found, use full mask
+                        print(
+                            "    ⚠️  Warning: No valid GT data found - using full mask"
+                        )
+                        gt_mask = np.ones(volume_shape, dtype=np.uint8)
+                else:
+                    # No foreground labels at all - this might be a background-only region
+                    # In GT extension mode, we should still have a mask
+                    # Method 2: Try to determine valid regions from original coordinate bounds
+                    if dataset_gt_bounds is not None:
+                        # Calculate intersection of GT ROI with the sampled volume ROI
+                        gt_begin, gt_end = dataset_gt_bounds
+                        gt_roi_full = Roi(gt_begin, gt_end - gt_begin)
+                        sampled_gt_roi = Roi(gt_offset, volume_shape_nm)
+
+                        # Find intersection
+                        intersection_roi = gt_roi_full.intersect(sampled_gt_roi)
+
+                        if intersection_roi is not None and not intersection_roi.empty:
+                            # Convert intersection back to volume coordinates
+                            gt_offset_coord = Coordinate(gt_offset)
+                            intersection_offset = (
+                                intersection_roi.begin - gt_offset_coord
+                            )
+                            intersection_shape = intersection_roi.shape
+
+                            # Convert from nm to voxels
+                            mask_start = intersection_offset // base_resolution
+                            mask_end = mask_start + (
+                                intersection_shape // base_resolution
+                            )
+
+                            # Ensure indices are within bounds and integers
+                            mask_start = np.maximum(0, mask_start).astype(int)
+                            mask_end = np.minimum(volume_shape, mask_end).astype(int)
+
+                            # Set mask to 1 in valid GT region
+                            gt_mask[
+                                mask_start[0] : mask_end[0],
+                                mask_start[1] : mask_end[1],
+                                mask_start[2] : mask_end[2],
+                            ] = 1
+
+                            print(
+                                f"    GT mask created from coordinate bounds: {np.sum(gt_mask)} / {gt_mask.size} voxels valid"
+                            )
+
+                    # Final fallback
+                    if np.sum(gt_mask) == 0:
+                        print(
+                            "    ⚠️  Warning: Could not determine valid GT regions - using full mask"
+                        )
+                        gt_mask = np.ones(volume_shape, dtype=np.uint8)
+
+                # Don't append mask yet - wait until after label fraction check
+                pass
+            else:
+                # For compatibility, add full mask when not using GT extension
+                gt_mask = np.ones(volume_shape, dtype=np.uint8)
+                # Don't append mask yet - wait until after label fraction check
+
+            # Now calculate label fraction within valid GT regions only
+            total_label_fraction = 0.0
+            valid_gt_voxels = np.sum(gt_mask)  # Number of valid GT voxels
+
+            if valid_gt_voxels == 0:
+                print(f"  Dataset {dataset_idx}: No valid GT region found - skipping")
                 continue
 
-            # Store the volumes
+            for class_key, class_mask in class_fractions.items():
+                # Only count labels within valid GT regions
+                valid_class_voxels = np.sum(class_mask & (gt_mask == 1))
+                class_fraction = valid_class_voxels / valid_gt_voxels
+                total_label_fraction += class_fraction
+
+            # Check minimum label fraction within valid GT regions
+            if total_label_fraction < min_label_fraction:
+                print(
+                    f"  Dataset {dataset_idx}: label fraction {total_label_fraction:.3f} too low within valid GT regions"
+                )
+                continue
+            print(
+                f"  Dataset {dataset_idx}: label fraction {total_label_fraction:.3f} within valid GT regions, roi {gt_roi}"
+            )
+
+            # Store the volumes and mask (only after all checks pass)
+            gt_masks.append(gt_mask)
             raw_volumes.append(raw_volume)
             gt_volumes.append(gt_volume)
             dataset_sources.append(dataset_idx)
@@ -1382,14 +1629,23 @@ def load_random_3d_training_data(
     gt_volumes = np.array(
         gt_volumes
     )  # Shape: (num_volumes, D, H, W) with class indices
+    gt_masks = np.array(gt_masks)  # Shape: (num_volumes, D, H, W) with 0/1 mask
 
     print(f"Final dataset summary:")
     print(f"  Raw volumes shape: {raw_volumes.shape}")
     print(f"  GT volumes shape: {gt_volumes.shape}")
+    print(f"  GT masks shape: {gt_masks.shape}")
     print(f"  Number of classes: {num_classes}")
     print(f"  Classes found in data: {np.unique(gt_volumes)}")
+    if allow_gt_extension:
+        print(f"  GT extension enabled - masks indicate valid GT regions")
+        valid_mask_fraction = np.mean(gt_masks)
+        print(f"  Average valid GT fraction: {valid_mask_fraction:.3f}")
 
-    return raw_volumes, gt_volumes, dataset_sources, num_classes
+    if allow_gt_extension:
+        return raw_volumes, gt_volumes, gt_masks, dataset_sources, num_classes
+    else:
+        return raw_volumes, gt_volumes, dataset_sources, num_classes
 
 
 def extract_organelle_directories(base_path="/nrs/cellmap/data", organelle_list=None):

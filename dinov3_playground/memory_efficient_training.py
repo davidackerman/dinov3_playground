@@ -58,6 +58,7 @@ class MemoryEfficientDataLoader3D:
         self,
         raw_data,
         gt_data,
+        gt_masks=None,  # NEW PARAMETER for GT extension masks
         train_volume_pool_size=20,
         val_volume_pool_size=5,
         target_volume_size=(64, 64, 64),
@@ -79,6 +80,9 @@ class MemoryEfficientDataLoader3D:
             4D raw volume data (num_volumes, D, H, W)
         gt_data : numpy.ndarray
             4D ground truth data (num_volumes, D, H, W)
+        gt_masks : numpy.ndarray, optional
+            4D mask data (num_volumes, D, H, W) with 1 where GT is valid, 0 elsewhere.
+            If None, assumes all GT regions are valid (full mask of 1s).
         train_volume_pool_size : int, default=20
             Number of possible training volumes to sample from
         val_volume_pool_size : int, default=5
@@ -159,6 +163,22 @@ class MemoryEfficientDataLoader3D:
 
         self.raw_data = raw_data
         self.gt_data = gt_data
+
+        # Handle GT masks - create full masks if not provided
+        if gt_masks is None:
+            self.gt_masks = np.ones_like(gt_data, dtype=np.uint8)
+            print("  - GT masks: Created full masks (all regions valid)")
+        else:
+            if gt_masks.shape != gt_data.shape:
+                raise ValueError(
+                    f"GT masks shape {gt_masks.shape} doesn't match GT data shape {gt_data.shape}"
+                )
+            self.gt_masks = gt_masks
+            valid_fraction = np.mean(gt_masks)
+            print(
+                f"  - GT masks: Using provided masks ({valid_fraction:.3f} average valid fraction)"
+            )
+
         self.train_volume_pool_size = train_volume_pool_size
         self.val_volume_pool_size = val_volume_pool_size
         self.target_volume_size = target_volume_size
@@ -233,7 +253,7 @@ class MemoryEfficientDataLoader3D:
 
         Returns:
         --------
-        tuple: (batch_volumes, batch_gt) of shape (batch_size, D, H, W)
+        tuple: (batch_volumes, batch_gt, batch_masks) of shape (batch_size, D, H, W)
         """
         # Sample random volumes from training pool
         sampled_indices = self.rng.choice(
@@ -244,8 +264,9 @@ class MemoryEfficientDataLoader3D:
 
         batch_volumes = self.raw_data[sampled_indices]
         batch_gt = self.gt_data[sampled_indices]
+        batch_masks = self.gt_masks[sampled_indices]
 
-        return batch_volumes, batch_gt
+        return batch_volumes, batch_gt, batch_masks
 
     def get_validation_data(self):
         """
@@ -253,12 +274,13 @@ class MemoryEfficientDataLoader3D:
 
         Returns:
         --------
-        tuple: (val_volumes, val_gt) of shape (val_pool_size, D, H, W)
+        tuple: (val_volumes, val_gt, val_masks) of shape (val_pool_size, D, H, W)
         """
         val_volumes = self.raw_data[self.val_indices]
         val_gt = self.gt_data[self.val_indices]
+        val_masks = self.gt_masks[self.val_indices]
 
-        return val_volumes, val_gt
+        return val_volumes, val_gt, val_masks
 
     def extract_dinov3_features_3d(
         self, volumes, epoch=None, batch=None, enable_detailed_timing=False
@@ -1395,6 +1417,7 @@ def train_3d_unet_memory_efficient_v2(
     print(f"  - Class weighting: {use_class_weighting}")
     print(f"  - Mixed precision: {use_mixed_precision}")
     print(f"  - Learn upsampling: {learn_upsampling}")  # NEW
+    print(f"  - GT extension masks: Conditional masking (auto-detected per batch)")
 
     # Initialize mixed precision scaler
     scaler = GradScaler() if use_mixed_precision else None
@@ -1409,7 +1432,7 @@ def train_3d_unet_memory_efficient_v2(
         print(f"  - Checkpoints will be saved to: {checkpoint_dir}")
 
     # Get validation data (keep on CPU for memory efficiency)
-    val_volumes, val_gt_volumes = data_loader_3d.get_validation_data()
+    val_volumes, val_gt_volumes, val_masks = data_loader_3d.get_validation_data()
 
     print(f"Validation set: {len(val_volumes)} volumes prepared")
     print(f"Validation labels will be processed volume-by-volume for memory efficiency")
@@ -1418,17 +1441,43 @@ def train_3d_unet_memory_efficient_v2(
         "Note: Validation features and labels will be computed volume-by-volume on-demand"
     )
 
-    # Calculate class weights from validation data (process on CPU to avoid GPU memory issues)
+    # Calculate class weights from training data (process volumes on CPU to avoid GPU memory issues)
     if use_class_weighting:
-        print("Calculating class weights from validation data...")
-        # Process validation volumes on CPU to calculate class distribution
-        all_val_labels = []
-        for vol_gt in val_gt_volumes:
-            all_val_labels.append(vol_gt.flatten())
-        val_labels_flat = np.concatenate(all_val_labels)
+        print("Calculating class weights from training data...")
+        # Sample training data to calculate class distribution from masked regions
+        print("Sampling training volumes to estimate class distribution...")
 
-        unique_classes, class_counts = np.unique(val_labels_flat, return_counts=True)
-        total_voxels = len(val_labels_flat)
+        # Use a reasonable sample of training volumes for class weight calculation
+        sample_size = min(
+            10, len(data_loader_3d.train_pool_indices)
+        )  # Sample up to 10 volumes
+        sample_indices = np.random.choice(
+            data_loader_3d.train_pool_indices, size=sample_size, replace=False
+        )
+
+        all_train_labels = []
+        total_masked_voxels = 0
+
+        for idx in sample_indices:
+            train_gt = data_loader_3d.gt_data[idx]
+            train_mask = data_loader_3d.gt_masks[idx]
+
+            # Check if mask is actually restricting regions (not all 1s)
+            if not np.all(train_mask == 1):
+                # Only consider masked regions for class distribution
+                mask_bool = train_mask.astype(bool)
+                masked_labels = train_gt[mask_bool]
+                all_train_labels.append(masked_labels.flatten())
+                total_masked_voxels += np.sum(mask_bool)
+            else:
+                # If mask is all 1s, use all voxels
+                all_train_labels.append(train_gt.flatten())
+                total_masked_voxels += train_gt.size
+
+        train_labels_flat = np.concatenate(all_train_labels)
+
+        unique_classes, class_counts = np.unique(train_labels_flat, return_counts=True)
+        total_voxels = len(train_labels_flat)
 
         class_weights = np.zeros(num_classes)
         for i, (class_id, count) in enumerate(zip(unique_classes, class_counts)):
@@ -1440,7 +1489,9 @@ def train_3d_unet_memory_efficient_v2(
             device
         )
 
-        print("Class distribution in validation data:")
+        print(
+            f"Class distribution in training data (from {sample_size} sampled volumes, {total_masked_voxels:,} masked voxels):"
+        )
         for i, (class_id, count) in enumerate(zip(unique_classes, class_counts)):
             if class_id < num_classes:
                 percentage = (count / total_voxels) * 100
@@ -1450,7 +1501,7 @@ def train_3d_unet_memory_efficient_v2(
                 )
 
         # Clean up temporary data
-        del all_val_labels, val_labels_flat
+        del all_train_labels, train_labels_flat
     else:
         class_weights_tensor = None
         print("Using unweighted loss (no class balancing)")
@@ -1545,8 +1596,8 @@ def train_3d_unet_memory_efficient_v2(
 
         for batch_idx in batch_pbar:
             # Sample new training volumes for this batch
-            train_volumes, train_gt_volumes = data_loader_3d.sample_training_batch(
-                volumes_per_batch
+            train_volumes, train_gt_volumes, train_masks = (
+                data_loader_3d.sample_training_batch(volumes_per_batch)
             )
 
             # TIMING: Start DINOv3 feature extraction
@@ -1576,6 +1627,25 @@ def train_3d_unet_memory_efficient_v2(
             dinov3_time = dinov3_end - dinov3_start
 
             train_labels = torch.tensor(train_gt_volumes, dtype=torch.long).to(device)
+            train_masks_tensor = torch.tensor(train_masks, dtype=torch.float32).to(
+                device
+            )
+
+            # Debug: Print shapes for first batch of first epoch
+            if epoch == 0 and batch_idx == 0:
+                print(f"  DEBUG - Tensor shapes:")
+                print(f"    train_features: {train_features.shape}")
+                print(f"    train_labels: {train_labels.shape}")
+                print(f"    train_masks_tensor: {train_masks_tensor.shape}")
+                print(
+                    f"    Mask min/max: {train_masks_tensor.min().item():.3f}/{train_masks_tensor.max().item():.3f}"
+                )
+                print(
+                    f"    Mask fraction valid: {train_masks_tensor.mean().item():.3f}"
+                )
+
+            # Check if masks are actually being used (not all 1s)
+            use_masks = not torch.all(train_masks_tensor == 1.0)
 
             # TIMING: Start training step (UNet forward/backward)
             training_start = time.time()
@@ -1590,7 +1660,55 @@ def train_3d_unet_memory_efficient_v2(
                     enabled=False,
                 ):  # Disable autocast for metric calculations
                     logits = unet3d(train_features)
-                    loss = criterion(logits, train_labels)
+
+                    # Debug: Print logits shape for first batch of first epoch
+                    if epoch == 0 and batch_idx == 0:
+                        print(f"    logits: {logits.shape}")
+                        print(
+                            f"    logits range: [{logits.min().item():.3f}, {logits.max().item():.3f}]"
+                        )
+                        # Check if logits sum to 1 (they shouldn't for raw logits)
+                        logits_sum = logits.sum(dim=1)  # Sum across class dimension
+                        print(
+                            f"    logits sum across classes: [{logits_sum.min().item():.3f}, {logits_sum.max().item():.3f}]"
+                        )
+                        # Show softmax probabilities for comparison
+                        probs = F.softmax(logits, dim=1)
+                        probs_sum = probs.sum(dim=1)
+                        print(
+                            f"    probabilities (after softmax) sum: [{probs_sum.min().item():.3f}, {probs_sum.max().item():.3f}]"
+                        )
+                        print(
+                            f"    probabilities range: [{probs.min().item():.3f}, {probs.max().item():.3f}]"
+                        )
+
+                    if use_masks:
+                        # Apply masks to loss calculation
+                        per_pixel_loss = F.cross_entropy(
+                            logits, train_labels, reduction="none"
+                        )
+                        masked_loss = per_pixel_loss * train_masks_tensor
+                        loss = masked_loss.sum() / train_masks_tensor.sum()
+
+                        # Debug: Print loss calculation details for first batch of first epoch
+                        if epoch == 0 and batch_idx == 0:
+                            print(
+                                f"    per_pixel_loss: {per_pixel_loss.shape}, mean: {per_pixel_loss.mean().item():.4f}"
+                            )
+                            print(
+                                f"    masked_loss sum: {masked_loss.sum().item():.4f}"
+                            )
+                            print(
+                                f"    mask sum: {train_masks_tensor.sum().item():.1f}"
+                            )
+                            print(f"    final loss: {loss.item():.4f}")
+                    else:
+                        # Use standard loss when no masking needed
+                        loss = criterion(logits, train_labels)
+
+                        # Debug: Print unmasked loss for first batch of first epoch
+                        if epoch == 0 and batch_idx == 0:
+                            print(f"    unmasked loss: {loss.item():.4f}")
 
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
@@ -1599,7 +1717,16 @@ def train_3d_unet_memory_efficient_v2(
                 scaler.update()
             else:
                 logits = unet3d(train_features)
-                loss = criterion(logits, train_labels)
+                if use_masks:
+                    # Apply masks to loss calculation
+                    per_pixel_loss = F.cross_entropy(
+                        logits, train_labels, reduction="none"
+                    )
+                    masked_loss = per_pixel_loss * train_masks_tensor
+                    loss = masked_loss.sum() / train_masks_tensor.sum()
+                else:
+                    # Use standard loss when no masking needed
+                    loss = criterion(logits, train_labels)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(unet3d.parameters(), max_norm=1.0)
                 optimizer.step()
@@ -1612,21 +1739,37 @@ def train_3d_unet_memory_efficient_v2(
             training_end = time.time()
             training_time = training_end - training_start
 
-            # Track metrics
+            # Track metrics (conditional on mask usage)
             with autocast(
                 device_type="cuda" if device.type == "cuda" else "cpu", enabled=False
             ):  # Disable autocast for metric calculations
                 predictions = torch.argmax(logits.float(), dim=1)
-                correct = (predictions == train_labels).sum().item()
-                total = train_labels.numel()
+                if use_masks:
+                    # Only for masked regions
+                    train_mask_bool = train_masks_tensor.bool()
+                    correct = (
+                        ((predictions == train_labels) & train_mask_bool).sum().item()
+                    )
+                    total = train_masks_tensor.sum().item()
+                else:
+                    # All regions when no masking
+                    correct = (predictions == train_labels).sum().item()
+                    total = train_labels.numel()
 
             epoch_train_loss += loss.item() * total
             epoch_train_correct += correct
             epoch_train_total += total
 
-            # Track per-class accuracy
+            # Track per-class accuracy (conditional on mask usage)
             for class_id in range(num_classes):
-                class_mask = train_labels == class_id
+                if use_masks:
+                    # Only in masked regions
+                    train_mask_bool = train_masks_tensor.bool()
+                    class_mask = (train_labels == class_id) & train_mask_bool
+                else:
+                    # All regions when no masking
+                    class_mask = train_labels == class_id
+
                 if class_mask.sum() > 0:
                     class_correct = (predictions[class_mask] == class_id).sum().item()
                     class_total = class_mask.sum().item()
@@ -1759,12 +1902,20 @@ def train_3d_unet_memory_efficient_v2(
                 val_dinov3_end = time.time()
                 val_dinov3_time = val_dinov3_end - val_dinov3_start
 
-                # Get ground truth for this volume and move to GPU
+                # Get ground truth and mask for this volume and move to GPU
                 vol_gt = (
                     torch.tensor(val_gt_volumes[vol_idx], dtype=torch.long)
                     .unsqueeze(0)
                     .to(device)
                 )
+                vol_mask = (
+                    torch.tensor(val_masks[vol_idx], dtype=torch.float32)
+                    .unsqueeze(0)
+                    .to(device)
+                )
+
+                # Check if masks are actually being used (not all 1s)
+                use_vol_masks = not torch.all(vol_mask == 1.0)
 
                 # TIMING: Start validation inference
                 val_inference_start = time.time()
@@ -1775,10 +1926,28 @@ def train_3d_unet_memory_efficient_v2(
                         device_type="cuda" if device.type == "cuda" else "cpu"
                     ):
                         vol_logits = unet3d(vol_features)
-                        vol_loss = criterion(vol_logits, vol_gt).item()
+                        if use_vol_masks:
+                            # Apply masks to validation loss calculation
+                            vol_per_pixel_loss = F.cross_entropy(
+                                vol_logits, vol_gt, reduction="none"
+                            )
+                            vol_masked_loss = vol_per_pixel_loss * vol_mask
+                            vol_loss = (vol_masked_loss.sum() / vol_mask.sum()).item()
+                        else:
+                            # Use standard loss when no masking needed
+                            vol_loss = criterion(vol_logits, vol_gt).item()
                 else:
                     vol_logits = unet3d(vol_features)
-                    vol_loss = criterion(vol_logits, vol_gt).item()
+                    if use_vol_masks:
+                        # Apply masks to validation loss calculation
+                        vol_per_pixel_loss = F.cross_entropy(
+                            vol_logits, vol_gt, reduction="none"
+                        )
+                        vol_masked_loss = vol_per_pixel_loss * vol_mask
+                        vol_loss = (vol_masked_loss.sum() / vol_mask.sum()).item()
+                    else:
+                        # Use standard loss when no masking needed
+                        vol_loss = criterion(vol_logits, vol_gt).item()
 
                 # TIMING: End validation inference
                 val_inference_end = time.time()
@@ -1791,34 +1960,50 @@ def train_3d_unet_memory_efficient_v2(
                 # Convert to predictions
                 vol_predictions = torch.argmax(vol_logits.float(), dim=1)
 
-                # Accumulate basic metrics
-                vol_correct = (vol_predictions == vol_gt).sum().item()
-                vol_voxels = vol_gt.numel()
+                # Accumulate basic metrics (conditional on mask usage)
+                if use_vol_masks:
+                    # Only for masked regions
+                    vol_mask_bool = vol_mask.bool()
+                    vol_correct = (
+                        ((vol_predictions == vol_gt) & vol_mask_bool).sum().item()
+                    )
+                    vol_valid_voxels = vol_mask.sum().item()
+                else:
+                    # All regions when no masking
+                    vol_correct = (vol_predictions == vol_gt).sum().item()
+                    vol_valid_voxels = vol_gt.numel()
 
-                val_total_loss += vol_loss * vol_voxels
+                val_total_loss += vol_loss * vol_valid_voxels
                 val_total_correct += vol_correct
-                val_total_voxels += vol_voxels
+                val_total_voxels += vol_valid_voxels
 
-                # Accumulate per-class metrics (convert to CPU for efficiency)
+                # Accumulate per-class metrics (convert to CPU for efficiency, conditional on mask usage)
                 vol_gt_cpu = vol_gt.cpu().numpy()
                 vol_pred_cpu = vol_predictions.cpu().numpy()
 
-                for class_id in range(num_classes):
-                    # Ground truth and prediction masks
-                    gt_mask = vol_gt_cpu == class_id
-                    pred_mask = vol_pred_cpu == class_id
+                if use_vol_masks:
+                    vol_mask_cpu = vol_mask.cpu().numpy().astype(bool)
+                else:
+                    # Create a full mask when no masking is needed
+                    vol_mask_cpu = np.ones_like(vol_gt_cpu, dtype=bool)
 
-                    # Confusion matrix components
-                    true_positives = np.sum(gt_mask & pred_mask)
-                    false_positives = np.sum(~gt_mask & pred_mask)
-                    false_negatives = np.sum(gt_mask & ~pred_mask)
+                for class_id in range(num_classes):
+                    # For confusion matrix, we need to consider the valid region
+                    valid_gt_mask = (vol_gt_cpu == class_id) & vol_mask_cpu
+                    valid_not_gt_mask = (vol_gt_cpu != class_id) & vol_mask_cpu
+                    valid_pred_mask = (vol_pred_cpu == class_id) & vol_mask_cpu
+
+                    # Confusion matrix components (only in valid regions)
+                    true_positives = np.sum(valid_gt_mask & valid_pred_mask)
+                    false_positives = np.sum(valid_not_gt_mask & valid_pred_mask)
+                    false_negatives = np.sum(valid_gt_mask & ~valid_pred_mask)
 
                     # Accumulate
                     val_class_true_positives[class_id] += true_positives
                     val_class_false_positives[class_id] += false_positives
                     val_class_false_negatives[class_id] += false_negatives
-                    val_class_total_gt[class_id] += np.sum(gt_mask)
-                    val_class_total_pred[class_id] += np.sum(pred_mask)
+                    val_class_total_gt[class_id] += np.sum(valid_gt_mask)
+                    val_class_total_pred[class_id] += np.sum(valid_pred_mask)
 
                 # Immediately free GPU memory for this volume
                 del vol_features, vol_logits, vol_predictions, vol_gt
@@ -2413,6 +2598,7 @@ def train_3d_unet_memory_efficient(
 def train_3d_unet_with_memory_efficient_loader(
     raw_data,
     gt_data,
+    gt_masks=None,  # NEW PARAMETER for GT extension masks
     train_volume_pool_size=20,
     val_volume_pool_size=5,
     num_classes=None,
@@ -2452,6 +2638,10 @@ def train_3d_unet_with_memory_efficient_loader(
 
     Parameters:
     -----------
+    gt_masks : numpy.ndarray, optional
+        Binary masks indicating valid ground truth regions (1) vs extended regions (0).
+        Shape must match gt_data. Used for GT extension functionality where raw volumes
+        extend beyond ground truth boundaries. If None, all regions are treated as valid.
     checkpoint_every_n_epochs : int, optional
         Save full model checkpoint every N epochs, regardless of performance.
         In addition to always saving the best model, this allows periodic backups.
@@ -2585,6 +2775,7 @@ def train_3d_unet_with_memory_efficient_loader(
     data_loader_3d = MemoryEfficientDataLoader3D(
         raw_data=raw_data,
         gt_data=gt_data,
+        gt_masks=gt_masks,  # NEW: GT extension masks
         train_volume_pool_size=train_volume_pool_size,
         val_volume_pool_size=val_volume_pool_size,
         target_volume_size=target_volume_size,
