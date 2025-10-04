@@ -533,53 +533,53 @@ class DINOv3UNetPipeline(nn.Module):
 class ContextAttentionFusion(nn.Module):
     """
     Context attention fusion module for multi-scale feature fusion.
-    
+
     Uses context features to generate attention weights for raw features,
     allowing context to guide raw feature processing while preserving
     raw feature dominance.
     """
-    
+
     def __init__(self, channels):
         super().__init__()
         self.channels = channels
-        
+
         # Context projection to match raw feature dimensions
         self.context_proj = nn.Sequential(
             nn.Conv3d(channels, channels // 4, 1),
             nn.BatchNorm3d(channels // 4),
             nn.ReLU(inplace=True),
             nn.Conv3d(channels // 4, channels, 1),
-            nn.Sigmoid()  # Attention weights between 0 and 1
+            nn.Sigmoid(),  # Attention weights between 0 and 1
         )
-        
+
         # Optional residual connection for raw features
         self.raw_proj = nn.Conv3d(channels, channels, 1)
-        
+
     def forward(self, raw_features, context_features):
         """
         Fuse raw and context features using attention mechanism.
-        
+
         Parameters:
         -----------
         raw_features : torch.Tensor
             Raw features of shape (B, C, D, H, W)
-        context_features : torch.Tensor  
+        context_features : torch.Tensor
             Context features of shape (B, C, D, H, W)
-            
+
         Returns:
         --------
         torch.Tensor: Fused features of shape (B, C, D, H, W)
         """
         # Generate attention weights from context
         attention_weights = self.context_proj(context_features)
-        
+
         # Apply attention to raw features
         raw_projected = self.raw_proj(raw_features)
         attended_features = raw_projected * attention_weights
-        
+
         # Residual connection with raw features
         fused_features = raw_features + attended_features
-        
+
         return fused_features
 
 
@@ -704,19 +704,37 @@ class DINOv3UNet3D(nn.Module):
         # Context fusion modules (optional)
         if self.use_context_fusion:
             # Context input projection
-            self.context_input_conv = nn.Conv3d(context_channels, self.base_channels, kernel_size=1)
-            
+            self.context_input_conv = nn.Conv3d(
+                context_channels, self.base_channels, kernel_size=1
+            )
+
             # Context projection layers for each encoder level
-            self.context_proj1 = nn.Conv3d(self.base_channels, self.base_channels, kernel_size=1)      # Full resolution
-            self.context_proj2 = nn.Conv3d(self.base_channels, self.base_channels * 2, kernel_size=1)  # 1/2 resolution
-            self.context_proj3 = nn.Conv3d(self.base_channels, self.base_channels * 4, kernel_size=1)  # 1/4 resolution
-            self.context_proj4 = nn.Conv3d(self.base_channels, self.base_channels * 8, kernel_size=1)  # 1/8 resolution
-            
+            self.context_proj1 = nn.Conv3d(
+                self.base_channels, self.base_channels, kernel_size=1
+            )  # Full resolution
+            self.context_proj2 = nn.Conv3d(
+                self.base_channels, self.base_channels * 2, kernel_size=1
+            )  # 1/2 resolution
+            self.context_proj3 = nn.Conv3d(
+                self.base_channels, self.base_channels * 4, kernel_size=1
+            )  # 1/4 resolution
+            self.context_proj4 = nn.Conv3d(
+                self.base_channels, self.base_channels * 8, kernel_size=1
+            )  # 1/8 resolution
+
             # Context fusion modules for each skip connection level
-            self.context_fusion1 = ContextAttentionFusion(self.base_channels)      # Full resolution
-            self.context_fusion2 = ContextAttentionFusion(self.base_channels * 2)  # 1/2 resolution
-            self.context_fusion3 = ContextAttentionFusion(self.base_channels * 4)  # 1/4 resolution  
-            self.context_fusion4 = ContextAttentionFusion(self.base_channels * 8)  # 1/8 resolution
+            self.context_fusion1 = ContextAttentionFusion(
+                self.base_channels
+            )  # Full resolution
+            self.context_fusion2 = ContextAttentionFusion(
+                self.base_channels * 2
+            )  # 1/2 resolution
+            self.context_fusion3 = ContextAttentionFusion(
+                self.base_channels * 4
+            )  # 1/4 resolution
+            self.context_fusion4 = ContextAttentionFusion(
+                self.base_channels * 8
+            )  # 1/8 resolution
 
         # Convert to half precision if requested
         if use_half_precision:
@@ -868,18 +886,23 @@ class DINOv3UNet3D(nn.Module):
             # Convert context to half precision if needed
             if self.use_half_precision and context_features.dtype != torch.float16:
                 context_features = context_features.half()
-            
+
             # Project context features to base channels
             context_features_processed = self.context_input_conv(context_features)
-            
+
             # Apply same upsampling to context if needed
             if self.learn_upsampling and self.learned_upsample is not None:
-                context_features_processed = self.learned_upsample(context_features_processed)
-                
+                context_features_processed = self.learned_upsample(
+                    context_features_processed
+                )
+
                 # Match size to raw features
                 if context_features_processed.shape[2:] != self.input_size:
                     context_features_processed = F.interpolate(
-                        context_features_processed, size=self.input_size, mode="trilinear", align_corners=False
+                        context_features_processed,
+                        size=self.input_size,
+                        mode="trilinear",
+                        align_corners=False,
                     )
 
         # Apply learned upsampling if enabled
@@ -943,10 +966,16 @@ class DINOv3UNet3D(nn.Module):
         if self.use_context_fusion and context_features_processed is not None:
             # Create context features at encoder resolutions by downsampling
             context_base = context_features_processed  # Full resolution
-            context_enc2_down = F.avg_pool3d(context_base, kernel_size=2, stride=2)  # 1/2 resolution
-            context_enc3_down = F.avg_pool3d(context_enc2_down, kernel_size=2, stride=2)  # 1/4 resolution  
-            context_enc4_down = F.avg_pool3d(context_enc3_down, kernel_size=2, stride=2)  # 1/8 resolution
-            
+            context_enc2_down = F.avg_pool3d(
+                context_base, kernel_size=2, stride=2
+            )  # 1/2 resolution
+            context_enc3_down = F.avg_pool3d(
+                context_enc2_down, kernel_size=2, stride=2
+            )  # 1/4 resolution
+            context_enc4_down = F.avg_pool3d(
+                context_enc3_down, kernel_size=2, stride=2
+            )  # 1/8 resolution
+
             # Project context features to match encoder channel dimensions
             context_enc1 = self.context_proj1(context_base)
             context_enc2 = self.context_proj2(context_enc2_down)
@@ -958,13 +987,13 @@ class DINOv3UNet3D(nn.Module):
         dec4_up = F.interpolate(
             bottleneck_out, scale_factor=2, mode="trilinear", align_corners=False
         )
-        
+
         # Apply context fusion to enc4 skip connection if available
         if context_enc4 is not None:
             enc4_fused = self.context_fusion4(enc4_out, context_enc4)
         else:
             enc4_fused = enc4_out
-            
+
         dec4_concat = torch.cat([dec4_up, enc4_fused], dim=1)
         if self.use_gradient_checkpointing and self.training:
             dec4_out = checkpoint(self.dec4, dec4_concat)
@@ -975,13 +1004,13 @@ class DINOv3UNet3D(nn.Module):
         dec3_up = F.interpolate(
             dec4_out, scale_factor=2, mode="trilinear", align_corners=False
         )
-        
+
         # Apply context fusion to enc3 skip connection if available
         if context_enc3 is not None:
             enc3_fused = self.context_fusion3(enc3_out, context_enc3)
         else:
             enc3_fused = enc3_out
-            
+
         dec3_concat = torch.cat([dec3_up, enc3_fused], dim=1)
         if self.use_gradient_checkpointing and self.training:
             dec3_out = checkpoint(self.dec3, dec3_concat)
@@ -992,13 +1021,13 @@ class DINOv3UNet3D(nn.Module):
         dec2_up = F.interpolate(
             dec3_out, scale_factor=2, mode="trilinear", align_corners=False
         )
-        
+
         # Apply context fusion to enc2 skip connection if available
         if context_enc2 is not None:
             enc2_fused = self.context_fusion2(enc2_out, context_enc2)
         else:
             enc2_fused = enc2_out
-            
+
         dec2_concat = torch.cat([dec2_up, enc2_fused], dim=1)
         if self.use_gradient_checkpointing and self.training:
             dec2_out = checkpoint(self.dec2, dec2_concat)
@@ -1009,13 +1038,13 @@ class DINOv3UNet3D(nn.Module):
         dec1_up = F.interpolate(
             dec2_out, scale_factor=2, mode="trilinear", align_corners=False
         )
-        
+
         # Apply context fusion to enc1 skip connection if available
         if context_enc1 is not None:
             enc1_fused = self.context_fusion1(enc1_out, context_enc1)
         else:
             enc1_fused = enc1_out
-            
+
         dec1_concat = torch.cat([dec1_up, enc1_fused], dim=1)
         if self.use_gradient_checkpointing and self.training:
             dec1_out = checkpoint(self.dec1, dec1_concat)
