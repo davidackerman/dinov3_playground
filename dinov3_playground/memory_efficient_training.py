@@ -59,6 +59,8 @@ class MemoryEfficientDataLoader3D:
         raw_data,
         gt_data,
         gt_masks=None,  # NEW PARAMETER for GT extension masks
+        context_data=None,  # NEW PARAMETER for context volumes at lower resolution
+        context_scale=None,  # NEW PARAMETER for context resolution (e.g., 8 for 8nm)
         train_volume_pool_size=20,
         val_volume_pool_size=5,
         target_volume_size=(64, 64, 64),
@@ -83,6 +85,11 @@ class MemoryEfficientDataLoader3D:
         gt_masks : numpy.ndarray, optional
             4D mask data (num_volumes, D, H, W) with 1 where GT is valid, 0 elsewhere.
             If None, assumes all GT regions are valid (full mask of 1s).
+        context_data : numpy.ndarray, optional
+            4D context volume data (num_volumes, D, H, W) at lower resolution for spatial context.
+            If None, no contextual information will be used.
+        context_scale : int or float, optional
+            Resolution of context data in nm (e.g., 8 for 8nm). Used for feature processing.
         train_volume_pool_size : int, default=20
             Number of possible training volumes to sample from
         val_volume_pool_size : int, default=5
@@ -179,6 +186,22 @@ class MemoryEfficientDataLoader3D:
                 f"  - GT masks: Using provided masks ({valid_fraction:.3f} average valid fraction)"
             )
 
+        # Handle context data
+        self.context_data = context_data
+        self.context_scale = context_scale
+        self.has_context = context_data is not None and context_scale is not None
+
+        if self.has_context:
+            if context_data.shape[0] != raw_data.shape[0]:
+                raise ValueError(
+                    f"Context data volume count {context_data.shape[0]} doesn't match raw data {raw_data.shape[0]}"
+                )
+            print(
+                f"  - Context data: Using {context_scale}nm context data, shape {context_data.shape}"
+            )
+        else:
+            print("  - Context data: No context data provided")
+
         self.train_volume_pool_size = train_volume_pool_size
         self.val_volume_pool_size = val_volume_pool_size
         self.target_volume_size = target_volume_size
@@ -253,7 +276,8 @@ class MemoryEfficientDataLoader3D:
 
         Returns:
         --------
-        tuple: (batch_volumes, batch_gt, batch_masks) of shape (batch_size, D, H, W)
+        tuple: (batch_volumes, batch_gt, batch_masks, batch_context) of shape (batch_size, D, H, W)
+               batch_context will be None if no context data available
         """
         # Sample random volumes from training pool
         sampled_indices = self.rng.choice(
@@ -266,7 +290,13 @@ class MemoryEfficientDataLoader3D:
         batch_gt = self.gt_data[sampled_indices]
         batch_masks = self.gt_masks[sampled_indices]
 
-        return batch_volumes, batch_gt, batch_masks
+        # Add context data if available
+        if self.has_context:
+            batch_context = self.context_data[sampled_indices]
+        else:
+            batch_context = None
+
+        return batch_volumes, batch_gt, batch_masks, batch_context
 
     def get_validation_data(self):
         """
@@ -274,13 +304,20 @@ class MemoryEfficientDataLoader3D:
 
         Returns:
         --------
-        tuple: (val_volumes, val_gt, val_masks) of shape (val_pool_size, D, H, W)
+        tuple: (val_volumes, val_gt, val_masks, val_context) of shape (val_pool_size, D, H, W)
+               val_context will be None if no context data available
         """
         val_volumes = self.raw_data[self.val_indices]
         val_gt = self.gt_data[self.val_indices]
         val_masks = self.gt_masks[self.val_indices]
 
-        return val_volumes, val_gt, val_masks
+        # Add context data if available
+        if self.has_context:
+            val_context = self.context_data[self.val_indices]
+        else:
+            val_context = None
+
+        return val_volumes, val_gt, val_masks, val_context
 
     def extract_dinov3_features_3d(
         self, volumes, epoch=None, batch=None, enable_detailed_timing=False
@@ -397,6 +434,89 @@ class MemoryEfficientDataLoader3D:
             return batch_features, detailed_timing
         else:
             return batch_features
+
+    def extract_multi_scale_dinov3_features_3d(
+        self,
+        local_volumes,
+        context_volumes=None,
+        epoch=None,
+        batch=None,
+        enable_detailed_timing=False,
+    ):
+        """
+        Extract both local high-resolution and contextual low-resolution DINOv3 features.
+
+        Parameters:
+        -----------
+        local_volumes : numpy.ndarray, shape (batch_size, D, H, W)
+            High-resolution local volumes
+        context_volumes : numpy.ndarray, optional
+            Low-resolution context volumes, same batch size
+        epoch : int, optional
+            Current training epoch (for logging)
+        batch : int, optional
+            Current batch index (for logging)
+        enable_detailed_timing : bool
+            Whether to return detailed timing information
+
+        Returns:
+        --------
+        torch.Tensor: Combined features with shape (batch_size, channels_local + channels_context, D, H, W)
+                     Or just local features if no context provided
+        """
+        import torch.nn.functional as F
+
+        # Extract local high-resolution features
+        if enable_detailed_timing:
+            local_features, local_timing = self.extract_dinov3_features_3d(
+                local_volumes, epoch, batch, enable_detailed_timing=True
+            )
+        else:
+            local_features = self.extract_dinov3_features_3d(
+                local_volumes, epoch, batch, enable_detailed_timing=False
+            )
+
+        # If no context data, return just local features
+        if context_volumes is None or not self.has_context:
+            if enable_detailed_timing:
+                return local_features, local_timing
+            else:
+                return local_features
+
+        # Extract context features
+        if enable_detailed_timing:
+            context_features, context_timing = self.extract_dinov3_features_3d(
+                context_volumes, epoch, batch, enable_detailed_timing=True
+            )
+        else:
+            context_features = self.extract_dinov3_features_3d(
+                context_volumes, epoch, batch, enable_detailed_timing=False
+            )
+
+        # Resize context features to match local feature spatial dimensions
+        if context_features.shape[2:] != local_features.shape[2:]:
+            context_features = F.interpolate(
+                context_features,
+                size=local_features.shape[2:],
+                mode="trilinear",
+                align_corners=False,
+            )
+
+        # Concatenate along channel dimension
+        multi_scale_features = torch.cat([local_features, context_features], dim=1)
+
+        if enable_detailed_timing:
+            # Combine timing information
+            combined_timing = local_timing.copy()
+            combined_timing.update(
+                {f"context_{k}": v for k, v in context_timing.items()}
+            )
+            combined_timing["multi_scale_channels"] = multi_scale_features.shape[1]
+            combined_timing["local_channels"] = local_features.shape[1]
+            combined_timing["context_channels"] = context_features.shape[1]
+            return multi_scale_features, combined_timing
+        else:
+            return multi_scale_features
 
     def get_data_info(self):
         """
@@ -1432,7 +1552,9 @@ def train_3d_unet_memory_efficient_v2(
         print(f"  - Checkpoints will be saved to: {checkpoint_dir}")
 
     # Get validation data (keep on CPU for memory efficiency)
-    val_volumes, val_gt_volumes, val_masks = data_loader_3d.get_validation_data()
+    val_volumes, val_gt_volumes, val_masks, val_context = (
+        data_loader_3d.get_validation_data()
+    )
 
     print(f"Validation set: {len(val_volumes)} volumes prepared")
     print(f"Validation labels will be processed volume-by-volume for memory efficiency")
@@ -1512,9 +1634,21 @@ def train_3d_unet_memory_efficient_v2(
     model_info = get_current_model_info()
     current_output_channels = model_info["output_channels"]
 
-    print(
-        f"Using {current_output_channels} input channels for 3D UNet (from .dinov3 {model_info['model_id']})"
-    )
+    # Adjust input channels based on context availability
+    if data_loader_3d.has_context:
+        # Double the channels: local + context features
+        model_input_channels = current_output_channels * 2
+        print(
+            f"Using multi-scale context: {model_input_channels} input channels "
+            f"({current_output_channels} local + {current_output_channels} context) "
+            f"for 3D UNet (from DINOv3 {model_info['model_id']})"
+        )
+        print(f"Context resolution: {data_loader_3d.context_scale}nm")
+    else:
+        model_input_channels = current_output_channels
+        print(
+            f"Using {model_input_channels} input channels for 3D UNet (from DINOv3 {model_info['model_id']})"
+        )
 
     # Initialize 3D UNet
     from .models import DINOv3UNet3D
@@ -1532,7 +1666,7 @@ def train_3d_unet_memory_efficient_v2(
         )
 
     unet3d = DINOv3UNet3D(
-        input_channels=current_output_channels,
+        input_channels=model_input_channels,  # Use adjusted input channels for context
         num_classes=num_classes,
         base_channels=base_channels,
         input_size=data_loader_3d.target_volume_size,
@@ -1596,26 +1730,28 @@ def train_3d_unet_memory_efficient_v2(
 
         for batch_idx in batch_pbar:
             # Sample new training volumes for this batch
-            train_volumes, train_gt_volumes, train_masks = (
+            train_volumes, train_gt_volumes, train_masks, train_context = (
                 data_loader_3d.sample_training_batch(volumes_per_batch)
             )
 
             # TIMING: Start DINOv3 feature extraction
             dinov3_start = time.time()
 
-            # Extract DINOv3 features for 3D UNet with detailed timing
+            # Extract DINOv3 features (multi-scale if context available)
             if enable_detailed_timing:
                 train_features, detailed_timing = (
-                    data_loader_3d.extract_dinov3_features_3d(
+                    data_loader_3d.extract_multi_scale_dinov3_features_3d(
                         train_volumes,
+                        train_context,
                         epoch,
                         batch_idx,
                         enable_detailed_timing=enable_detailed_timing,
                     )
                 )
             else:
-                train_features = data_loader_3d.extract_dinov3_features_3d(
+                train_features = data_loader_3d.extract_multi_scale_dinov3_features_3d(
                     train_volumes,
+                    train_context,
                     epoch,
                     batch_idx,
                     enable_detailed_timing=enable_detailed_timing,
@@ -1879,12 +2015,19 @@ def train_3d_unet_memory_efficient_v2(
                 single_vol = np.array(
                     [val_volumes[vol_idx]]
                 )  # Convert to numpy array with batch dimension
+
+                # Get context volume if available
+                single_context = None
+                if val_context is not None:
+                    single_context = np.array([val_context[vol_idx]])
+
                 # Extract features with detailed timing for first validation volume
                 if (
                     vol_idx == 0
                 ):  # Only get detailed timing for first volume to avoid spam
-                    result = data_loader_3d.extract_dinov3_features_3d(
+                    result = data_loader_3d.extract_multi_scale_dinov3_features_3d(
                         single_vol,
+                        single_context,
                         epoch=epoch,
                         enable_detailed_timing=enable_detailed_timing,
                     )
@@ -1894,8 +2037,10 @@ def train_3d_unet_memory_efficient_v2(
                         vol_features = result
                         val_detailed_timing = None
                 else:
-                    vol_features = data_loader_3d.extract_dinov3_features_3d(
-                        single_vol, epoch=epoch
+                    vol_features = (
+                        data_loader_3d.extract_multi_scale_dinov3_features_3d(
+                            single_vol, single_context, epoch=epoch
+                        )
                     )
 
                 # TIMING: End DINOv3 validation feature extraction
@@ -2599,6 +2744,8 @@ def train_3d_unet_with_memory_efficient_loader(
     raw_data,
     gt_data,
     gt_masks=None,  # NEW PARAMETER for GT extension masks
+    context_data=None,  # NEW PARAMETER for context volumes at lower resolution
+    context_scale=None,  # NEW PARAMETER for context resolution (e.g., 8 for 8nm)
     train_volume_pool_size=20,
     val_volume_pool_size=5,
     num_classes=None,
@@ -2776,6 +2923,8 @@ def train_3d_unet_with_memory_efficient_loader(
         raw_data=raw_data,
         gt_data=gt_data,
         gt_masks=gt_masks,  # NEW: GT extension masks
+        context_data=context_data,  # NEW: Context volumes for spatial context
+        context_scale=context_scale,  # NEW: Context resolution in nm
         train_volume_pool_size=train_volume_pool_size,
         val_volume_pool_size=val_volume_pool_size,
         target_volume_size=target_volume_size,

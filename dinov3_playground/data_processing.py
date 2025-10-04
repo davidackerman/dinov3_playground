@@ -1010,6 +1010,7 @@ def load_random_3d_training_data(
     dinov3_stride=None,
     min_resolution_for_raw=None,
     allow_gt_extension=False,  # NEW PARAMETER
+    context_scale=None,  # NEW: Load context data at this resolution
 ):
     """
     Load random 3D volumes from multiple datasets for 3D UNet training.
@@ -1092,6 +1093,9 @@ def load_random_3d_training_data(
     gt_masks = (
         []
     )  # Masks indicating valid GT regions (only used if allow_gt_extension=True)
+    context_volumes = (
+        []
+    )  # Context volumes at lower resolution (if context_scale provided)
     dataset_sources = []
 
     print(
@@ -1128,8 +1132,27 @@ def load_random_3d_training_data(
                     raw_path, output_voxel_size=3 * [base_resolution]
                 )
 
-            # Initialize all class data interfaces (any key that's not "raw")
-            class_keys = [k for k in dataset_dict.keys() if k != "raw"]
+            # Initialize context data interface if requested
+            context_idi = None
+            context_keys = [
+                k for k in dataset_dict.keys() if k.startswith("raw_") and "nm" in k
+            ]
+            if context_scale is not None and context_keys:
+                # Find the context key that matches our scale
+                context_key = f"raw_{int(context_scale)}nm"
+                if context_key in dataset_dict:
+                    context_idi = ImageDataInterface(
+                        dataset_dict[context_key],
+                        output_voxel_size=3 * [context_scale],
+                        force_pseudo_isotropic=True,
+                    )
+
+            # Initialize all class data interfaces (any key that's not "raw" and not context)
+            class_keys = [
+                k
+                for k in dataset_dict.keys()
+                if k != "raw" and not (k.startswith("raw_") and "nm" in k)
+            ]
             class_idis = {}
             for class_key in class_keys:
                 class_idis[class_key] = ImageDataInterface(
@@ -1405,6 +1428,50 @@ def load_random_3d_training_data(
                 print(f"    Error: {str(e)[:100]}...")
                 continue
 
+            # Sample context volume if context data interface exists
+            context_volume = None
+            if context_idi is not None:
+                try:
+                    # Create expanded ROI for context to cover larger area at lower resolution
+                    # We want same voxel dimensions but covering larger physical area
+                    raw_resolution = raw_idi.voxel_size[0]  # e.g., 4nm
+                    context_resolution = context_idi.voxel_size[0]  # e.g., 32nm
+                    resolution_ratio = (
+                        context_resolution / raw_resolution
+                    )  # e.g., 32/4 = 8x
+
+                    # Expand ROI by resolution ratio to cover larger area
+                    roi_center = padded_roi.begin + padded_roi.shape // 2
+                    expanded_shape = padded_roi.shape * resolution_ratio
+                    expanded_begin = roi_center - expanded_shape // 2
+                    context_roi = Roi(expanded_begin, expanded_shape)
+
+                    # Sample from expanded ROI at context resolution
+                    context_volume = context_idi.to_ndarray_ts(context_roi)
+
+                    # Context should naturally have same voxel dimensions as raw due to resolution difference
+                    # If not, resample to match raw volume dimensions
+                    if context_volume.shape != raw_volume.shape:
+                        from scipy.ndimage import zoom
+
+                        zoom_factors = np.array(raw_volume.shape) / np.array(
+                            context_volume.shape
+                        )
+                        context_volume = zoom(
+                            context_volume.astype(float), zoom_factors, order=1
+                        )
+                        context_volume = context_volume.astype(raw_volume.dtype)
+
+                except (ValueError, RuntimeError, OSError, IndexError) as e:
+                    print(
+                        f"  Dataset {dataset_idx}: Failed to load context data - continuing without context"
+                    )
+                    print(
+                        f"    Context ROI: {context_roi if 'context_roi' in locals() else 'undefined'}"
+                    )
+                    print(f"    Error: {str(e)[:100]}...")
+                    context_volume = None
+
             # Validate shapes
             expected_raw_shape = (
                 tuple(padded_volume_shape_nm // raw_idi.voxel_size[0])
@@ -1578,6 +1645,7 @@ def load_random_3d_training_data(
             gt_masks.append(gt_mask)
             raw_volumes.append(raw_volume)
             gt_volumes.append(gt_volume)
+            context_volumes.append(context_volume)  # Will be None if no context
             dataset_sources.append(dataset_idx)
             volumes_collected += 1
 
@@ -1631,10 +1699,36 @@ def load_random_3d_training_data(
     )  # Shape: (num_volumes, D, H, W) with class indices
     gt_masks = np.array(gt_masks)  # Shape: (num_volumes, D, H, W) with 0/1 mask
 
+    # Handle context volumes
+    has_context = context_scale is not None and any(
+        cv is not None for cv in context_volumes
+    )
+    if has_context:
+        # Convert context volumes to numpy array, handling None values
+        context_volumes_filtered = [cv for cv in context_volumes if cv is not None]
+        if len(context_volumes_filtered) == len(context_volumes):
+            context_volumes = np.array(context_volumes)
+        else:
+            # Some volumes don't have context - pad with None or handle appropriately
+            print(
+                f"Warning: Only {len(context_volumes_filtered)}/{len(context_volumes)} volumes have context data"
+            )
+            context_volumes = np.array(
+                context_volumes, dtype=object
+            )  # Allow None values
+    else:
+        context_volumes = None
+
     print(f"Final dataset summary:")
     print(f"  Raw volumes shape: {raw_volumes.shape}")
     print(f"  GT volumes shape: {gt_volumes.shape}")
     print(f"  GT masks shape: {gt_masks.shape}")
+    if has_context and context_volumes is not None:
+        if context_volumes.dtype == object:
+            print(f"  Context volumes: Mixed (some None)")
+        else:
+            print(f"  Context volumes shape: {context_volumes.shape}")
+        print(f"  Context scale: {context_scale}nm")
     print(f"  Number of classes: {num_classes}")
     print(f"  Classes found in data: {np.unique(gt_volumes)}")
     if allow_gt_extension:
@@ -1643,9 +1737,28 @@ def load_random_3d_training_data(
         print(f"  Average valid GT fraction: {valid_mask_fraction:.3f}")
 
     if allow_gt_extension:
-        return raw_volumes, gt_volumes, gt_masks, dataset_sources, num_classes
+        if has_context:
+            return (
+                raw_volumes,
+                gt_volumes,
+                gt_masks,
+                context_volumes,
+                dataset_sources,
+                num_classes,
+            )
+        else:
+            return raw_volumes, gt_volumes, gt_masks, dataset_sources, num_classes
     else:
-        return raw_volumes, gt_volumes, dataset_sources, num_classes
+        if has_context:
+            return (
+                raw_volumes,
+                gt_volumes,
+                context_volumes,
+                dataset_sources,
+                num_classes,
+            )
+        else:
+            return raw_volumes, gt_volumes, dataset_sources, num_classes
 
 
 def extract_organelle_directories(base_path="/nrs/cellmap/data", organelle_list=None):
@@ -1937,6 +2050,7 @@ def generate_multi_organelle_dataset_pairs(
     min_resolution_for_raw=None,
     apply_scale_updates=True,
     require_all_organelles=False,
+    context_scale=None,  # NEW: Add context data at this resolution (e.g., 8 for 8nm)
 ):
     """
     Generate multi-organelle dataset pairs where each pair contains multiple organelles from the same dataset/crop.
@@ -1961,6 +2075,9 @@ def generate_multi_organelle_dataset_pairs(
     require_all_organelles : bool, default=False
         If True, only include dataset pairs that have ALL specified organelles.
         If False, include pairs that have at least one of the specified organelles.
+    context_scale : int or float, optional
+        If provided, adds a context raw data source at this resolution (e.g., 8 for 8nm).
+        The context data will be named "raw_context" or "raw_{context_scale}nm" in the dataset pair.
 
     Returns:
     --------
@@ -2016,6 +2133,15 @@ def generate_multi_organelle_dataset_pairs(
             # Build the dataset pair
             pair = {"raw": raw_path}
             all_paths_exist = True
+
+            # Add context raw data if requested
+            if context_scale is not None:
+                context_raw_path = (
+                    f"{base_path}/{dataset}/{dataset}.zarr/recon-1/em/fibsem-uint8"
+                )
+                context_key = f"raw_{int(context_scale)}nm"
+                pair[context_key] = context_raw_path
+                # Note: We'll handle the actual scale selection during data loading
 
             for organelle in organelles_to_include:
                 gt_path = f"{base_path}/{dataset}/{dataset}.zarr/recon-1/labels/groundtruth/crop{crop_num}/{organelle}"
