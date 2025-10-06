@@ -48,6 +48,77 @@ import os
 from datetime import datetime
 
 
+def print_class_metrics_table(
+    class_names,
+    train_recall=None,
+    train_dist=None,
+    val_recall=None,
+    val_precision=None,
+    val_f1=None,
+    val_iou=None,
+    val_dist=None,
+):
+    """
+    Print per-class metrics in a nicely formatted table.
+
+    Parameters:
+    -----------
+    class_names : list of str
+        Names of classes (e.g., ['background', 'nuc', 'mito', 'er'])
+    train_recall, train_dist, val_recall, val_precision, val_f1, val_iou, val_dist : list of float, optional
+        Metric values for each class. All should have same length as class_names.
+    """
+    if not class_names:
+        return
+
+    # Determine which metrics to display
+    metrics_to_show = []
+    if train_recall is not None:
+        metrics_to_show.append(("Train Recall", train_recall))
+    if train_dist is not None:
+        metrics_to_show.append(("Train Dist", train_dist))
+    if val_recall is not None:
+        metrics_to_show.append(("Val Recall", val_recall))
+    if val_precision is not None:
+        metrics_to_show.append(("Val Precision", val_precision))
+    if val_f1 is not None:
+        metrics_to_show.append(("Val F1", val_f1))
+    if val_iou is not None:
+        metrics_to_show.append(("Val IoU", val_iou))
+    if val_dist is not None:
+        metrics_to_show.append(("Val Dist", val_dist))
+
+    if not metrics_to_show:
+        return
+
+    # Calculate column widths
+    class_col_width = max(max(len(name) for name in class_names), len("Class"))
+    metric_col_width = 12
+
+    # Print header
+    header = f"  {'Class':<{class_col_width}}"
+    for metric_name, _ in metrics_to_show:
+        header += f" {metric_name:>{metric_col_width}}"
+    print(header)
+    print("  " + "-" * (class_col_width + metric_col_width * len(metrics_to_show)))
+
+    # Print rows for each class
+    for i, class_name in enumerate(class_names):
+        row = f"  {class_name:<{class_col_width}}"
+        for metric_name, metric_values in metrics_to_show:
+            if i < len(metric_values):
+                value = metric_values[i]
+                # Format differently for distribution percentages vs metrics
+                if "Dist" in metric_name:
+                    row += f" {value:>{metric_col_width - 1}.1f}%"
+                else:
+                    row += f" {value:>{metric_col_width}.3f}"
+            else:
+                row += f" {'N/A':>{metric_col_width}}"
+        print(row)
+    print()  # Blank line after table
+
+
 class MemoryEfficientDataLoader3D:
     """
     Memory-efficient data loader for 3D DINOv3 UNet training.
@@ -446,6 +517,10 @@ class MemoryEfficientDataLoader3D:
         """
         Extract both local high-resolution and contextual low-resolution DINOv3 features.
 
+        IMPORTANT: Returns features SEPARATELY for proper context fusion architecture.
+        Context features should NOT be mixed with raw features via simple concatenation.
+        Instead, they should be passed separately to the UNet for attention-based fusion.
+
         Parameters:
         -----------
         local_volumes : numpy.ndarray, shape (batch_size, D, H, W)
@@ -461,8 +536,14 @@ class MemoryEfficientDataLoader3D:
 
         Returns:
         --------
-        torch.Tensor: Combined features with shape (batch_size, channels_local + channels_context, D, H, W)
-                     Or just local features if no context provided
+        If context_volumes is None:
+            - local_features: torch.Tensor (batch_size, channels, D, H, W)
+            - None: No context features
+        If context_volumes is provided:
+            - local_features: torch.Tensor (batch_size, channels, D, H, W)
+            - context_features: torch.Tensor (batch_size, channels, D, H, W)
+
+        If enable_detailed_timing=True, also returns timing dict
         """
         import torch.nn.functional as F
 
@@ -476,12 +557,12 @@ class MemoryEfficientDataLoader3D:
                 local_volumes, epoch, batch, enable_detailed_timing=False
             )
 
-        # If no context data, return just local features
+        # If no context data, return just local features and None for context
         if context_volumes is None or not self.has_context:
             if enable_detailed_timing:
-                return local_features, local_timing
+                return local_features, None, local_timing
             else:
-                return local_features
+                return local_features, None
 
         # Extract context features
         if enable_detailed_timing:
@@ -493,7 +574,12 @@ class MemoryEfficientDataLoader3D:
                 context_volumes, epoch, batch, enable_detailed_timing=False
             )
 
-        # Resize context features to match local feature spatial dimensions
+        # Clear input context volumes from memory after feature extraction
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+        # Resize context features to match local feature spatial dimensions if needed
         if context_features.shape[2:] != local_features.shape[2:]:
             context_features = F.interpolate(
                 context_features,
@@ -502,21 +588,18 @@ class MemoryEfficientDataLoader3D:
                 align_corners=False,
             )
 
-        # Concatenate along channel dimension
-        multi_scale_features = torch.cat([local_features, context_features], dim=1)
-
+        # Return SEPARATE features for proper context fusion architecture
         if enable_detailed_timing:
             # Combine timing information
             combined_timing = local_timing.copy()
             combined_timing.update(
                 {f"context_{k}": v for k, v in context_timing.items()}
             )
-            combined_timing["multi_scale_channels"] = multi_scale_features.shape[1]
             combined_timing["local_channels"] = local_features.shape[1]
             combined_timing["context_channels"] = context_features.shape[1]
-            return multi_scale_features, combined_timing
+            return local_features, context_features, combined_timing
         else:
-            return multi_scale_features
+            return local_features, context_features
 
     def get_data_info(self):
         """
@@ -1515,6 +1598,14 @@ def train_3d_unet_memory_efficient_v2(
     export_base_dir=None,
     use_class_weighting=True,
     use_mixed_precision=True,  # Add this parameter
+    # Loss function parameters
+    loss_type="weighted_ce",  # NEW: 'ce', 'weighted_ce', 'focal', 'dice', 'focal_dice', 'tversky'
+    focal_gamma=2.0,  # NEW: Focusing parameter for Focal Loss
+    focal_weight=0.5,  # NEW: Weight for focal component in combined loss
+    dice_weight=0.5,  # NEW: Weight for dice component in combined loss
+    dice_smooth=1.0,  # NEW: Smoothing for Dice loss
+    tversky_alpha=0.5,  # NEW: Tversky alpha (FP weight)
+    tversky_beta=0.5,  # NEW: Tversky beta (FN weight)
     # Additional parameters for complete config saving
     use_half_precision=False,
     use_gradient_checkpointing=False,
@@ -1524,16 +1615,28 @@ def train_3d_unet_memory_efficient_v2(
     # Data resolution parameters
     min_resolution_for_raw=None,
     base_resolution=None,
+    class_names=None,  # NEW PARAMETER for class names
 ):
     """
     Train 3D UNet using memory-efficient data loading with DINOv3 features.
     Now supports mixed precision training for reduced memory usage.
     """
 
+    # Generate default class names if not provided
+    if class_names is None:
+        if num_classes == 2:
+            class_names = ["background", "foreground"]
+        else:
+            class_names = ["background"] + [f"class_{i}" for i in range(1, num_classes)]
+        print(f"Generated default class names: {class_names}")
+    else:
+        print(f"Using provided class names: {class_names}")
+
     print(f"Memory-efficient 3D UNet training setup:")
     print(f"  - Volumes per batch: {volumes_per_batch}")
     print(f"  - Batches per epoch: {batches_per_epoch}")
     print(f"  - Total volumes per epoch: {volumes_per_batch * batches_per_epoch}")
+    print(f"  - Loss type: {loss_type}")
     print(f"  - Class weighting: {use_class_weighting}")
     print(f"  - Mixed precision: {use_mixed_precision}")
     print(f"  - Learn upsampling: {learn_upsampling}")  # NEW
@@ -1634,21 +1737,29 @@ def train_3d_unet_memory_efficient_v2(
     model_info = get_current_model_info()
     current_output_channels = model_info["output_channels"]
 
-    # Adjust input channels based on context availability
-    if data_loader_3d.has_context:
-        # Double the channels: local + context features
-        model_input_channels = current_output_channels * 2
+    # Context fusion setup
+    use_context_fusion = data_loader_3d.has_context
+    if use_context_fusion:
+        print(f"✓ Context fusion ENABLED: Using attention-based multi-scale fusion")
         print(
-            f"Using multi-scale context: {model_input_channels} input channels "
-            f"({current_output_channels} local + {current_output_channels} context) "
-            f"for 3D UNet (from DINOv3 {model_info['model_id']})"
+            f"  - Raw features: {current_output_channels} channels from {model_info['model_id']}"
         )
-        print(f"Context resolution: {data_loader_3d.context_scale}nm")
+        print(
+            f"  - Context features: {current_output_channels} channels at {data_loader_3d.context_scale}nm"
+        )
+        print(
+            f"  - Fusion: Context guides raw features via attention at skip connections"
+        )
+        model_input_channels = (
+            current_output_channels  # Only raw goes through main encoder
+        )
+        context_channels = current_output_channels  # Context processed separately
     else:
-        model_input_channels = current_output_channels
         print(
-            f"Using {model_input_channels} input channels for 3D UNet (from DINOv3 {model_info['model_id']})"
+            f"Using {current_output_channels} input channels for 3D UNet (from DINOv3 {model_info['model_id']})"
         )
+        model_input_channels = current_output_channels
+        context_channels = None
 
     # Initialize 3D UNet
     from .models import DINOv3UNet3D
@@ -1666,7 +1777,7 @@ def train_3d_unet_memory_efficient_v2(
         )
 
     unet3d = DINOv3UNet3D(
-        input_channels=model_input_channels,  # Use adjusted input channels for context
+        input_channels=model_input_channels,  # Raw feature channels
         num_classes=num_classes,
         base_channels=base_channels,
         input_size=data_loader_3d.target_volume_size,
@@ -1674,21 +1785,62 @@ def train_3d_unet_memory_efficient_v2(
         learn_upsampling=learn_upsampling,
         dinov3_feature_size=dinov3_feature_size,
         use_gradient_checkpointing=True,  # Enable gradient checkpointing for memory efficiency
+        use_context_fusion=use_context_fusion,  # Enable context fusion architecture
+        context_channels=context_channels
+        or current_output_channels,  # Context feature dimension
     ).to(device)
 
     print(
-        f"Using DINOv3UNet3D with {base_channels} base channels and {current_output_channels} input channels"
+        f"Using DINOv3UNet3D with {base_channels} base channels and {model_input_channels} input channels"
+    )
+    if use_context_fusion:
+        print(
+            f"  - Context fusion layers: 4 attention modules at encoder skip connections"
+        )
+
+    # Loss function setup with configurable loss type
+    from .losses import get_loss_function
+
+    # Prepare class weights if using weighted loss
+    loss_class_weights = None
+    if use_class_weighting and class_weights_tensor is not None:
+        loss_class_weights = class_weights_tensor
+
+    # Get loss function based on type
+    criterion = get_loss_function(
+        loss_type=loss_type,
+        class_weights=loss_class_weights,
+        gamma=focal_gamma,
+        focal_weight=focal_weight,
+        dice_weight=dice_weight,
+        dice_smooth=dice_smooth,
+        alpha=tversky_alpha,
+        beta=tversky_beta,
     )
 
-    # Loss and optimizer with class weighting
-    if use_class_weighting and class_weights_tensor is not None:
-        criterion = nn.CrossEntropyLoss(weight=class_weights_tensor)
-        print(
-            f"Using weighted CrossEntropyLoss with class weights: {class_weights_tensor.cpu().numpy()}"
-        )
-    else:
-        criterion = nn.CrossEntropyLoss()
-        print("Using standard CrossEntropyLoss")
+    # Print loss configuration
+    print(f"\nLoss Configuration:")
+    print(f"  - Loss type: {loss_type}")
+    if loss_type == "focal":
+        print(f"  - Focal gamma: {focal_gamma}")
+        if loss_class_weights is not None:
+            print(f"  - Class weights: {loss_class_weights.cpu().numpy()}")
+    elif loss_type == "focal_dice":
+        print(f"  - Focal gamma: {focal_gamma}")
+        print(f"  - Focal weight: {focal_weight}")
+        print(f"  - Dice weight: {dice_weight}")
+        print(f"  - Dice smooth: {dice_smooth}")
+        if loss_class_weights is not None:
+            print(f"  - Class weights: {loss_class_weights.cpu().numpy()}")
+    elif loss_type == "dice":
+        print(f"  - Dice smooth: {dice_smooth}")
+    elif loss_type == "tversky":
+        print(f"  - Tversky alpha (FP weight): {tversky_alpha}")
+        print(f"  - Tversky beta (FN weight): {tversky_beta}")
+        print(f"  - Dice smooth: {dice_smooth}")
+    elif loss_type == "weighted_ce":
+        if loss_class_weights is not None:
+            print(f"  - Class weights: {loss_class_weights.cpu().numpy()}")
 
     optimizer = optim.Adam(
         unet3d.parameters(), lr=learning_rate, weight_decay=weight_decay
@@ -1704,6 +1856,18 @@ def train_3d_unet_memory_efficient_v2(
     val_class_precisions, val_class_f1s, val_class_ious = [], [], []
     best_mean_iou = 0.0  # Changed from best_val_acc to best_mean_iou
     epochs_without_improvement = 0
+
+    # Helper function to compute loss (handles both CE-based and Dice-based losses)
+    def compute_loss(criterion, logits, targets):
+        """
+        Compute loss, handling different loss function signatures.
+
+        Some losses (Dice, Focal+Dice, Tversky) need num_classes parameter.
+        """
+        if loss_type in ["dice", "focal_dice", "tversky"]:
+            return criterion(logits, targets, num_classes)
+        else:
+            return criterion(logits, targets)
 
     print(f"Starting memory-efficient 3D UNet training for up to {epochs} epochs...")
 
@@ -1737,9 +1901,9 @@ def train_3d_unet_memory_efficient_v2(
             # TIMING: Start DINOv3 feature extraction
             dinov3_start = time.time()
 
-            # Extract DINOv3 features (multi-scale if context available)
+            # Extract DINOv3 features (separate for proper context fusion)
             if enable_detailed_timing:
-                train_features, detailed_timing = (
+                train_features, train_context_features, detailed_timing = (
                     data_loader_3d.extract_multi_scale_dinov3_features_3d(
                         train_volumes,
                         train_context,
@@ -1749,12 +1913,14 @@ def train_3d_unet_memory_efficient_v2(
                     )
                 )
             else:
-                train_features = data_loader_3d.extract_multi_scale_dinov3_features_3d(
-                    train_volumes,
-                    train_context,
-                    epoch,
-                    batch_idx,
-                    enable_detailed_timing=enable_detailed_timing,
+                train_features, train_context_features = (
+                    data_loader_3d.extract_multi_scale_dinov3_features_3d(
+                        train_volumes,
+                        train_context,
+                        epoch,
+                        batch_idx,
+                        enable_detailed_timing=enable_detailed_timing,
+                    )
                 )
                 detailed_timing = {}
 
@@ -1771,6 +1937,8 @@ def train_3d_unet_memory_efficient_v2(
             if epoch == 0 and batch_idx == 0:
                 print(f"  DEBUG - Tensor shapes:")
                 print(f"    train_features: {train_features.shape}")
+                if train_context_features is not None:
+                    print(f"    train_context_features: {train_context_features.shape}")
                 print(f"    train_labels: {train_labels.shape}")
                 print(f"    train_masks_tensor: {train_masks_tensor.shape}")
                 print(
@@ -1795,7 +1963,10 @@ def train_3d_unet_memory_efficient_v2(
                     device_type="cuda" if device.type == "cuda" else "cpu",
                     enabled=False,
                 ):  # Disable autocast for metric calculations
-                    logits = unet3d(train_features)
+                    # Pass raw and context features separately for proper fusion
+                    logits = unet3d(
+                        train_features, context_features=train_context_features
+                    )
 
                     # Debug: Print logits shape for first batch of first epoch
                     if epoch == 0 and batch_idx == 0:
@@ -1820,27 +1991,35 @@ def train_3d_unet_memory_efficient_v2(
 
                     if use_masks:
                         # Apply masks to loss calculation
-                        per_pixel_loss = F.cross_entropy(
-                            logits, train_labels, reduction="none"
-                        )
-                        masked_loss = per_pixel_loss * train_masks_tensor
-                        loss = masked_loss.sum() / train_masks_tensor.sum()
+                        # For CE-based losses, we can use per-pixel masking
+                        if loss_type in ["ce", "weighted_ce", "focal"]:
+                            per_pixel_loss = F.cross_entropy(
+                                logits,
+                                train_labels,
+                                reduction="none",
+                                weight=loss_class_weights,
+                            )
+                            if loss_type == "focal":
+                                # Apply focal term
+                                p_t = torch.exp(-per_pixel_loss)
+                                focal_weight = (1 - p_t) ** focal_gamma
+                                per_pixel_loss = focal_weight * per_pixel_loss
+
+                            masked_loss = per_pixel_loss * train_masks_tensor
+                            loss = masked_loss.sum() / train_masks_tensor.sum()
+                        else:
+                            # For Dice-based losses, compute on full volume and weight the loss
+                            # This is an approximation; ideally Dice should only use masked regions
+                            loss_full = compute_loss(criterion, logits, train_labels)
+                            # Weight by fraction of valid voxels
+                            loss = loss_full
 
                         # Debug: Print loss calculation details for first batch of first epoch
                         if epoch == 0 and batch_idx == 0:
-                            print(
-                                f"    per_pixel_loss: {per_pixel_loss.shape}, mean: {per_pixel_loss.mean().item():.4f}"
-                            )
-                            print(
-                                f"    masked_loss sum: {masked_loss.sum().item():.4f}"
-                            )
-                            print(
-                                f"    mask sum: {train_masks_tensor.sum().item():.1f}"
-                            )
                             print(f"    final loss: {loss.item():.4f}")
                     else:
                         # Use standard loss when no masking needed
-                        loss = criterion(logits, train_labels)
+                        loss = compute_loss(criterion, logits, train_labels)
 
                         # Debug: Print unmasked loss for first batch of first epoch
                         if epoch == 0 and batch_idx == 0:
@@ -1852,17 +2031,30 @@ def train_3d_unet_memory_efficient_v2(
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                logits = unet3d(train_features)
+                # Pass raw and context features separately for proper fusion
+                logits = unet3d(train_features, context_features=train_context_features)
                 if use_masks:
                     # Apply masks to loss calculation
-                    per_pixel_loss = F.cross_entropy(
-                        logits, train_labels, reduction="none"
-                    )
-                    masked_loss = per_pixel_loss * train_masks_tensor
-                    loss = masked_loss.sum() / train_masks_tensor.sum()
+                    if loss_type in ["ce", "weighted_ce", "focal"]:
+                        per_pixel_loss = F.cross_entropy(
+                            logits,
+                            train_labels,
+                            reduction="none",
+                            weight=loss_class_weights,
+                        )
+                        if loss_type == "focal":
+                            p_t = torch.exp(-per_pixel_loss)
+                            focal_weight = (1 - p_t) ** focal_gamma
+                            per_pixel_loss = focal_weight * per_pixel_loss
+
+                        masked_loss = per_pixel_loss * train_masks_tensor
+                        loss = masked_loss.sum() / train_masks_tensor.sum()
+                    else:
+                        loss_full = compute_loss(criterion, logits, train_labels)
+                        loss = loss_full
                 else:
                     # Use standard loss when no masking needed
-                    loss = criterion(logits, train_labels)
+                    loss = compute_loss(criterion, logits, train_labels)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(unet3d.parameters(), max_norm=1.0)
                 optimizer.step()
@@ -1958,7 +2150,13 @@ def train_3d_unet_memory_efficient_v2(
             )
 
             # Clear processed volumes from GPU memory after each batch
-            del train_features, train_labels, logits, predictions
+            del train_features, train_labels, logits, predictions, train_masks_tensor
+            if train_context_features is not None:
+                del train_context_features
+            if "train_volumes" in locals():
+                del train_volumes, train_gt_volumes, train_masks
+            if "train_context" in locals() and train_context is not None:
+                del train_context
             if device.type == "cuda":
                 torch.cuda.empty_cache()
 
@@ -2032,12 +2230,12 @@ def train_3d_unet_memory_efficient_v2(
                         enable_detailed_timing=enable_detailed_timing,
                     )
                     if enable_detailed_timing:
-                        vol_features, val_detailed_timing = result
+                        vol_features, vol_context_features, val_detailed_timing = result
                     else:
-                        vol_features = result
+                        vol_features, vol_context_features = result
                         val_detailed_timing = None
                 else:
-                    vol_features = (
+                    vol_features, vol_context_features = (
                         data_loader_3d.extract_multi_scale_dinov3_features_3d(
                             single_vol, single_context, epoch=epoch
                         )
@@ -2070,29 +2268,67 @@ def train_3d_unet_memory_efficient_v2(
                     with autocast(
                         device_type="cuda" if device.type == "cuda" else "cpu"
                     ):
-                        vol_logits = unet3d(vol_features)
+                        # Pass raw and context features separately for proper fusion
+                        vol_logits = unet3d(
+                            vol_features, context_features=vol_context_features
+                        )
                         if use_vol_masks:
                             # Apply masks to validation loss calculation
+                            if loss_type in ["ce", "weighted_ce", "focal"]:
+                                vol_per_pixel_loss = F.cross_entropy(
+                                    vol_logits,
+                                    vol_gt,
+                                    reduction="none",
+                                    weight=loss_class_weights,
+                                )
+                                if loss_type == "focal":
+                                    p_t = torch.exp(-vol_per_pixel_loss)
+                                    focal_weight = (1 - p_t) ** focal_gamma
+                                    vol_per_pixel_loss = (
+                                        focal_weight * vol_per_pixel_loss
+                                    )
+
+                                vol_masked_loss = vol_per_pixel_loss * vol_mask
+                                vol_loss = (
+                                    vol_masked_loss.sum() / vol_mask.sum()
+                                ).item()
+                            else:
+                                vol_loss = compute_loss(
+                                    criterion, vol_logits, vol_gt
+                                ).item()
+                        else:
+                            # Use standard loss when no masking needed
+                            vol_loss = compute_loss(
+                                criterion, vol_logits, vol_gt
+                            ).item()
+                else:
+                    # Pass raw and context features separately for proper fusion
+                    vol_logits = unet3d(
+                        vol_features, context_features=vol_context_features
+                    )
+                    if use_vol_masks:
+                        # Apply masks to validation loss calculation
+                        if loss_type in ["ce", "weighted_ce", "focal"]:
                             vol_per_pixel_loss = F.cross_entropy(
-                                vol_logits, vol_gt, reduction="none"
+                                vol_logits,
+                                vol_gt,
+                                reduction="none",
+                                weight=loss_class_weights,
                             )
+                            if loss_type == "focal":
+                                p_t = torch.exp(-vol_per_pixel_loss)
+                                focal_weight = (1 - p_t) ** focal_gamma
+                                vol_per_pixel_loss = focal_weight * vol_per_pixel_loss
+
                             vol_masked_loss = vol_per_pixel_loss * vol_mask
                             vol_loss = (vol_masked_loss.sum() / vol_mask.sum()).item()
                         else:
-                            # Use standard loss when no masking needed
-                            vol_loss = criterion(vol_logits, vol_gt).item()
-                else:
-                    vol_logits = unet3d(vol_features)
-                    if use_vol_masks:
-                        # Apply masks to validation loss calculation
-                        vol_per_pixel_loss = F.cross_entropy(
-                            vol_logits, vol_gt, reduction="none"
-                        )
-                        vol_masked_loss = vol_per_pixel_loss * vol_mask
-                        vol_loss = (vol_masked_loss.sum() / vol_mask.sum()).item()
+                            vol_loss = compute_loss(
+                                criterion, vol_logits, vol_gt
+                            ).item()
                     else:
                         # Use standard loss when no masking needed
-                        vol_loss = criterion(vol_logits, vol_gt).item()
+                        vol_loss = compute_loss(criterion, vol_logits, vol_gt).item()
 
                 # TIMING: End validation inference
                 val_inference_end = time.time()
@@ -2151,7 +2387,13 @@ def train_3d_unet_memory_efficient_v2(
                     val_class_total_pred[class_id] += np.sum(valid_pred_mask)
 
                 # Immediately free GPU memory for this volume
-                del vol_features, vol_logits, vol_predictions, vol_gt
+                del vol_features, vol_logits, vol_predictions, vol_gt, vol_mask
+                if vol_context_features is not None:
+                    del vol_context_features
+                if "single_vol" in locals():
+                    del single_vol
+                if "single_context" in locals() and single_context is not None:
+                    del single_context
 
                 # Clear GPU cache after each volume
                 if device.type == "cuda":
@@ -2301,55 +2543,27 @@ def train_3d_unet_memory_efficient_v2(
             f"  Val:   Loss={val_loss:.4f}, IoU={current_mean_iou:.4f}, Acc={val_acc:.4f}"
         )
 
-        # Print comprehensive per-class metrics
-        print(
-            f"  Train Class Recall: ["
-            + ", ".join([f"{acc:.3f}" for acc in train_class_acc])
-            + "]"
-        )
-
-        # Print training class distribution
+        # Print comprehensive per-class metrics in a nice table
         train_class_percentages = [
             count / epoch_train_total * 100 for count in epoch_train_class_total
         ]
-        print(
-            f"  Train Class Dist:   ["
-            + ", ".join([f"{pct:.1f}%" for pct in train_class_percentages])
-            + "]"
-        )
-
-        print(
-            f"  Val Class Recall:   ["
-            + ", ".join([f"{acc:.3f}" for acc in val_class_acc])
-            + "]"
-        )
-        print(
-            f"  Val Class Precision:["
-            + ", ".join([f"{prec:.3f}" for prec in val_class_precision])
-            + "]"
-        )
-        print(
-            f"  Val Class F1:       ["
-            + ", ".join([f"{f1:.3f}" for f1 in val_class_f1])
-            + "]"
-        )
-        print(
-            f"  Val Class IoU:      ["
-            + ", ".join([f"{iou:.3f}" for iou in val_class_iou])
-            + "]"
-        )
-        print(f"  Mean IoU: {current_mean_iou:.4f}")
-
-        # Print class distribution to understand accuracy weighting
         val_class_counts = val_class_total_gt  # Use the counts we already calculated
         val_class_percentages = [
             count / val_total_voxels * 100 for count in val_class_counts
         ]
-        print(
-            f"  Val Class Dist:   ["
-            + ", ".join([f"{pct:.1f}%" for pct in val_class_percentages])
-            + "]"
+
+        print_class_metrics_table(
+            class_names=class_names,
+            train_recall=train_class_acc,
+            train_dist=train_class_percentages,
+            val_recall=val_class_acc,
+            val_precision=val_class_precision,
+            val_f1=val_class_f1,
+            val_iou=val_class_iou,
+            val_dist=val_class_percentages,
         )
+
+        print(f"  Mean IoU: {current_mean_iou:.4f}")
 
         print(f"  Best Mean IoU: {best_mean_iou:.4f}, LR: {current_lr:.6f}")
         print(f"  Epochs without improvement: {epochs_without_improvement}")
@@ -2749,6 +2963,7 @@ def train_3d_unet_with_memory_efficient_loader(
     train_volume_pool_size=20,
     val_volume_pool_size=5,
     num_classes=None,
+    class_names=None,  # NEW PARAMETER for class names (e.g., ['background', 'nuc', 'mito', 'er'])
     target_volume_size=(64, 64, 64),
     volumes_per_batch=1,
     batches_per_epoch=10,
@@ -2779,6 +2994,14 @@ def train_3d_unet_with_memory_efficient_loader(
     # DATA RESOLUTION PARAMETERS
     min_resolution_for_raw=None,  # NEW PARAMETER for raw data resolution
     base_resolution=None,  # NEW PARAMETER for ground truth resolution
+    # LOSS FUNCTION PARAMETERS
+    loss_type="weighted_ce",  # 'ce', 'weighted_ce', 'focal', 'dice', 'focal_dice', 'tversky'
+    focal_gamma=2.0,  # Focusing parameter for Focal Loss
+    focal_weight=0.5,  # Weight for focal component in combined loss
+    dice_weight=0.5,  # Weight for dice component in combined loss
+    dice_smooth=1.0,  # Smoothing for Dice loss
+    tversky_alpha=0.5,  # Tversky alpha (FP weight)
+    tversky_beta=0.5,  # Tversky beta (FN weight)
 ):
     """
     Memory-efficient 3D UNet training with multiple precision and memory optimization options.
@@ -2851,6 +3074,29 @@ def train_3d_unet_with_memory_efficient_loader(
         print(
             f"Auto-detected {num_classes} classes from ground truth data: {unique_classes}"
         )
+
+    # Generate default class names if not provided
+    if class_names is None:
+        if num_classes == 2:
+            class_names = ["background", "foreground"]
+        else:
+            class_names = ["background"] + [f"class_{i}" for i in range(1, num_classes)]
+        print(f"Generated default class names: {class_names}")
+    else:
+        # Validate class names
+        if len(class_names) != num_classes:
+            print(
+                f"WARNING: Number of class names ({len(class_names)}) doesn't match num_classes ({num_classes})"
+            )
+            print(f"  Provided names: {class_names}")
+            # Adjust class_names to match num_classes
+            if len(class_names) < num_classes:
+                class_names = class_names + [
+                    f"class_{i}" for i in range(len(class_names), num_classes)
+                ]
+            else:
+                class_names = class_names[:num_classes]
+            print(f"  Adjusted names: {class_names}")
 
     print(f"Setting up memory-efficient 3D UNet training:")
     print(f"  Raw data shape: {raw_data.shape}")
@@ -2967,6 +3213,15 @@ def train_3d_unet_with_memory_efficient_loader(
         enable_detailed_timing=enable_detailed_timing,  # Pass through new parameter
         min_resolution_for_raw=min_resolution_for_raw,  # Pass through data resolution parameters
         base_resolution=base_resolution,
+        class_names=class_names,  # Pass through class names
+        # Pass through loss function parameters
+        loss_type=loss_type,
+        focal_gamma=focal_gamma,
+        focal_weight=focal_weight,
+        dice_weight=dice_weight,
+        dice_smooth=dice_smooth,
+        tversky_alpha=tversky_alpha,
+        tversky_beta=tversky_beta,
     )
 
     print(f"\n3D UNet training completed!")

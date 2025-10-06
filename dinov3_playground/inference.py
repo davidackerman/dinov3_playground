@@ -372,6 +372,12 @@ class DINOv3UNet3DInference:
                     "learn_upsampling", False
                 ),  # NEW
                 "dinov3_stride": self.training_config.get("dinov3_stride", None),  # NEW
+                "use_context_fusion": self.training_config.get(
+                    "use_context_fusion", False
+                ),  # NEW - context support
+                "context_channels": self.training_config.get(
+                    "context_channels", None
+                ),  # NEW - context channels
                 "model_id": self.training_config.get(
                     "model_id", "facebook/dinov3-vitl16-pretrain-sat493m"
                 ),
@@ -397,6 +403,15 @@ class DINOv3UNet3DInference:
                 self.model_config["learn_upsampling"] = True
                 print("Detected learned upsampling from model state dict")
 
+        # Detect context fusion from state dict if not in config
+        use_context_fusion = self.model_config.get("use_context_fusion", False)
+        if not use_context_fusion and state_dict_keys:
+            # Check for context fusion layers
+            if any("context" in key.lower() for key in state_dict_keys):
+                use_context_fusion = True
+                self.model_config["use_context_fusion"] = True
+                print("Detected context fusion from model state dict")
+
         # Initialize DINOv3
         model_id = self.model_config.get(
             "model_id", "facebook/dinov3-vitl16-pretrain-sat493m"
@@ -420,6 +435,13 @@ class DINOv3UNet3DInference:
         input_size = self.model_config.get("input_size", (128, 128, 128))
         dinov3_slice_size = self.model_config.get("dinov3_slice_size", 512)
 
+        # Context fusion setup
+        context_channels = None
+        if use_context_fusion:
+            # Context features come from DINOv3 at same resolution, so same channel count
+            context_channels = output_channels
+            print(f"Context fusion enabled with {context_channels} context channels")
+
         # Calculate DINOv3 feature size for learned upsampling
         dinov3_feature_size = None
         if learn_upsampling:
@@ -436,8 +458,13 @@ class DINOv3UNet3DInference:
             if learn_upsampling
             else "with interpolated upsampling"
         )
+        context_info = (
+            f"with context fusion ({context_channels} channels)"
+            if use_context_fusion
+            else "without context fusion"
+        )
         print(
-            f"Creating 3D UNet with {output_channels} input channels, {num_classes} classes {upsampling_info}"
+            f"Creating 3D UNet with {output_channels} input channels, {num_classes} classes {upsampling_info} {context_info}"
         )
         self.unet3d = DINOv3UNet3D(
             input_channels=output_channels,
@@ -446,6 +473,8 @@ class DINOv3UNet3DInference:
             input_size=input_size,
             learn_upsampling=learn_upsampling,
             dinov3_feature_size=dinov3_feature_size,
+            use_context_fusion=use_context_fusion,  # Enable context fusion if detected
+            context_channels=context_channels,  # Pass context channels
         ).to(self.device)
 
         # Load model weights - the training saves 3D UNet weights as "unet3d_state_dict"
@@ -510,17 +539,24 @@ class DINOv3UNet3DInference:
         print(f"   - DINOv3 slice size: {dinov3_slice_size}")
         print(f"   - DINOv3 stride: {dinov3_stride}")
         print(f"   - Learn upsampling: {learn_upsampling}")
+        print(f"   - Use context fusion: {use_context_fusion}")
+        if use_context_fusion:
+            print(f"   - Context channels: {context_channels}")
         print(f"   - Model config keys: {list(self.model_config.keys())}")
         print(f"   - Training config keys: {list(self.training_config.keys())}")
 
     def predict(
-        self, volume: np.ndarray, return_probabilities: bool = False
+        self,
+        volume: np.ndarray,
+        context_volume: Optional[np.ndarray] = None,
+        return_probabilities: bool = False,
     ) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
         """
         Run inference on a single 3D volume.
 
         Args:
             volume: Input volume as numpy array (D, H, W)
+            context_volume: Optional context volume at lower resolution for context fusion
             return_probabilities: If True, return both predictions and probabilities
 
         Returns:
@@ -531,19 +567,52 @@ class DINOv3UNet3DInference:
         if volume.ndim != 3:
             raise ValueError(f"Expected 3D volume, got shape {volume.shape}")
 
+        # Check if model uses context fusion
+        use_context_fusion = self.model_config.get("use_context_fusion", False)
+
         # Add batch dimension and extract features
         volume_batch = volume[np.newaxis, ...]  # (1, D, H, W)
 
         # Extract DINOv3 features
-        features, timing = self.data_loader.extract_dinov3_features_3d(
-            volume_batch, enable_detailed_timing=True
-        )
+        if use_context_fusion and context_volume is not None:
+            # Extract both local and context features
+            context_batch = context_volume[np.newaxis, ...]  # (1, D, H, W)
 
-        print(f"Feature extraction timing: {timing}")
+            # Use the multi-scale feature extraction
+            local_features, context_features, timing = (
+                self.data_loader.extract_multi_scale_dinov3_features_3d(
+                    volume_batch, context_batch, enable_detailed_timing=True
+                )
+            )
+            print(f"Feature extraction timing (with context): {timing}")
+        elif use_context_fusion and context_volume is None:
+            warnings.warn(
+                "Model was trained with context fusion but no context_volume provided. "
+                "Inference may produce suboptimal results."
+            )
+            # Extract just local features, pass None for context
+            local_features, timing = self.data_loader.extract_dinov3_features_3d(
+                volume_batch, enable_detailed_timing=True
+            )
+            context_features = None
+            print(f"Feature extraction timing (without context): {timing}")
+        else:
+            # No context fusion - standard single-volume feature extraction
+            local_features, timing = self.data_loader.extract_dinov3_features_3d(
+                volume_batch, enable_detailed_timing=True
+            )
+            context_features = None
+            print(f"Feature extraction timing: {timing}")
 
         # Run through 3D UNet
         with torch.no_grad():
-            logits = self.unet3d(features)
+            if use_context_fusion:
+                # Pass context features separately for proper fusion
+                logits = self.unet3d(local_features, context_features=context_features)
+            else:
+                # Standard inference without context
+                logits = self.unet3d(local_features)
+
             probabilities = torch.softmax(logits, dim=1)
             predictions = torch.argmax(logits, dim=1)
 
@@ -648,7 +717,9 @@ def load_inference_model(
     Convenience function to automatically load the appropriate inference model.
 
     Args:
-        export_dir: Path to the training export directory
+        export_dir: Path to the training export directory. Can be either:
+                   - Direct path to timestamp folder (e.g., .../run_20251003_110551)
+                   - Path to parent folder (will auto-select most recent timestamp)
         model_type: Type of model to load ('2d', '3d', or 'auto' to detect)
         device: Device to run inference on
 
@@ -656,6 +727,37 @@ def load_inference_model(
         Loaded inference model (2D or 3D)
     """
     export_path = Path(export_dir)
+
+    # Check if the last folder in the path looks like a timestamp folder
+    # Timestamp pattern: run_YYYYMMDD_HHMMSS or just YYYYMMDD_HHMMSS
+    import re
+
+    last_folder = export_path.name
+    timestamp_pattern = r"(run_)?\d{8}_\d{6}"
+
+    if not re.match(timestamp_pattern, last_folder):
+        # Not a timestamp folder - look for timestamp subdirectories
+        print(f"Path does not end with timestamp folder: {export_path}")
+        print(f"Looking for most recent timestamp folder...")
+
+        # Find all timestamp directories
+        timestamp_dirs = []
+        for item in export_path.iterdir():
+            if item.is_dir() and re.match(timestamp_pattern, item.name):
+                timestamp_dirs.append(item)
+
+        if timestamp_dirs:
+            # Sort by name (timestamp) and take the most recent
+            most_recent = sorted(timestamp_dirs, key=lambda x: x.name)[-1]
+            print(f"Found {len(timestamp_dirs)} timestamp folder(s)")
+            print(f"Using most recent: {most_recent.name}")
+            export_path = most_recent
+        else:
+            print(f"No timestamp folders found in {export_path}")
+            print(f"Proceeding with provided path...")
+
+    # Update export_dir to use the selected path (string version)
+    export_dir = str(export_path)
 
     if model_type == "auto":
         # Try to detect model type from training config embedded in best.pkl

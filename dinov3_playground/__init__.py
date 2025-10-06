@@ -31,7 +31,11 @@ from .dinov3_core import (
 )
 
 # Data processing
-from .data_processing import sample_training_data, apply_intensity_augmentation
+from .data_processing import (
+    sample_training_data,
+    apply_intensity_augmentation,
+    get_class_names_from_dataset_pairs,
+)
 
 # Models
 from .models import (
@@ -46,6 +50,15 @@ from .models import (
 
 # Training functions
 from .model_training import balance_classes
+
+# Loss functions
+from .losses import (
+    FocalLoss,
+    DiceLoss,
+    FocalDiceLoss,
+    TverskyLoss,
+    get_loss_function,
+)
 
 # Visualization
 try:
@@ -111,6 +124,7 @@ __all__ = [
     # Data processing
     "sample_training_data",
     "apply_intensity_augmentation",
+    "get_class_names_from_dataset_pairs",
     # Models
     "SimpleClassifier",
     "ImprovedClassifier",
@@ -122,6 +136,12 @@ __all__ = [
     "print_model_summary",
     # Training
     "balance_classes",
+    # Loss functions
+    "FocalLoss",
+    "DiceLoss",
+    "FocalDiceLoss",
+    "TverskyLoss",
+    "get_loss_function",
     # Visualization
     "plot_training_history",
     "plot_class_distribution",

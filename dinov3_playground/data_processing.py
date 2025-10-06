@@ -991,11 +991,52 @@ def get_num_classes_from_dataset_pairs(dataset_pairs):
     # Find maximum number of classes across all datasets
     max_classes = 0
     for pair in converted_pairs:
-        class_keys = [k for k in pair.keys() if k != "raw"]
+        # Count only organelle/class keys, not raw or context keys
+        class_keys = [
+            k
+            for k in pair.keys()
+            if k != "raw" and not (k.startswith("raw_") and "nm" in k)
+        ]
         max_classes = max(max_classes, len(class_keys))
 
     # Add 1 for background class (class 0)
     return max_classes + 1
+
+
+def get_class_names_from_dataset_pairs(dataset_pairs):
+    """
+    Extract class names from dataset pairs.
+
+    Parameters:
+    -----------
+    dataset_pairs : list
+        List of dataset dictionaries or tuples
+
+    Returns:
+    --------
+    list: List of class names, with "background" as first element
+    """
+    converted_pairs = convert_dataset_pairs_format(dataset_pairs)
+
+    if not converted_pairs:
+        return ["background", "foreground"]  # Default binary classification
+
+    # Collect all unique class keys across all datasets
+    all_class_keys = set()
+    for pair in converted_pairs:
+        # Get only organelle/class keys, not raw or context keys
+        class_keys = [
+            k
+            for k in pair.keys()
+            if k != "raw" and not (k.startswith("raw_") and "nm" in k)
+        ]
+        all_class_keys.update(class_keys)
+
+    # Sort alphabetically for consistent ordering
+    sorted_class_keys = sorted(all_class_keys)
+
+    # Return with background as first class
+    return ["background"] + sorted_class_keys
 
 
 # %%
@@ -1134,18 +1175,46 @@ def load_random_3d_training_data(
 
             # Initialize context data interface if requested
             context_idi = None
-            context_keys = [
-                k for k in dataset_dict.keys() if k.startswith("raw_") and "nm" in k
-            ]
-            if context_scale is not None and context_keys:
-                # Find the context key that matches our scale
-                context_key = f"raw_{int(context_scale)}nm"
-                if context_key in dataset_dict:
-                    context_idi = ImageDataInterface(
-                        dataset_dict[context_key],
-                        output_voxel_size=3 * [context_scale],
-                        force_pseudo_isotropic=True,
-                    )
+            if context_scale is not None:
+                # Find the best matching raw data path for the context resolution
+                # Look for keys like "raw_64nm", "raw_32nm", etc.
+                context_keys = [
+                    k for k in dataset_dict.keys() if k.startswith("raw_") and "nm" in k
+                ]
+
+                if context_keys:
+                    # Find the context key that best matches our desired context_scale
+                    best_context_key = None
+                    min_difference = float("inf")
+
+                    for key in context_keys:
+                        # Extract resolution from key (e.g., "raw_64nm" -> 64)
+                        try:
+                            key_resolution = int(
+                                key.replace("raw_", "").replace("nm", "")
+                            )
+                            difference = abs(key_resolution - context_scale)
+                            if difference < min_difference:
+                                min_difference = difference
+                                best_context_key = key
+                        except ValueError:
+                            continue
+
+                    if best_context_key is not None:
+                        actual_resolution = int(
+                            best_context_key.replace("raw_", "").replace("nm", "")
+                        )
+                        if actual_resolution != context_scale:
+                            print(
+                                f"    ℹ️  Context: requested {context_scale}nm, using closest available {actual_resolution}nm"
+                            )
+
+                        context_idi = ImageDataInterface(
+                            dataset_dict[best_context_key],
+                            output_voxel_size=3
+                            * [context_scale],  # Resample to desired resolution
+                            force_pseudo_isotropic=True,
+                        )
 
             # Initialize all class data interfaces (any key that's not "raw" and not context)
             class_keys = [
@@ -1293,6 +1362,15 @@ def load_random_3d_training_data(
             failed_classes = []
 
             crop_failed = False
+            # Print GT ROI information once
+            if class_idis:
+                print(
+                    f"    📦 GT ROI: {gt_roi.begin} → {gt_roi.end} (shape: {gt_roi.shape} nm)"
+                )
+                print(
+                    f"       Resolution: {base_resolution}nm, Expected voxels: {gt_roi.shape / base_resolution}"
+                )
+
             for class_key, class_idi in class_idis.items():
                 try:
                     class_volumes[class_key] = class_idi.to_ndarray_ts(gt_roi)
@@ -1420,6 +1498,16 @@ def load_random_3d_training_data(
             # Sample raw volume with padding (for sliding window context)
             try:
                 raw_volume = raw_idi.to_ndarray_ts(padded_roi)
+
+                # Print actual ROI coordinates being used
+                print(
+                    f"    📍 Raw ROI: {padded_roi.begin} → {padded_roi.end} (shape: {padded_roi.shape} nm)"
+                )
+                print(
+                    f"       Resolution: {raw_idi.output_voxel_size[0]}nm, Expected voxels: {padded_roi.shape / raw_idi.output_voxel_size[0]}"
+                )
+                print(f"       Actual shape: {raw_volume.shape}")
+
             except (ValueError, RuntimeError, OSError, IndexError) as e:
                 print(
                     f"  Dataset {dataset_idx}: Invalid ROI coordinates - skipping this crop"
@@ -1434,8 +1522,8 @@ def load_random_3d_training_data(
                 try:
                     # Create expanded ROI for context to cover larger area at lower resolution
                     # We want same voxel dimensions but covering larger physical area
-                    raw_resolution = raw_idi.voxel_size[0]  # e.g., 4nm
-                    context_resolution = context_idi.voxel_size[0]  # e.g., 32nm
+                    raw_resolution = raw_idi.output_voxel_size[0]  # e.g., 4nm
+                    context_resolution = context_idi.output_voxel_size[0]  # e.g., 32nm
                     resolution_ratio = (
                         context_resolution / raw_resolution
                     )  # e.g., 32/4 = 8x
@@ -1449,18 +1537,33 @@ def load_random_3d_training_data(
                     # Sample from expanded ROI at context resolution
                     context_volume = context_idi.to_ndarray_ts(context_roi)
 
+                    # Print context ROI coordinates
+                    print(
+                        f"    🌐 Context ROI: {context_roi.begin} → {context_roi.end} (shape: {context_roi.shape} nm)"
+                    )
+                    print(
+                        f"       Resolution: {context_idi.output_voxel_size[0]}nm, Expected voxels: {context_roi.shape / context_idi.output_voxel_size[0]}"
+                    )
+                    print(
+                        f"       Raw coverage ratio: {resolution_ratio:.1f}x larger spatial area"
+                    )
+                    print(f"       Actual shape: {context_volume.shape}")
+
                     # Context should naturally have same voxel dimensions as raw due to resolution difference
                     # If not, resample to match raw volume dimensions
                     if context_volume.shape != raw_volume.shape:
-                        from scipy.ndimage import zoom
+                        raise Exception(
+                            f"Context shape {context_volume.shape} does not match raw shape {raw_volume.shape}"
+                        )
+                        # from scipy.ndimage import zoom
 
-                        zoom_factors = np.array(raw_volume.shape) / np.array(
-                            context_volume.shape
-                        )
-                        context_volume = zoom(
-                            context_volume.astype(float), zoom_factors, order=1
-                        )
-                        context_volume = context_volume.astype(raw_volume.dtype)
+                        # zoom_factors = np.array(raw_volume.shape) / np.array(
+                        #     context_volume.shape
+                        # )
+                        # context_volume = zoom(
+                        #     context_volume.astype(float), zoom_factors, order=1
+                        # )
+                        # context_volume = context_volume.astype(raw_volume.dtype)
 
                 except (ValueError, RuntimeError, OSError, IndexError) as e:
                     print(
@@ -2173,6 +2276,7 @@ def generate_multi_organelle_dataset_pairs(
             base_resolution,
             use_highest_res_for_raw=use_highest_res_for_raw,
             min_resolution_for_raw=min_resolution_for_raw,
+            context_scale=context_scale,  # Pass context_scale for context data path updates
         )
         print(
             f"Updated {len(result)} multi-organelle dataset pairs with scale information"

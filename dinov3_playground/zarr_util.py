@@ -144,6 +144,7 @@ def update_datapaths_with_target_scales(
     base_resolution,
     use_highest_res_for_raw=False,
     min_resolution_for_raw=None,
+    context_scale=None,
 ):
     """
     Update dataset paths with target scales.
@@ -164,6 +165,9 @@ def update_datapaths_with_target_scales(
     min_resolution_for_raw : int, float, or Coordinate, optional
         Minimum allowed resolution for raw data when use_highest_res_for_raw=True.
         Prevents using extremely high resolution scales that may be computationally prohibitive.
+    context_scale : int, float, or Coordinate, optional
+        If provided, updates context raw data paths (keys like "raw_64nm") to use the best
+        available scale for the specified context resolution.
 
     Returns:
     --------
@@ -186,6 +190,8 @@ def update_datapaths_with_target_scales(
                 raw_path = find_highest_resolution_scale(
                     dataset_pair[0], min_resolution=min_resolution_for_raw
                 )[0]
+            elif min_resolution_for_raw is not None:
+                raw_path = find_target_scale(dataset_pair[0], min_resolution_for_raw)[0]
             else:
                 raw_path = find_target_scale(dataset_pair[0], base_resolution)[0]
 
@@ -207,6 +213,10 @@ def update_datapaths_with_target_scales(
                     dataset_pair["raw"], min_resolution=min_resolution_for_raw
                 )[0]
                 print(f"Using highest resolution for raw data")
+            elif min_resolution_for_raw is not None:
+                updated_dataset_pair["raw"] = find_target_scale(
+                    dataset_pair["raw"], min_resolution_for_raw
+                )[0]
             else:
                 updated_dataset_pair["raw"] = find_target_scale(
                     dataset_pair["raw"], base_resolution
@@ -215,8 +225,20 @@ def update_datapaths_with_target_scales(
             # Update all class paths (any key that's not "raw" is treated as a class)
             # Always use base_resolution for segmentation labels
             for key, path in dataset_pair.items():
-                if key != "raw":
-                    # All non-raw keys are class paths that use base_resolution
+                if key == "raw":
+                    continue  # Already handled above
+                elif key.startswith("raw_") and "nm" in key:
+                    # Context raw data - use context_scale if provided
+                    if context_scale is not None:
+                        updated_dataset_pair[key] = find_target_scale(
+                            path, context_scale
+                        )[0]
+                        print(f"Using context resolution {context_scale} for {key}")
+                    else:
+                        # Keep original path if no context_scale specified
+                        updated_dataset_pair[key] = path
+                else:
+                    # All other non-raw keys are class paths that use base_resolution
                     updated_dataset_pair[key] = find_target_scale(
                         path, base_resolution
                     )[0]
