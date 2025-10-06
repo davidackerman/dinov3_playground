@@ -31,7 +31,11 @@ from .dinov3_core import (
 )
 
 # Data processing
-from .data_processing import sample_training_data, apply_intensity_augmentation
+from .data_processing import (
+    sample_training_data,
+    apply_intensity_augmentation,
+    get_class_names_from_dataset_pairs,
+)
 
 # Models
 from .models import (
@@ -39,7 +43,6 @@ from .models import (
     ImprovedClassifier,
     DINOv3UNet,  # 2D UNet
     DINOv3UNet3D,  # 3D UNet - This was missing
-    UNetPipeline,  # 2D Pipeline
     DINOv3UNet3DPipeline,  # 3D Pipeline - This was missing
     create_model,
     print_model_summary,
@@ -47,6 +50,15 @@ from .models import (
 
 # Training functions
 from .model_training import balance_classes
+
+# Loss functions
+from .losses import (
+    FocalLoss,
+    DiceLoss,
+    FocalDiceLoss,
+    TverskyLoss,
+    get_loss_function,
+)
 
 # Visualization
 try:
@@ -82,6 +94,15 @@ from .memory_efficient_training import (
     restore_model_from_checkpoint,
 )
 
+# Inference
+from .inference import (
+    DINOv3UNetInference,
+    DINOv3UNet3DInference,
+    load_inference_model,
+    demo_2d_inference,
+    demo_3d_inference,
+)
+
 __version__ = "0.1.0"
 __author__ = "GitHub Copilot"
 
@@ -103,6 +124,7 @@ __all__ = [
     # Data processing
     "sample_training_data",
     "apply_intensity_augmentation",
+    "get_class_names_from_dataset_pairs",
     # Models
     "SimpleClassifier",
     "ImprovedClassifier",
@@ -114,6 +136,12 @@ __all__ = [
     "print_model_summary",
     # Training
     "balance_classes",
+    # Loss functions
+    "FocalLoss",
+    "DiceLoss",
+    "FocalDiceLoss",
+    "TverskyLoss",
+    "get_loss_function",
     # Visualization
     "plot_training_history",
     "plot_class_distribution",
@@ -130,4 +158,10 @@ __all__ = [
     "load_checkpoint",
     "list_checkpoints",
     "restore_model_from_checkpoint",
+    # Inference
+    "DINOv3UNetInference",
+    "DINOv3UNet3DInference",
+    "load_inference_model",
+    "demo_2d_inference",
+    "demo_3d_inference",
 ]

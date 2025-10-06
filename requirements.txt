@@ -1,0 +1,11 @@
+# Core dependencies for dinov3_playground
+# torch>=1.9.0
+# numpy
+# pillow
+# transformers>=4.20.0
+# matplotlib
+# scikit-image
+# scipy
+# zarr
+# funlib.geometry
+# cellmap_flow

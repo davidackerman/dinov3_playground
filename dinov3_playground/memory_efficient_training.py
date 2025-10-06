@@ -19,6 +19,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F  # Add this import
 import torch.optim as optim
+import time
+from tqdm import tqdm
 from datetime import datetime
 from .dinov3_core import (
     process,
@@ -26,9 +28,16 @@ from .dinov3_core import (
     apply_normalization_stats,
     output_channels,
 )
-from data_processing import sample_training_data
-from models import ImprovedClassifier, SimpleClassifier
-from model_training import balance_classes
+
+# Handle both relative and absolute imports
+try:
+    from .data_processing import sample_training_data
+    from .models import ImprovedClassifier, SimpleClassifier
+    from .model_training import balance_classes
+except ImportError:
+    from dinov3_playground.data_processing import sample_training_data
+    from dinov3_playground.models import ImprovedClassifier, SimpleClassifier
+    from dinov3_playground.model_training import balance_classes
 from torch.amp import autocast  # Updated import
 from torch.cuda.amp import GradScaler  # Keep GradScaler from cuda.amp
 
@@ -37,6 +46,77 @@ import pickle
 import glob
 import os
 from datetime import datetime
+
+
+def print_class_metrics_table(
+    class_names,
+    train_recall=None,
+    train_dist=None,
+    val_recall=None,
+    val_precision=None,
+    val_f1=None,
+    val_iou=None,
+    val_dist=None,
+):
+    """
+    Print per-class metrics in a nicely formatted table.
+
+    Parameters:
+    -----------
+    class_names : list of str
+        Names of classes (e.g., ['background', 'nuc', 'mito', 'er'])
+    train_recall, train_dist, val_recall, val_precision, val_f1, val_iou, val_dist : list of float, optional
+        Metric values for each class. All should have same length as class_names.
+    """
+    if not class_names:
+        return
+
+    # Determine which metrics to display
+    metrics_to_show = []
+    if train_recall is not None:
+        metrics_to_show.append(("Train Recall", train_recall))
+    if train_dist is not None:
+        metrics_to_show.append(("Train Dist", train_dist))
+    if val_recall is not None:
+        metrics_to_show.append(("Val Recall", val_recall))
+    if val_precision is not None:
+        metrics_to_show.append(("Val Precision", val_precision))
+    if val_f1 is not None:
+        metrics_to_show.append(("Val F1", val_f1))
+    if val_iou is not None:
+        metrics_to_show.append(("Val IoU", val_iou))
+    if val_dist is not None:
+        metrics_to_show.append(("Val Dist", val_dist))
+
+    if not metrics_to_show:
+        return
+
+    # Calculate column widths
+    class_col_width = max(max(len(name) for name in class_names), len("Class"))
+    metric_col_width = 12
+
+    # Print header
+    header = f"  {'Class':<{class_col_width}}"
+    for metric_name, _ in metrics_to_show:
+        header += f" {metric_name:>{metric_col_width}}"
+    print(header)
+    print("  " + "-" * (class_col_width + metric_col_width * len(metrics_to_show)))
+
+    # Print rows for each class
+    for i, class_name in enumerate(class_names):
+        row = f"  {class_name:<{class_col_width}}"
+        for metric_name, metric_values in metrics_to_show:
+            if i < len(metric_values):
+                value = metric_values[i]
+                # Format differently for distribution percentages vs metrics
+                if "Dist" in metric_name:
+                    row += f" {value:>{metric_col_width - 1}.1f}%"
+                else:
+                    row += f" {value:>{metric_col_width}.3f}"
+            else:
+                row += f" {'N/A':>{metric_col_width}}"
+        print(row)
+    print()  # Blank line after table
 
 
 class MemoryEfficientDataLoader3D:
@@ -49,12 +129,20 @@ class MemoryEfficientDataLoader3D:
         self,
         raw_data,
         gt_data,
+        gt_masks=None,  # NEW PARAMETER for GT extension masks
+        context_data=None,  # NEW PARAMETER for context volumes at lower resolution
+        context_scale=None,  # NEW PARAMETER for context resolution (e.g., 8 for 8nm)
         train_volume_pool_size=20,
         val_volume_pool_size=5,
         target_volume_size=(64, 64, 64),
         dinov3_slice_size=896,
         seed=42,
         model_id=None,
+        learn_upsampling=False,  # NEW PARAMETER
+        dinov3_stride=None,  # NEW PARAMETER for sliding window inference
+        use_orthogonal_planes=True,  # NEW PARAMETER for 3-plane processing
+        enable_detailed_timing=True,  # NEW PARAMETER for detailed timing
+        verbose=True,  # NEW PARAMETER to control verbose output
     ):
         """
         Initialize memory-efficient 3D data loader.
@@ -65,6 +153,14 @@ class MemoryEfficientDataLoader3D:
             4D raw volume data (num_volumes, D, H, W)
         gt_data : numpy.ndarray
             4D ground truth data (num_volumes, D, H, W)
+        gt_masks : numpy.ndarray, optional
+            4D mask data (num_volumes, D, H, W) with 1 where GT is valid, 0 elsewhere.
+            If None, assumes all GT regions are valid (full mask of 1s).
+        context_data : numpy.ndarray, optional
+            4D context volume data (num_volumes, D, H, W) at lower resolution for spatial context.
+            If None, no contextual information will be used.
+        context_scale : int or float, optional
+            Resolution of context data in nm (e.g., 8 for 8nm). Used for feature processing.
         train_volume_pool_size : int, default=20
             Number of possible training volumes to sample from
         val_volume_pool_size : int, default=5
@@ -77,13 +173,59 @@ class MemoryEfficientDataLoader3D:
             Random seed for reproducibility
         model_id : str, optional
             DINOv3 model identifier to use
+        learn_upsampling : bool, default=False
+            Whether to use learned upsampling in the UNet
+        dinov3_stride : int, optional
+            Stride for DINOv3 sliding window inference. If None, uses patch_size (16).
+            Use smaller values (e.g., 8, 4) for higher resolution features.
+        use_orthogonal_planes : bool, default=True
+            If True, processes slices in all 3 orthogonal planes (XY, XZ, YZ) and averages them.
+            If False, processes only XY planes (original behavior).
         """
 
-        # Validate inputs
-        if raw_data.shape != gt_data.shape:
+        # Validate inputs with ROI-level padding support
+        if raw_data.shape[0] != gt_data.shape[0]:
             raise ValueError(
-                f"Raw and GT data shapes must match: {raw_data.shape} vs {gt_data.shape}"
+                f"Number of volumes must match: {raw_data.shape[0]} vs {gt_data.shape[0]}"
             )
+
+        # Allow different dimensions for multi-resolution training
+        # Raw data can be at higher resolution than GT data
+        if len(raw_data.shape) >= 2:
+            raw_shape = raw_data.shape[1:]  # (D, H, W)
+            gt_shape = gt_data.shape[1:]  # (D, H, W)
+
+            if raw_shape == gt_shape:
+                print(f"✓ DataLoader: Same resolution mode - {raw_shape}")
+            else:
+                print(
+                    f"✓ DataLoader: Multi-resolution mode - Raw {raw_shape} → GT {gt_shape}"
+                )
+
+                # Validate that dimensions are reasonable ratios
+                for dim_name, (raw_dim, gt_dim) in zip(
+                    ["D", "H", "W"], zip(raw_shape, gt_shape)
+                ):
+                    ratio = raw_dim / gt_dim
+                    if (
+                        ratio < 0.1 or ratio > 16.0
+                    ):  # Allow wide range but catch obvious errors
+                        print(
+                            f"Warning: {dim_name} dimension ratio ({ratio:.2f}) is very extreme"
+                        )
+
+        # Multi-resolution training allows different spatial dimensions
+        # This replaces the old ROI padding validation with more flexible logic
+        if len(raw_data.shape) >= 4:
+            raw_spatial = raw_data.shape[2:]
+            gt_spatial = gt_data.shape[2:]
+            if raw_spatial != gt_spatial:
+                print(
+                    f"✓ DataLoader: Different spatial dimensions - Raw {raw_spatial} vs GT {gt_spatial}"
+                )
+                print("  This is expected for multi-resolution training")
+            else:
+                print(f"✓ DataLoader: Same spatial dimensions - {raw_spatial}")
 
         if len(raw_data.shape) != 4:
             raise ValueError(
@@ -99,11 +241,53 @@ class MemoryEfficientDataLoader3D:
 
         self.raw_data = raw_data
         self.gt_data = gt_data
+
+        # Handle GT masks - create full masks if not provided
+        if gt_masks is None:
+            self.gt_masks = np.ones_like(gt_data, dtype=np.uint8)
+            print("  - GT masks: Created full masks (all regions valid)")
+        else:
+            if gt_masks.shape != gt_data.shape:
+                raise ValueError(
+                    f"GT masks shape {gt_masks.shape} doesn't match GT data shape {gt_data.shape}"
+                )
+            self.gt_masks = gt_masks
+            valid_fraction = np.mean(gt_masks)
+            print(
+                f"  - GT masks: Using provided masks ({valid_fraction:.3f} average valid fraction)"
+            )
+
+        # Handle context data
+        self.context_data = context_data
+        self.context_scale = context_scale
+        self.has_context = context_data is not None and context_scale is not None
+
+        if self.has_context:
+            if context_data.shape[0] != raw_data.shape[0]:
+                raise ValueError(
+                    f"Context data volume count {context_data.shape[0]} doesn't match raw data {raw_data.shape[0]}"
+                )
+            print(
+                f"  - Context data: Using {context_scale}nm context data, shape {context_data.shape}"
+            )
+        else:
+            print("  - Context data: No context data provided")
+
         self.train_volume_pool_size = train_volume_pool_size
         self.val_volume_pool_size = val_volume_pool_size
         self.target_volume_size = target_volume_size
         self.dinov3_slice_size = dinov3_slice_size
         self.model_id = model_id
+        self.seed = seed  # Store seed for config saving
+        self.learn_upsampling = learn_upsampling  # Store upsampling mode
+        self.dinov3_stride = dinov3_stride  # Store sliding window stride
+        self.use_orthogonal_planes = (
+            use_orthogonal_planes  # Store orthogonal planes mode
+        )
+        self.verbose = verbose  # Store verbose output mode
+
+        # Calculate padding requirements for sliding window
+        self._calculate_padding_requirements()
 
         # Set up random state
         self.rng = np.random.RandomState(seed)
@@ -127,6 +311,30 @@ class MemoryEfficientDataLoader3D:
         print(f"  - Validation set: {len(self.val_indices)} volumes")
         print(f"  - Target volume size: {target_volume_size}")
         print(f"  - DINOv3 slice size: {dinov3_slice_size}")
+        if dinov3_stride is not None:
+            print(
+                f"  - DINOv3 stride: {dinov3_stride} (sliding window inference enabled)"
+            )
+            # Calculate padding requirements
+            self._calculate_padding_requirements()
+        else:
+            print(f"  - DINOv3 stride: 16 (standard inference)")
+            self.sliding_window_padding = 0
+
+    def _calculate_padding_requirements(self):
+        """Calculate padding requirements for sliding window inference."""
+        if self.dinov3_stride is not None and self.dinov3_stride < 16:
+            # Calculate maximum shift needed for info
+            patch_size = 16  # DINOv3 patch size
+            max_shift = patch_size - self.dinov3_stride
+            print(
+                f"  - Sliding window context: {max_shift} pixels (handled at ROI level)"
+            )
+            self.sliding_window_padding = (
+                0  # No per-slice padding needed with ROI-level padding
+            )
+        else:
+            self.sliding_window_padding = 0
 
     def sample_training_batch(self, batch_size):
         """
@@ -139,7 +347,8 @@ class MemoryEfficientDataLoader3D:
 
         Returns:
         --------
-        tuple: (batch_volumes, batch_gt) of shape (batch_size, D, H, W)
+        tuple: (batch_volumes, batch_gt, batch_masks, batch_context) of shape (batch_size, D, H, W)
+               batch_context will be None if no context data available
         """
         # Sample random volumes from training pool
         sampled_indices = self.rng.choice(
@@ -150,8 +359,15 @@ class MemoryEfficientDataLoader3D:
 
         batch_volumes = self.raw_data[sampled_indices]
         batch_gt = self.gt_data[sampled_indices]
+        batch_masks = self.gt_masks[sampled_indices]
 
-        return batch_volumes, batch_gt
+        # Add context data if available
+        if self.has_context:
+            batch_context = self.context_data[sampled_indices]
+        else:
+            batch_context = None
+
+        return batch_volumes, batch_gt, batch_masks, batch_context
 
     def get_validation_data(self):
         """
@@ -159,19 +375,30 @@ class MemoryEfficientDataLoader3D:
 
         Returns:
         --------
-        tuple: (val_volumes, val_gt) of shape (val_pool_size, D, H, W)
+        tuple: (val_volumes, val_gt, val_masks, val_context) of shape (val_pool_size, D, H, W)
+               val_context will be None if no context data available
         """
         val_volumes = self.raw_data[self.val_indices]
         val_gt = self.gt_data[self.val_indices]
+        val_masks = self.gt_masks[self.val_indices]
 
-        return val_volumes, val_gt
+        # Add context data if available
+        if self.has_context:
+            val_context = self.context_data[self.val_indices]
+        else:
+            val_context = None
 
-    def extract_dinov3_features_3d(self, volumes, epoch=None, batch=None):
+        return val_volumes, val_gt, val_masks, val_context
+
+    def extract_dinov3_features_3d(
+        self, volumes, epoch=None, batch=None, enable_detailed_timing=False
+    ):
         """
-        Extract DINOv3 features from 3D volumes by processing each slice.
+        Extract DINOv3 features from 3D volumes by processing slices.
+        Uses orthogonal planes if enabled.
         """
-        from .dinov3_core import process, get_current_model_info
-        from skimage.transform import resize
+        from .models import DINOv3UNet3DPipeline
+        from .dinov3_core import get_current_model_info
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -179,149 +406,200 @@ class MemoryEfficientDataLoader3D:
             volumes = volumes[np.newaxis, ...]
 
         batch_size, depth, height, width = volumes.shape
-        target_d, target_h, target_w = self.target_volume_size
 
         # Get current model info to determine output channels
         model_info = get_current_model_info()
         current_output_channels = model_info["output_channels"]
-        # if epoch is not None and batch is not None:
-        #     print(f"Epoch {epoch}, Batch {batch}:")
-        # print(f"Processing {batch_size} volumes for DINOv3 feature extraction...")
-        # print(f"  - Volume shape: {volumes.shape}")
-        # print(f"  - Target volume size: {self.target_volume_size}")
-        # print(f"  - Expected output channels: {current_output_channels}")
-        # print(f"  - DINOv3 slice size: {self.dinov3_slice_size}")
 
-        all_features = []
+        # Create a temporary pipeline instance for feature extraction
+        temp_pipeline = DINOv3UNet3DPipeline(
+            num_classes=2,  # Dummy value, only using for feature extraction
+            input_size=self.target_volume_size,
+            dinov3_slice_size=self.dinov3_slice_size,
+            base_channels=32,  # Dummy value
+            input_channels=current_output_channels,
+            use_orthogonal_planes=self.use_orthogonal_planes,
+            device=device,
+            verbose=self.verbose,  # Pass verbose flag to suppress messages
+        )
 
+        # GPU-accelerated batch processing optimization
+        import time
+
+        batch_processing_start = time.time()
+
+        # Simple GPU-optimized stacking - no complex batch processing
+        # Pre-allocate GPU tensor for batch features to avoid repeated memory allocation
+        expected_shape = (
+            batch_size,
+            current_output_channels,
+            *self.target_volume_size,
+        )
+        batch_features = torch.zeros(expected_shape, device=device, dtype=torch.float32)
+
+        # Process each volume through the pipeline's feature extractor
+        # with GPU-optimized direct assignment instead of list append + stack
         for b in range(batch_size):
-            volume_features = []
+            # Extract a single volume
+            single_volume = volumes[b : b + 1]  # Keep batch dimension
 
-            for z in range(target_d):
-                # Resize volume slice
-                if volumes.shape[1] == target_d:
-                    slice_2d = volumes[b, z]
-                else:
-                    # Need to resize the volume first
-                    volume_resized = resize(
-                        volumes[b],
-                        (target_d, target_h, target_w),
-                        preserve_range=True,
-                        anti_aliasing=True,
+            # Use the pipeline's orthogonal feature extraction
+            # Pass target_volume_size as target output to ensure features match GT size
+            if enable_detailed_timing:
+                volume_features, volume_timing = (
+                    temp_pipeline.extract_dinov3_features_3d(
+                        single_volume,
+                        use_orthogonal_planes=self.use_orthogonal_planes,
+                        enable_timing=True,
+                        target_output_size=self.target_volume_size,
                     )
-                    slice_2d = volume_resized[z]
+                )
+                # Store timing for this volume
+                if b == 0:  # First volume, initialize timing aggregation
+                    detailed_timing = volume_timing
+                else:  # Subsequent volumes, aggregate timing
+                    for key in [
+                        "total_upsampling_time",
+                        "total_stacking_time",
+                        "total_dinov3_inference_time",
+                        "total_feature_extraction_time",
+                        "total_downsampling_time",
+                        "total_batches",
+                        "total_slices",
+                    ]:
+                        if key in detailed_timing:
+                            detailed_timing[key] += volume_timing.get(key, 0)
+            else:
+                volume_features = temp_pipeline.extract_dinov3_features_3d(
+                    single_volume,
+                    use_orthogonal_planes=self.use_orthogonal_planes,
+                    target_output_size=self.target_volume_size,
+                )
 
-                slice_2d = resize(
-                    slice_2d,
-                    (target_h, target_w),
-                    preserve_range=True,
-                    anti_aliasing=True,
-                ).astype(volumes.dtype)
+            # GPU-optimized direct assignment instead of list append + stack
+            # This is much faster than: all_features.append() + torch.stack(all_features)
+            # volume_features shape: (1, output_channels, D, H, W)
+            if volume_features.dim() == 5 and volume_features.shape[0] == 1:
+                # Direct GPU tensor assignment - eliminates CPU-GPU transfer overhead
+                batch_features[b] = volume_features.squeeze(0).to(device)
+            else:
+                print(
+                    f"WARNING: Unexpected volume_features shape: {volume_features.shape}"
+                )
+                batch_features[b] = volume_features.to(device)
 
-                # FIXED: Upsample to the correct DINOv3 input size
-                # The issue was here - we need to match the size that DINOv3 was initialized with
-                slice_upsampled = resize(
-                    slice_2d,
-                    (self.dinov3_slice_size, self.dinov3_slice_size),
-                    preserve_range=True,
-                    anti_aliasing=True,
-                ).astype(volumes.dtype)
+        batch_processing_time = time.time() - batch_processing_start
+        processing_method = "gpu_optimized_stacking"
 
-                # Extract features
-                slice_batch = slice_upsampled[np.newaxis, ...]
+        if enable_detailed_timing and "detailed_timing" in locals():
+            detailed_timing["batch_processing_time"] = batch_processing_time
+            detailed_timing["batch_processing_method"] = processing_method
+            detailed_timing["batch_size_processed"] = batch_size
 
-                # Use updated autocast
-                with autocast(
-                    device_type="cuda" if device.type == "cuda" else "cpu",
-                    enabled=False,
-                ):  # Disable autocast for metric calculations
-                    dinov3_features = process(
-                        slice_batch,
-                        model_id=self.model_id,
-                        image_size=self.dinov3_slice_size,
-                    )
+        # Clear temporary pipeline and input volumes from GPU memory
+        del temp_pipeline
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
-                # Convert to torch tensor if it's numpy
-                if isinstance(dinov3_features, np.ndarray):
-                    dinov3_features = torch.from_numpy(dinov3_features)
+        if enable_detailed_timing:
+            return batch_features, detailed_timing
+        else:
+            return batch_features
 
-                # DEBUG: Print feature information
-                if b == 0 and z == 0:  # Only print for first slice
-                    print(f"  - DINOv3 features shape: {dinov3_features.shape}")
-                    print(f"  - DINOv3 features size: {dinov3_features.numel()}")
-                    print(f"  - DINOv3 features type: {type(dinov3_features)}")
+    def extract_multi_scale_dinov3_features_3d(
+        self,
+        local_volumes,
+        context_volumes=None,
+        epoch=None,
+        batch=None,
+        enable_detailed_timing=False,
+    ):
+        """
+        Extract both local high-resolution and contextual low-resolution DINOv3 features.
 
-                # FIXED: Handle the actual DINOv3 output format
-                # DINOv3 returns (channels, batch_size, patch_h, patch_w)
-                if len(dinov3_features.shape) == 4:
-                    # Expected format: (channels, batch_size, patch_h, patch_w)
-                    channels, batch_dim, patch_h, patch_w = dinov3_features.shape
+        IMPORTANT: Returns features SEPARATELY for proper context fusion architecture.
+        Context features should NOT be mixed with raw features via simple concatenation.
+        Instead, they should be passed separately to the UNet for attention-based fusion.
 
-                    if batch_dim != 1:
-                        raise ValueError(f"Expected batch size 1, got {batch_dim}")
+        Parameters:
+        -----------
+        local_volumes : numpy.ndarray, shape (batch_size, D, H, W)
+            High-resolution local volumes
+        context_volumes : numpy.ndarray, optional
+            Low-resolution context volumes, same batch size
+        epoch : int, optional
+            Current training epoch (for logging)
+        batch : int, optional
+            Current batch index (for logging)
+        enable_detailed_timing : bool
+            Whether to return detailed timing information
 
-                    # Remove batch dimension: (channels, patch_h, patch_w)
-                    features_2d = dinov3_features.squeeze(1)
+        Returns:
+        --------
+        If context_volumes is None:
+            - local_features: torch.Tensor (batch_size, channels, D, H, W)
+            - None: No context features
+        If context_volumes is provided:
+            - local_features: torch.Tensor (batch_size, channels, D, H, W)
+            - context_features: torch.Tensor (batch_size, channels, D, H, W)
 
-                elif len(dinov3_features.shape) == 3:
-                    # Alternative format: (batch_size, tokens, channels) or similar
-                    # This shouldn't happen with the current process() function, but handle just in case
-                    if dinov3_features.shape[0] == 1:
-                        # Batch first format
-                        features_flat = dinov3_features.squeeze(0)  # Remove batch dim
-                        # Reshape based on expected channels
-                        if features_flat.shape[1] == current_output_channels:
-                            # (tokens, channels) -> need to reshape to spatial
-                            tokens = features_flat.shape[0]
-                            spatial_size = int(np.sqrt(tokens))
-                            features_2d = features_flat.transpose(0, 1).reshape(
-                                current_output_channels, spatial_size, spatial_size
-                            )
-                        else:
-                            raise ValueError(
-                                f"Unexpected feature shape: {dinov3_features.shape}"
-                            )
-                    else:
-                        raise ValueError(
-                            f"Unexpected feature shape: {dinov3_features.shape}"
-                        )
+        If enable_detailed_timing=True, also returns timing dict
+        """
+        import torch.nn.functional as F
 
-                else:
-                    raise ValueError(
-                        f"Unexpected DINOv3 features shape: {dinov3_features.shape}"
-                    )
+        # Extract local high-resolution features
+        if enable_detailed_timing:
+            local_features, local_timing = self.extract_dinov3_features_3d(
+                local_volumes, epoch, batch, enable_detailed_timing=True
+            )
+        else:
+            local_features = self.extract_dinov3_features_3d(
+                local_volumes, epoch, batch, enable_detailed_timing=False
+            )
 
-                # DEBUG: Print reshaped features
-                if b == 0 and z == 0:
-                    print(f"  - Reshaped features_2d shape: {features_2d.shape}")
+        # If no context data, return just local features and None for context
+        if context_volumes is None or not self.has_context:
+            if enable_detailed_timing:
+                return local_features, None, local_timing
+            else:
+                return local_features, None
 
-                # Resize to target spatial dimensions
-                features_resized = torch.nn.functional.interpolate(
-                    features_2d.unsqueeze(0),  # Add batch dimension
-                    size=(target_h, target_w),
-                    mode="bilinear",
-                    align_corners=False,
-                ).squeeze(
-                    0
-                )  # Remove batch dimension
+        # Extract context features
+        if enable_detailed_timing:
+            context_features, context_timing = self.extract_dinov3_features_3d(
+                context_volumes, epoch, batch, enable_detailed_timing=True
+            )
+        else:
+            context_features = self.extract_dinov3_features_3d(
+                context_volumes, epoch, batch, enable_detailed_timing=False
+            )
 
-                # DEBUG: Print final features
-                if b == 0 and z == 0:
-                    print(f"  - Final features_resized shape: {features_resized.shape}")
+        # Clear input context volumes from memory after feature extraction
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
-                volume_features.append(features_resized)
+        # Resize context features to match local feature spatial dimensions if needed
+        if context_features.shape[2:] != local_features.shape[2:]:
+            context_features = F.interpolate(
+                context_features,
+                size=local_features.shape[2:],
+                mode="trilinear",
+                align_corners=False,
+            )
 
-            # Stack along depth dimension
-            volume_features_3d = torch.stack(
-                volume_features, dim=1
-            )  # (channels, depth, height, width)
-            all_features.append(volume_features_3d)
-
-        batch_features = torch.stack(all_features, dim=0)
-
-        print(f"  - Final batch features shape: {batch_features.shape}")
-
-        return batch_features.to(device)
+        # Return SEPARATE features for proper context fusion architecture
+        if enable_detailed_timing:
+            # Combine timing information
+            combined_timing = local_timing.copy()
+            combined_timing.update(
+                {f"context_{k}": v for k, v in context_timing.items()}
+            )
+            combined_timing["local_channels"] = local_features.shape[1]
+            combined_timing["context_channels"] = context_features.shape[1]
+            return local_features, context_features, combined_timing
+        else:
+            return local_features, context_features
 
     def get_data_info(self):
         """
@@ -721,7 +999,7 @@ def train_classifier_memory_efficient(
     print(f"Validation set: {val_X.shape} features from {len(val_images)} images")
 
     # Initialize classifier
-    from models import ImprovedClassifier, SimpleClassifier
+    from .models import ImprovedClassifier, SimpleClassifier
 
     if use_improved_classifier:
         classifier = ImprovedClassifier(
@@ -735,6 +1013,12 @@ def train_classifier_memory_efficient(
         model_name = "simple_classifier"
 
     print(f"Using {model_name}")
+
+    # Get current model info for config saving
+    from .dinov3_core import get_current_model_info
+
+    model_info = get_current_model_info()
+    current_output_channels = model_info["output_channels"]
 
     # Loss and optimizer
     criterion = nn.CrossEntropyLoss()
@@ -853,6 +1137,21 @@ def train_classifier_memory_efficient(
                     "batches_per_epoch": batches_per_epoch,
                     "model_type": model_name,
                     "model_id": model_id,
+                    "target_size": target_size,  # 2D image size
+                    "image_size": target_size,  # For DINOv3 initialization
+                    "seed": data_loader.seed,  # Add seed
+                    "train_image_pool_size": data_loader.train_image_pool_size,  # Add pool sizes
+                    "val_image_pool_size": data_loader.val_image_pool_size,
+                },
+                "model_config": {
+                    "num_classes": num_classes,
+                    "input_size": (target_size, target_size),  # 2D input size
+                    "model_id": model_id,
+                    "model_type": model_name,
+                    "use_improved_classifier": use_improved_classifier,
+                    "target_size": target_size,  # Add target size
+                    "image_size": target_size,  # Add image size for DINOv3
+                    "input_channels": current_output_channels,  # Add input channels
                 },
             }
 
@@ -1001,7 +1300,7 @@ def train_unet_memory_efficient(
     )
 
     # Initialize UNet with correct input channels
-    from models import DINOv3UNet
+    from .models import DINOv3UNet
 
     unet = DINOv3UNet(
         input_channels=current_output_channels,
@@ -1203,6 +1502,24 @@ def train_unet_memory_efficient(
                     "model_id": model_id,
                     "input_channels": current_output_channels,
                     "use_class_weighting": use_class_weighting,
+                    "target_size": data_loader.target_size,  # Add target size
+                    "image_size": data_loader.target_size,  # For DINOv3 initialization
+                    "seed": data_loader.seed,  # Add seed
+                    "train_image_pool_size": data_loader.train_image_pool_size,  # Add pool sizes
+                    "val_image_pool_size": data_loader.val_image_pool_size,
+                },
+                "model_config": {
+                    "num_classes": num_classes,
+                    "base_channels": base_channels,
+                    "input_size": (
+                        data_loader.target_size,
+                        data_loader.target_size,
+                    ),  # 2D input size
+                    "input_channels": current_output_channels,
+                    "model_id": model_id,
+                    "model_type": "dinov3_unet",
+                    "target_size": data_loader.target_size,  # Add target size
+                    "image_size": data_loader.target_size,  # Add image size for DINOv3
                 },
             }
 
@@ -1276,22 +1593,54 @@ def train_3d_unet_memory_efficient_v2(
     volumes_per_batch=1,
     batches_per_epoch=10,
     save_checkpoints=True,
+    checkpoint_every_n_epochs=None,
     model_id=None,
     export_base_dir=None,
     use_class_weighting=True,
     use_mixed_precision=True,  # Add this parameter
+    # Loss function parameters
+    loss_type="weighted_ce",  # NEW: 'ce', 'weighted_ce', 'focal', 'dice', 'focal_dice', 'tversky'
+    focal_gamma=2.0,  # NEW: Focusing parameter for Focal Loss
+    focal_weight=0.5,  # NEW: Weight for focal component in combined loss
+    dice_weight=0.5,  # NEW: Weight for dice component in combined loss
+    dice_smooth=1.0,  # NEW: Smoothing for Dice loss
+    tversky_alpha=0.5,  # NEW: Tversky alpha (FP weight)
+    tversky_beta=0.5,  # NEW: Tversky beta (FN weight)
+    # Additional parameters for complete config saving
+    use_half_precision=False,
+    use_gradient_checkpointing=False,
+    memory_efficient_mode="auto",
+    learn_upsampling=False,  # NEW PARAMETER
+    enable_detailed_timing=True,
+    # Data resolution parameters
+    min_resolution_for_raw=None,
+    base_resolution=None,
+    class_names=None,  # NEW PARAMETER for class names
 ):
     """
     Train 3D UNet using memory-efficient data loading with DINOv3 features.
     Now supports mixed precision training for reduced memory usage.
     """
 
+    # Generate default class names if not provided
+    if class_names is None:
+        if num_classes == 2:
+            class_names = ["background", "foreground"]
+        else:
+            class_names = ["background"] + [f"class_{i}" for i in range(1, num_classes)]
+        print(f"Generated default class names: {class_names}")
+    else:
+        print(f"Using provided class names: {class_names}")
+
     print(f"Memory-efficient 3D UNet training setup:")
     print(f"  - Volumes per batch: {volumes_per_batch}")
     print(f"  - Batches per epoch: {batches_per_epoch}")
     print(f"  - Total volumes per epoch: {volumes_per_batch * batches_per_epoch}")
+    print(f"  - Loss type: {loss_type}")
     print(f"  - Class weighting: {use_class_weighting}")
-    print(f"  - Mixed precision: {use_mixed_precision}")  # NEW
+    print(f"  - Mixed precision: {use_mixed_precision}")
+    print(f"  - Learn upsampling: {learn_upsampling}")  # NEW
+    print(f"  - GT extension masks: Conditional masking (auto-detected per batch)")
 
     # Initialize mixed precision scaler
     scaler = GradScaler() if use_mixed_precision else None
@@ -1305,26 +1654,55 @@ def train_3d_unet_memory_efficient_v2(
         print(f"  - Export base: {export_base_dir}")
         print(f"  - Checkpoints will be saved to: {checkpoint_dir}")
 
-    # Get validation data (fixed throughout training)
-    val_volumes, val_gt_volumes = data_loader_3d.get_validation_data()
-
-    # Process validation data to get features
-    print("Processing validation data...")
-    val_features = data_loader_3d.extract_dinov3_features_3d(val_volumes)
-    val_labels = torch.tensor(val_gt_volumes, dtype=torch.long).to(device)
-
-    print(
-        f"Validation set: {val_features.shape} features from {len(val_volumes)} volumes"
+    # Get validation data (keep on CPU for memory efficiency)
+    val_volumes, val_gt_volumes, val_masks, val_context = (
+        data_loader_3d.get_validation_data()
     )
-    print(f"Validation labels shape: {val_labels.shape}")
 
-    # Calculate class weights from validation data
+    print(f"Validation set: {len(val_volumes)} volumes prepared")
+    print(f"Validation labels will be processed volume-by-volume for memory efficiency")
+    print(f"Expected validation shape per volume: {val_gt_volumes[0].shape}")
+    print(
+        "Note: Validation features and labels will be computed volume-by-volume on-demand"
+    )
+
+    # Calculate class weights from training data (process volumes on CPU to avoid GPU memory issues)
     if use_class_weighting:
-        print("Calculating class weights from validation data...")
-        val_labels_flat = val_labels.view(-1).cpu().numpy()
+        print("Calculating class weights from training data...")
+        # Sample training data to calculate class distribution from masked regions
+        print("Sampling training volumes to estimate class distribution...")
 
-        unique_classes, class_counts = np.unique(val_labels_flat, return_counts=True)
-        total_voxels = len(val_labels_flat)
+        # Use a reasonable sample of training volumes for class weight calculation
+        sample_size = min(
+            10, len(data_loader_3d.train_pool_indices)
+        )  # Sample up to 10 volumes
+        sample_indices = np.random.choice(
+            data_loader_3d.train_pool_indices, size=sample_size, replace=False
+        )
+
+        all_train_labels = []
+        total_masked_voxels = 0
+
+        for idx in sample_indices:
+            train_gt = data_loader_3d.gt_data[idx]
+            train_mask = data_loader_3d.gt_masks[idx]
+
+            # Check if mask is actually restricting regions (not all 1s)
+            if not np.all(train_mask == 1):
+                # Only consider masked regions for class distribution
+                mask_bool = train_mask.astype(bool)
+                masked_labels = train_gt[mask_bool]
+                all_train_labels.append(masked_labels.flatten())
+                total_masked_voxels += np.sum(mask_bool)
+            else:
+                # If mask is all 1s, use all voxels
+                all_train_labels.append(train_gt.flatten())
+                total_masked_voxels += train_gt.size
+
+        train_labels_flat = np.concatenate(all_train_labels)
+
+        unique_classes, class_counts = np.unique(train_labels_flat, return_counts=True)
+        total_voxels = len(train_labels_flat)
 
         class_weights = np.zeros(num_classes)
         for i, (class_id, count) in enumerate(zip(unique_classes, class_counts)):
@@ -1336,7 +1714,9 @@ def train_3d_unet_memory_efficient_v2(
             device
         )
 
-        print("Class distribution in validation data:")
+        print(
+            f"Class distribution in training data (from {sample_size} sampled volumes, {total_masked_voxels:,} masked voxels):"
+        )
         for i, (class_id, count) in enumerate(zip(unique_classes, class_counts)):
             if class_id < num_classes:
                 percentage = (count / total_voxels) * 100
@@ -1344,6 +1724,9 @@ def train_3d_unet_memory_efficient_v2(
                 print(
                     f"  Class {class_id}: {count:,} voxels ({percentage:.2f}%), weight: {weight:.3f}"
                 )
+
+        # Clean up temporary data
+        del all_train_labels, train_labels_flat
     else:
         class_weights_tensor = None
         print("Using unweighted loss (no class balancing)")
@@ -1354,33 +1737,110 @@ def train_3d_unet_memory_efficient_v2(
     model_info = get_current_model_info()
     current_output_channels = model_info["output_channels"]
 
-    print(
-        f"Using {current_output_channels} input channels for 3D UNet (from .dinov3 {model_info['model_id']})"
-    )
+    # Context fusion setup
+    use_context_fusion = data_loader_3d.has_context
+    if use_context_fusion:
+        print(f"✓ Context fusion ENABLED: Using attention-based multi-scale fusion")
+        print(
+            f"  - Raw features: {current_output_channels} channels from {model_info['model_id']}"
+        )
+        print(
+            f"  - Context features: {current_output_channels} channels at {data_loader_3d.context_scale}nm"
+        )
+        print(
+            f"  - Fusion: Context guides raw features via attention at skip connections"
+        )
+        model_input_channels = (
+            current_output_channels  # Only raw goes through main encoder
+        )
+        context_channels = current_output_channels  # Context processed separately
+    else:
+        print(
+            f"Using {current_output_channels} input channels for 3D UNet (from DINOv3 {model_info['model_id']})"
+        )
+        model_input_channels = current_output_channels
+        context_channels = None
 
     # Initialize 3D UNet
-    from models import DINOv3UNet3D
+    from .models import DINOv3UNet3D
+
+    # Calculate DINOv3 feature size if learning upsampling
+    dinov3_feature_size = None
+    if learn_upsampling:
+        # DINOv3 features are typically 1/16 of the slice size
+        slice_size = data_loader_3d.dinov3_slice_size
+        feature_spatial_size = slice_size // 16  # e.g., 896//16 = 56
+        dinov3_feature_size = (
+            data_loader_3d.target_volume_size[0],  # Keep depth dimension
+            feature_spatial_size,
+            feature_spatial_size,
+        )
 
     unet3d = DINOv3UNet3D(
-        input_channels=current_output_channels,
+        input_channels=model_input_channels,  # Raw feature channels
         num_classes=num_classes,
         base_channels=base_channels,
         input_size=data_loader_3d.target_volume_size,
+        use_half_precision=use_half_precision,
+        learn_upsampling=learn_upsampling,
+        dinov3_feature_size=dinov3_feature_size,
+        use_gradient_checkpointing=True,  # Enable gradient checkpointing for memory efficiency
+        use_context_fusion=use_context_fusion,  # Enable context fusion architecture
+        context_channels=context_channels
+        or current_output_channels,  # Context feature dimension
     ).to(device)
 
     print(
-        f"Using DINOv3UNet3D with {base_channels} base channels and {current_output_channels} input channels"
+        f"Using DINOv3UNet3D with {base_channels} base channels and {model_input_channels} input channels"
+    )
+    if use_context_fusion:
+        print(
+            f"  - Context fusion layers: 4 attention modules at encoder skip connections"
+        )
+
+    # Loss function setup with configurable loss type
+    from .losses import get_loss_function
+
+    # Prepare class weights if using weighted loss
+    loss_class_weights = None
+    if use_class_weighting and class_weights_tensor is not None:
+        loss_class_weights = class_weights_tensor
+
+    # Get loss function based on type
+    criterion = get_loss_function(
+        loss_type=loss_type,
+        class_weights=loss_class_weights,
+        gamma=focal_gamma,
+        focal_weight=focal_weight,
+        dice_weight=dice_weight,
+        dice_smooth=dice_smooth,
+        alpha=tversky_alpha,
+        beta=tversky_beta,
     )
 
-    # Loss and optimizer with class weighting
-    if use_class_weighting and class_weights_tensor is not None:
-        criterion = nn.CrossEntropyLoss(weight=class_weights_tensor)
-        print(
-            f"Using weighted CrossEntropyLoss with class weights: {class_weights_tensor.cpu().numpy()}"
-        )
-    else:
-        criterion = nn.CrossEntropyLoss()
-        print("Using standard CrossEntropyLoss")
+    # Print loss configuration
+    print(f"\nLoss Configuration:")
+    print(f"  - Loss type: {loss_type}")
+    if loss_type == "focal":
+        print(f"  - Focal gamma: {focal_gamma}")
+        if loss_class_weights is not None:
+            print(f"  - Class weights: {loss_class_weights.cpu().numpy()}")
+    elif loss_type == "focal_dice":
+        print(f"  - Focal gamma: {focal_gamma}")
+        print(f"  - Focal weight: {focal_weight}")
+        print(f"  - Dice weight: {dice_weight}")
+        print(f"  - Dice smooth: {dice_smooth}")
+        if loss_class_weights is not None:
+            print(f"  - Class weights: {loss_class_weights.cpu().numpy()}")
+    elif loss_type == "dice":
+        print(f"  - Dice smooth: {dice_smooth}")
+    elif loss_type == "tversky":
+        print(f"  - Tversky alpha (FP weight): {tversky_alpha}")
+        print(f"  - Tversky beta (FN weight): {tversky_beta}")
+        print(f"  - Dice smooth: {dice_smooth}")
+    elif loss_type == "weighted_ce":
+        if loss_class_weights is not None:
+            print(f"  - Class weights: {loss_class_weights.cpu().numpy()}")
 
     optimizer = optim.Adam(
         unet3d.parameters(), lr=learning_rate, weight_decay=weight_decay
@@ -1393,12 +1853,27 @@ def train_3d_unet_memory_efficient_v2(
     train_losses, val_losses = [], []
     train_accs, val_accs = [], []
     train_class_accs, val_class_accs = [], []
-    best_val_acc = 0.0
+    val_class_precisions, val_class_f1s, val_class_ious = [], [], []
+    best_mean_iou = 0.0  # Changed from best_val_acc to best_mean_iou
     epochs_without_improvement = 0
+
+    # Helper function to compute loss (handles both CE-based and Dice-based losses)
+    def compute_loss(criterion, logits, targets):
+        """
+        Compute loss, handling different loss function signatures.
+
+        Some losses (Dice, Focal+Dice, Tversky) need num_classes parameter.
+        """
+        if loss_type in ["dice", "focal_dice", "tversky"]:
+            return criterion(logits, targets, num_classes)
+        else:
+            return criterion(logits, targets)
 
     print(f"Starting memory-efficient 3D UNet training for up to {epochs} epochs...")
 
     for epoch in range(epochs):
+        epoch_start_time = time.time()
+
         # Training phase
         unet3d.train()
         epoch_train_loss = 0.0
@@ -1407,17 +1882,77 @@ def train_3d_unet_memory_efficient_v2(
         epoch_train_class_correct = np.zeros(num_classes)
         epoch_train_class_total = np.zeros(num_classes)
 
-        for batch_idx in range(batches_per_epoch):
+        # Progress bar for batches within epoch
+        batch_pbar = tqdm(
+            range(batches_per_epoch),
+            desc=f"Epoch {epoch+1}/{epochs} - Training",
+            leave=False,
+            ncols=100,
+            position=0,
+            dynamic_ncols=True,
+        )
+
+        for batch_idx in batch_pbar:
             # Sample new training volumes for this batch
-            train_volumes, train_gt_volumes = data_loader_3d.sample_training_batch(
-                volumes_per_batch
+            train_volumes, train_gt_volumes, train_masks, train_context = (
+                data_loader_3d.sample_training_batch(volumes_per_batch)
             )
 
-            # Extract DINOv3 features for 3D UNet
-            train_features = data_loader_3d.extract_dinov3_features_3d(
-                train_volumes, epoch, batch_idx
-            )
+            # TIMING: Start DINOv3 feature extraction
+            dinov3_start = time.time()
+
+            # Extract DINOv3 features (separate for proper context fusion)
+            if enable_detailed_timing:
+                train_features, train_context_features, detailed_timing = (
+                    data_loader_3d.extract_multi_scale_dinov3_features_3d(
+                        train_volumes,
+                        train_context,
+                        epoch,
+                        batch_idx,
+                        enable_detailed_timing=enable_detailed_timing,
+                    )
+                )
+            else:
+                train_features, train_context_features = (
+                    data_loader_3d.extract_multi_scale_dinov3_features_3d(
+                        train_volumes,
+                        train_context,
+                        epoch,
+                        batch_idx,
+                        enable_detailed_timing=enable_detailed_timing,
+                    )
+                )
+                detailed_timing = {}
+
+            # TIMING: End DINOv3 feature extraction
+            dinov3_end = time.time()
+            dinov3_time = dinov3_end - dinov3_start
+
             train_labels = torch.tensor(train_gt_volumes, dtype=torch.long).to(device)
+            train_masks_tensor = torch.tensor(train_masks, dtype=torch.float32).to(
+                device
+            )
+
+            # Debug: Print shapes for first batch of first epoch
+            if epoch == 0 and batch_idx == 0:
+                print(f"  DEBUG - Tensor shapes:")
+                print(f"    train_features: {train_features.shape}")
+                if train_context_features is not None:
+                    print(f"    train_context_features: {train_context_features.shape}")
+                print(f"    train_labels: {train_labels.shape}")
+                print(f"    train_masks_tensor: {train_masks_tensor.shape}")
+                print(
+                    f"    Mask min/max: {train_masks_tensor.min().item():.3f}/{train_masks_tensor.max().item():.3f}"
+                )
+                print(
+                    f"    Mask fraction valid: {train_masks_tensor.mean().item():.3f}"
+                )
+
+            # Check if masks are actually being used (not all 1s)
+            use_masks = not torch.all(train_masks_tensor == 1.0)
+
+            # TIMING: Start training step (UNet forward/backward)
+            training_start = time.time()
 
             # Training step
             optimizer.zero_grad()
@@ -1428,8 +1963,67 @@ def train_3d_unet_memory_efficient_v2(
                     device_type="cuda" if device.type == "cuda" else "cpu",
                     enabled=False,
                 ):  # Disable autocast for metric calculations
-                    logits = unet3d(train_features)
-                    loss = criterion(logits, train_labels)
+                    # Pass raw and context features separately for proper fusion
+                    logits = unet3d(
+                        train_features, context_features=train_context_features
+                    )
+
+                    # Debug: Print logits shape for first batch of first epoch
+                    if epoch == 0 and batch_idx == 0:
+                        print(f"    logits: {logits.shape}")
+                        print(
+                            f"    logits range: [{logits.min().item():.3f}, {logits.max().item():.3f}]"
+                        )
+                        # Check if logits sum to 1 (they shouldn't for raw logits)
+                        logits_sum = logits.sum(dim=1)  # Sum across class dimension
+                        print(
+                            f"    logits sum across classes: [{logits_sum.min().item():.3f}, {logits_sum.max().item():.3f}]"
+                        )
+                        # Show softmax probabilities for comparison
+                        probs = F.softmax(logits, dim=1)
+                        probs_sum = probs.sum(dim=1)
+                        print(
+                            f"    probabilities (after softmax) sum: [{probs_sum.min().item():.3f}, {probs_sum.max().item():.3f}]"
+                        )
+                        print(
+                            f"    probabilities range: [{probs.min().item():.3f}, {probs.max().item():.3f}]"
+                        )
+
+                    if use_masks:
+                        # Apply masks to loss calculation
+                        # For CE-based losses, we can use per-pixel masking
+                        if loss_type in ["ce", "weighted_ce", "focal"]:
+                            per_pixel_loss = F.cross_entropy(
+                                logits,
+                                train_labels,
+                                reduction="none",
+                                weight=loss_class_weights,
+                            )
+                            if loss_type == "focal":
+                                # Apply focal term
+                                p_t = torch.exp(-per_pixel_loss)
+                                focal_weight = (1 - p_t) ** focal_gamma
+                                per_pixel_loss = focal_weight * per_pixel_loss
+
+                            masked_loss = per_pixel_loss * train_masks_tensor
+                            loss = masked_loss.sum() / train_masks_tensor.sum()
+                        else:
+                            # For Dice-based losses, compute on full volume and weight the loss
+                            # This is an approximation; ideally Dice should only use masked regions
+                            loss_full = compute_loss(criterion, logits, train_labels)
+                            # Weight by fraction of valid voxels
+                            loss = loss_full
+
+                        # Debug: Print loss calculation details for first batch of first epoch
+                        if epoch == 0 and batch_idx == 0:
+                            print(f"    final loss: {loss.item():.4f}")
+                    else:
+                        # Use standard loss when no masking needed
+                        loss = compute_loss(criterion, logits, train_labels)
+
+                        # Debug: Print unmasked loss for first batch of first epoch
+                        if epoch == 0 and batch_idx == 0:
+                            print(f"    unmasked loss: {loss.item():.4f}")
 
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
@@ -1437,32 +2031,141 @@ def train_3d_unet_memory_efficient_v2(
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                logits = unet3d(train_features)
-                loss = criterion(logits, train_labels)
+                # Pass raw and context features separately for proper fusion
+                logits = unet3d(train_features, context_features=train_context_features)
+                if use_masks:
+                    # Apply masks to loss calculation
+                    if loss_type in ["ce", "weighted_ce", "focal"]:
+                        per_pixel_loss = F.cross_entropy(
+                            logits,
+                            train_labels,
+                            reduction="none",
+                            weight=loss_class_weights,
+                        )
+                        if loss_type == "focal":
+                            p_t = torch.exp(-per_pixel_loss)
+                            focal_weight = (1 - p_t) ** focal_gamma
+                            per_pixel_loss = focal_weight * per_pixel_loss
+
+                        masked_loss = per_pixel_loss * train_masks_tensor
+                        loss = masked_loss.sum() / train_masks_tensor.sum()
+                    else:
+                        loss_full = compute_loss(criterion, logits, train_labels)
+                        loss = loss_full
+                else:
+                    # Use standard loss when no masking needed
+                    loss = compute_loss(criterion, logits, train_labels)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(unet3d.parameters(), max_norm=1.0)
                 optimizer.step()
 
-            # Track metrics
+            # Clear GPU cache to prevent memory accumulation
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
+            # TIMING: End training step
+            training_end = time.time()
+            training_time = training_end - training_start
+
+            # Track metrics (conditional on mask usage)
             with autocast(
                 device_type="cuda" if device.type == "cuda" else "cpu", enabled=False
             ):  # Disable autocast for metric calculations
                 predictions = torch.argmax(logits.float(), dim=1)
-                correct = (predictions == train_labels).sum().item()
-                total = train_labels.numel()
+                if use_masks:
+                    # Only for masked regions
+                    train_mask_bool = train_masks_tensor.bool()
+                    correct = (
+                        ((predictions == train_labels) & train_mask_bool).sum().item()
+                    )
+                    total = train_masks_tensor.sum().item()
+                else:
+                    # All regions when no masking
+                    correct = (predictions == train_labels).sum().item()
+                    total = train_labels.numel()
 
             epoch_train_loss += loss.item() * total
             epoch_train_correct += correct
             epoch_train_total += total
 
-            # Track per-class accuracy
+            # Track per-class accuracy (conditional on mask usage)
             for class_id in range(num_classes):
-                class_mask = train_labels == class_id
+                if use_masks:
+                    # Only in masked regions
+                    train_mask_bool = train_masks_tensor.bool()
+                    class_mask = (train_labels == class_id) & train_mask_bool
+                else:
+                    # All regions when no masking
+                    class_mask = train_labels == class_id
+
                 if class_mask.sum() > 0:
                     class_correct = (predictions[class_mask] == class_id).sum().item()
                     class_total = class_mask.sum().item()
                     epoch_train_class_correct[class_id] += class_correct
                     epoch_train_class_total[class_id] += class_total
+
+            # TIMING: Print timing breakdown for this batch
+            total_batch_time = dinov3_time + training_time
+            dinov3_pct = (dinov3_time / total_batch_time) * 100
+            training_pct = (training_time / total_batch_time) * 100
+
+            # Print timing every 5 batches or on first batch
+            if (batch_idx % 5 == 0 or batch_idx == 0) and enable_detailed_timing:
+                tqdm.write(f"  Batch {batch_idx+1} Timing:")
+                tqdm.write(
+                    f"    DINOv3 extraction: {dinov3_time:.3f}s ({dinov3_pct:.1f}%)"
+                )
+                tqdm.write(
+                    f"    UNet training:      {training_time:.3f}s ({training_pct:.1f}%)"
+                )
+                tqdm.write(f"    Total batch time:   {total_batch_time:.3f}s")
+
+                # Print detailed DINOv3 timing breakdown if available
+                if "detailed_timing" in locals() and detailed_timing:
+                    tqdm.write(f"    DINOv3 Detailed Breakdown:")
+                    tqdm.write(
+                        f"      Slice upsampling:    {detailed_timing.get('total_upsampling_time', 0):.3f}s ({detailed_timing.get('upsampling_percentage', 0):.1f}%)"
+                    )
+                    tqdm.write(
+                        f"      Batch stacking:      {detailed_timing.get('total_stacking_time', 0):.3f}s ({detailed_timing.get('stacking_percentage', 0):.1f}%)"
+                    )
+                    tqdm.write(
+                        f"      DINOv3 inference:    {detailed_timing.get('total_dinov3_inference_time', 0):.3f}s ({detailed_timing.get('dinov3_inference_percentage', 0):.1f}%)"
+                    )
+                    tqdm.write(
+                        f"      Feature extraction:  {detailed_timing.get('total_feature_extraction_time', 0):.3f}s ({detailed_timing.get('feature_extraction_percentage', 0):.1f}%)"
+                    )
+                    tqdm.write(
+                        f"      Feature downsampling:{detailed_timing.get('total_downsampling_time', 0):.3f}s ({detailed_timing.get('downsampling_percentage', 0):.1f}%)"
+                    )
+                    tqdm.write(
+                        f"      Total slices processed: {detailed_timing.get('total_slices', 0)} in {detailed_timing.get('total_batches', 0)} batches"
+                    )
+
+            # Update progress bar with current metrics
+            current_loss = epoch_train_loss / max(epoch_train_total, 1)
+            current_acc = epoch_train_correct / max(epoch_train_total, 1)
+            batch_pbar.set_postfix(
+                {"Loss": f"{current_loss:.4f}", "Acc": f"{current_acc:.4f}"}
+            )
+
+            # Clear processed volumes from GPU memory after each batch
+            del train_features, train_labels, logits, predictions, train_masks_tensor
+            if train_context_features is not None:
+                del train_context_features
+            if "train_volumes" in locals():
+                del train_volumes, train_gt_volumes, train_masks
+            if "train_context" in locals() and train_context is not None:
+                del train_context
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
+        batch_pbar.close()
+        training_time = time.time() - epoch_start_time
+
+        # Clear all training-related GPU memory before validation
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
         # Average training metrics for this epoch
         train_loss = epoch_train_loss / epoch_train_total
@@ -1480,36 +2183,325 @@ def train_3d_unet_memory_efficient_v2(
             else:
                 train_class_acc.append(0.0)
 
-        # Validation phase (using fixed validation set)
+        # Validation phase with timing - VOLUME-BY-VOLUME for memory efficiency
+        # This approach processes each validation volume independently to avoid GPU memory spikes
+        val_start_time = time.time()
         unet3d.eval()
         with torch.no_grad():
-            if use_mixed_precision:
-                with autocast(device_type="cuda" if device.type == "cuda" else "cpu"):
-                    val_logits = unet3d(val_features)
-                    val_loss = criterion(val_logits, val_labels).item()
-            else:
-                val_logits = unet3d(val_features)
-                val_loss = criterion(val_logits, val_labels).item()
+            # Initialize validation metrics accumulators
+            val_total_loss = 0.0
+            val_total_correct = 0
+            val_total_voxels = 0
 
-            # Convert to float32 for metric calculations
-            val_predictions = torch.argmax(val_logits.float(), dim=1)
-            val_correct = (val_predictions == val_labels).sum().item()
-            val_total = val_labels.numel()
-            val_acc = val_correct / val_total
+            # Per-class metrics accumulators
+            val_class_true_positives = np.zeros(num_classes)
+            val_class_false_positives = np.zeros(num_classes)
+            val_class_false_negatives = np.zeros(num_classes)
+            val_class_total_gt = np.zeros(num_classes)  # For recall calculation
+            val_class_total_pred = np.zeros(num_classes)  # For precision calculation
 
-            # MISSING: Calculate per-class validation accuracies
-            val_class_acc = []
-            for class_id in range(num_classes):
-                class_mask = val_labels == class_id
-                if class_mask.sum() > 0:
-                    class_correct = (
-                        (val_predictions[class_mask] == class_id).sum().item()
+            # Initialize validation timing accumulators
+            total_val_dinov3_time = 0.0
+            total_val_inference_time = 0.0
+
+            # Process each validation volume independently
+            for vol_idx in range(len(val_volumes)):
+                # TIMING: Start DINOv3 validation feature extraction
+                val_dinov3_start = time.time()
+
+                # Extract features for single volume (keeps GPU memory minimal)
+                single_vol = np.array(
+                    [val_volumes[vol_idx]]
+                )  # Convert to numpy array with batch dimension
+
+                # Get context volume if available
+                single_context = None
+                if val_context is not None:
+                    single_context = np.array([val_context[vol_idx]])
+
+                # Extract features with detailed timing for first validation volume
+                if (
+                    vol_idx == 0
+                ):  # Only get detailed timing for first volume to avoid spam
+                    result = data_loader_3d.extract_multi_scale_dinov3_features_3d(
+                        single_vol,
+                        single_context,
+                        epoch=epoch,
+                        enable_detailed_timing=enable_detailed_timing,
                     )
-                    class_total = class_mask.sum().item()
-                    class_acc = class_correct / class_total
-                    val_class_acc.append(class_acc)
+                    if enable_detailed_timing:
+                        vol_features, vol_context_features, val_detailed_timing = result
+                    else:
+                        vol_features, vol_context_features = result
+                        val_detailed_timing = None
                 else:
-                    val_class_acc.append(0.0)
+                    vol_features, vol_context_features = (
+                        data_loader_3d.extract_multi_scale_dinov3_features_3d(
+                            single_vol, single_context, epoch=epoch
+                        )
+                    )
+
+                # TIMING: End DINOv3 validation feature extraction
+                val_dinov3_end = time.time()
+                val_dinov3_time = val_dinov3_end - val_dinov3_start
+
+                # Get ground truth and mask for this volume and move to GPU
+                vol_gt = (
+                    torch.tensor(val_gt_volumes[vol_idx], dtype=torch.long)
+                    .unsqueeze(0)
+                    .to(device)
+                )
+                vol_mask = (
+                    torch.tensor(val_masks[vol_idx], dtype=torch.float32)
+                    .unsqueeze(0)
+                    .to(device)
+                )
+
+                # Check if masks are actually being used (not all 1s)
+                use_vol_masks = not torch.all(vol_mask == 1.0)
+
+                # TIMING: Start validation inference
+                val_inference_start = time.time()
+
+                # Run inference on single volume
+                if use_mixed_precision:
+                    with autocast(
+                        device_type="cuda" if device.type == "cuda" else "cpu"
+                    ):
+                        # Pass raw and context features separately for proper fusion
+                        vol_logits = unet3d(
+                            vol_features, context_features=vol_context_features
+                        )
+                        if use_vol_masks:
+                            # Apply masks to validation loss calculation
+                            if loss_type in ["ce", "weighted_ce", "focal"]:
+                                vol_per_pixel_loss = F.cross_entropy(
+                                    vol_logits,
+                                    vol_gt,
+                                    reduction="none",
+                                    weight=loss_class_weights,
+                                )
+                                if loss_type == "focal":
+                                    p_t = torch.exp(-vol_per_pixel_loss)
+                                    focal_weight = (1 - p_t) ** focal_gamma
+                                    vol_per_pixel_loss = (
+                                        focal_weight * vol_per_pixel_loss
+                                    )
+
+                                vol_masked_loss = vol_per_pixel_loss * vol_mask
+                                vol_loss = (
+                                    vol_masked_loss.sum() / vol_mask.sum()
+                                ).item()
+                            else:
+                                vol_loss = compute_loss(
+                                    criterion, vol_logits, vol_gt
+                                ).item()
+                        else:
+                            # Use standard loss when no masking needed
+                            vol_loss = compute_loss(
+                                criterion, vol_logits, vol_gt
+                            ).item()
+                else:
+                    # Pass raw and context features separately for proper fusion
+                    vol_logits = unet3d(
+                        vol_features, context_features=vol_context_features
+                    )
+                    if use_vol_masks:
+                        # Apply masks to validation loss calculation
+                        if loss_type in ["ce", "weighted_ce", "focal"]:
+                            vol_per_pixel_loss = F.cross_entropy(
+                                vol_logits,
+                                vol_gt,
+                                reduction="none",
+                                weight=loss_class_weights,
+                            )
+                            if loss_type == "focal":
+                                p_t = torch.exp(-vol_per_pixel_loss)
+                                focal_weight = (1 - p_t) ** focal_gamma
+                                vol_per_pixel_loss = focal_weight * vol_per_pixel_loss
+
+                            vol_masked_loss = vol_per_pixel_loss * vol_mask
+                            vol_loss = (vol_masked_loss.sum() / vol_mask.sum()).item()
+                        else:
+                            vol_loss = compute_loss(
+                                criterion, vol_logits, vol_gt
+                            ).item()
+                    else:
+                        # Use standard loss when no masking needed
+                        vol_loss = compute_loss(criterion, vol_logits, vol_gt).item()
+
+                # TIMING: End validation inference
+                val_inference_end = time.time()
+                val_inference_time = val_inference_end - val_inference_start
+
+                # Accumulate validation timing
+                total_val_dinov3_time += val_dinov3_time
+                total_val_inference_time += val_inference_time
+
+                # Convert to predictions
+                vol_predictions = torch.argmax(vol_logits.float(), dim=1)
+
+                # Accumulate basic metrics (conditional on mask usage)
+                if use_vol_masks:
+                    # Only for masked regions
+                    vol_mask_bool = vol_mask.bool()
+                    vol_correct = (
+                        ((vol_predictions == vol_gt) & vol_mask_bool).sum().item()
+                    )
+                    vol_valid_voxels = vol_mask.sum().item()
+                else:
+                    # All regions when no masking
+                    vol_correct = (vol_predictions == vol_gt).sum().item()
+                    vol_valid_voxels = vol_gt.numel()
+
+                val_total_loss += vol_loss * vol_valid_voxels
+                val_total_correct += vol_correct
+                val_total_voxels += vol_valid_voxels
+
+                # Accumulate per-class metrics (convert to CPU for efficiency, conditional on mask usage)
+                vol_gt_cpu = vol_gt.cpu().numpy()
+                vol_pred_cpu = vol_predictions.cpu().numpy()
+
+                if use_vol_masks:
+                    vol_mask_cpu = vol_mask.cpu().numpy().astype(bool)
+                else:
+                    # Create a full mask when no masking is needed
+                    vol_mask_cpu = np.ones_like(vol_gt_cpu, dtype=bool)
+
+                for class_id in range(num_classes):
+                    # For confusion matrix, we need to consider the valid region
+                    valid_gt_mask = (vol_gt_cpu == class_id) & vol_mask_cpu
+                    valid_not_gt_mask = (vol_gt_cpu != class_id) & vol_mask_cpu
+                    valid_pred_mask = (vol_pred_cpu == class_id) & vol_mask_cpu
+
+                    # Confusion matrix components (only in valid regions)
+                    true_positives = np.sum(valid_gt_mask & valid_pred_mask)
+                    false_positives = np.sum(valid_not_gt_mask & valid_pred_mask)
+                    false_negatives = np.sum(valid_gt_mask & ~valid_pred_mask)
+
+                    # Accumulate
+                    val_class_true_positives[class_id] += true_positives
+                    val_class_false_positives[class_id] += false_positives
+                    val_class_false_negatives[class_id] += false_negatives
+                    val_class_total_gt[class_id] += np.sum(valid_gt_mask)
+                    val_class_total_pred[class_id] += np.sum(valid_pred_mask)
+
+                # Immediately free GPU memory for this volume
+                del vol_features, vol_logits, vol_predictions, vol_gt, vol_mask
+                if vol_context_features is not None:
+                    del vol_context_features
+                if "single_vol" in locals():
+                    del single_vol
+                if "single_context" in locals() and single_context is not None:
+                    del single_context
+
+                # Clear GPU cache after each volume
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+
+            # Calculate final validation metrics from accumulated values
+            val_loss = val_total_loss / val_total_voxels
+            val_acc = val_total_correct / val_total_voxels
+
+            # TIMING: Print validation timing summary
+            total_val_time = total_val_dinov3_time + total_val_inference_time
+            val_dinov3_pct = (
+                (total_val_dinov3_time / total_val_time) * 100
+                if total_val_time > 0
+                else 0
+            )
+            val_inference_pct = (
+                (total_val_inference_time / total_val_time) * 100
+                if total_val_time > 0
+                else 0
+            )
+            avg_val_dinov3_time = (
+                total_val_dinov3_time / len(val_volumes) if len(val_volumes) > 0 else 0
+            )
+            avg_val_inference_time = (
+                total_val_inference_time / len(val_volumes)
+                if len(val_volumes) > 0
+                else 0
+            )
+
+            print(f"\n  Validation Timing Summary ({len(val_volumes)} volumes):")
+            print(
+                f"    Total DINOv3 extraction: {total_val_dinov3_time:.3f}s ({val_dinov3_pct:.1f}%) - Avg: {avg_val_dinov3_time:.3f}s/vol"
+            )
+            print(
+                f"    Total UNet inference:     {total_val_inference_time:.3f}s ({val_inference_pct:.1f}%) - Avg: {avg_val_inference_time:.3f}s/vol"
+            )
+            print(f"    Total validation time:    {total_val_time:.3f}s")
+
+            # Print detailed DINOv3 breakdown if available (from first validation volume)
+            if "val_detailed_timing" in locals() and val_detailed_timing:
+                print(f"    DINOv3 Detailed Breakdown (first volume):")
+                print(
+                    f"      Slice upsampling:    {val_detailed_timing.get('total_upsampling_time', 0):.3f}s ({val_detailed_timing.get('upsampling_percentage', 0):.1f}%)"
+                )
+                print(
+                    f"      Batch stacking:      {val_detailed_timing.get('total_stacking_time', 0):.3f}s ({val_detailed_timing.get('stacking_percentage', 0):.1f}%)"
+                )
+                print(
+                    f"      DINOv3 inference:    {val_detailed_timing.get('total_dinov3_inference_time', 0):.3f}s ({val_detailed_timing.get('dinov3_inference_percentage', 0):.1f}%)"
+                )
+                print(
+                    f"      Feature extraction:  {val_detailed_timing.get('total_feature_extraction_time', 0):.3f}s ({val_detailed_timing.get('feature_extraction_percentage', 0):.1f}%)"
+                )
+                print(
+                    f"      Feature downsampling:{val_detailed_timing.get('total_downsampling_time', 0):.3f}s ({val_detailed_timing.get('downsampling_percentage', 0):.1f}%)"
+                )
+                print(
+                    f"      Total slices processed: {val_detailed_timing.get('total_slices', 0)} in {val_detailed_timing.get('total_batches', 0)} batches"
+                )
+
+            # Calculate comprehensive per-class validation metrics
+            val_class_acc = []  # Recall/Sensitivity
+            val_class_precision = []
+            val_class_f1 = []
+            val_class_iou = []
+
+            for class_id in range(num_classes):
+                tp = val_class_true_positives[class_id]
+                fp = val_class_false_positives[class_id]
+                fn = val_class_false_negatives[class_id]
+
+                # Recall (Sensitivity) = TP / (TP + FN)
+                if val_class_total_gt[class_id] > 0:
+                    recall = tp / val_class_total_gt[class_id]
+                else:
+                    recall = 0.0
+
+                # Precision = TP / (TP + FP)
+                if val_class_total_pred[class_id] > 0:
+                    precision = tp / val_class_total_pred[class_id]
+                else:
+                    precision = 0.0
+
+                # F1-Score = 2 * (Precision * Recall) / (Precision + Recall)
+                if precision + recall > 0:
+                    f1 = 2 * (precision * recall) / (precision + recall)
+                else:
+                    f1 = 0.0
+
+                # IoU (Intersection over Union) = TP / (TP + FP + FN)
+                union = tp + fp + fn
+                if union > 0:
+                    iou = tp / union
+                else:
+                    iou = 0.0
+
+                val_class_acc.append(recall)
+                val_class_precision.append(precision)
+                val_class_f1.append(f1)
+                val_class_iou.append(iou)
+
+        val_time = time.time() - val_start_time
+        total_epoch_time = time.time() - epoch_start_time
+
+        # Clear all validation-related GPU memory after validation phase
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
         # Record metrics
         train_losses.append(train_loss)
@@ -1517,49 +2509,71 @@ def train_3d_unet_memory_efficient_v2(
         train_accs.append(train_acc)
         val_accs.append(val_acc)
         train_class_accs.append(train_class_acc)
-        val_class_accs.append(val_class_acc)  # This line should now work
+        val_class_accs.append(val_class_acc)
+        val_class_precisions.append(val_class_precision)
+        val_class_f1s.append(val_class_f1)
+        val_class_ious.append(val_class_iou)
+
+        # Calculate mean IoU for both scheduler and best model selection
+        current_mean_iou = np.mean(val_class_iou)
 
         # Learning rate scheduling
         old_lr = optimizer.param_groups[0]["lr"]
-        scheduler.step(val_acc)
+        scheduler.step(current_mean_iou)
         new_lr = optimizer.param_groups[0]["lr"]
 
-        # Check if this is the best validation accuracy so far
+        # Check if this is the best mean IoU so far
         is_best_model = False
-        if val_acc > best_val_acc + min_delta:
-            best_val_acc = val_acc
+        if current_mean_iou > best_mean_iou + min_delta:
+            best_mean_iou = current_mean_iou
             epochs_without_improvement = 0
             is_best_model = True
         else:
             epochs_without_improvement += 1
 
-        # Print progress every epoch
+        # Print progress every epoch with timing
         current_lr = optimizer.param_groups[0]["lr"]
-        print(f"Epoch {epoch+1}/{epochs}")
+        print(
+            f"Epoch {epoch+1}/{epochs} - Time: {total_epoch_time:.1f}s (Train: {training_time:.1f}s, Val: {val_time:.1f}s)"
+        )
         print(
             f"  Train: Loss={train_loss:.4f}, Acc={train_acc:.4f} (from {epoch_train_total} voxels)"
         )
-        print(f"  Val:   Loss={val_loss:.4f}, Acc={val_acc:.4f}")
-
-        # Print per-class accuracies
         print(
-            f"  Train Class Accs: ["
-            + ", ".join([f"{acc:.3f}" for acc in train_class_acc])
-            + "]"
-        )
-        print(
-            f"  Val Class Accs:   ["
-            + ", ".join([f"{acc:.3f}" for acc in val_class_acc])
-            + "]"
+            f"  Val:   Loss={val_loss:.4f}, IoU={current_mean_iou:.4f}, Acc={val_acc:.4f}"
         )
 
-        print(f"  Best Val Acc: {best_val_acc:.4f}, LR: {current_lr:.6f}")
+        # Print comprehensive per-class metrics in a nice table
+        train_class_percentages = [
+            count / epoch_train_total * 100 for count in epoch_train_class_total
+        ]
+        val_class_counts = val_class_total_gt  # Use the counts we already calculated
+        val_class_percentages = [
+            count / val_total_voxels * 100 for count in val_class_counts
+        ]
+
+        print_class_metrics_table(
+            class_names=class_names,
+            train_recall=train_class_acc,
+            train_dist=train_class_percentages,
+            val_recall=val_class_acc,
+            val_precision=val_class_precision,
+            val_f1=val_class_f1,
+            val_iou=val_class_iou,
+            val_dist=val_class_percentages,
+        )
+
+        print(f"  Mean IoU: {current_mean_iou:.4f}")
+
+        print(f"  Best Mean IoU: {best_mean_iou:.4f}, LR: {current_lr:.6f}")
         print(f"  Epochs without improvement: {epochs_without_improvement}")
         if new_lr < old_lr:
             print(f"  Learning rate reduced: {old_lr:.6f} -> {new_lr:.6f}")
 
         # Save checkpoints
         if save_checkpoints:
+            # For backward compatibility with checkpoint system, alias the best metric
+            best_val_acc = best_mean_iou
             stats_data = {
                 "epoch": epoch + 1,
                 "train_losses": train_losses,
@@ -1584,11 +2598,51 @@ def train_3d_unet_memory_efficient_v2(
                     "base_channels": base_channels,
                     "volumes_per_batch": volumes_per_batch,
                     "batches_per_epoch": batches_per_epoch,
+                    "epochs": epochs,  # Add total epochs
                     "model_type": "dinov3_unet3d",
                     "model_id": model_id,
                     "input_channels": current_output_channels,
                     "use_class_weighting": use_class_weighting,
                     "target_volume_size": data_loader_3d.target_volume_size,
+                    "dinov3_slice_size": data_loader_3d.dinov3_slice_size,
+                    "image_size": data_loader_3d.dinov3_slice_size,  # For DINOv3 initialization
+                    "seed": data_loader_3d.seed,  # Add seed
+                    "use_mixed_precision": use_mixed_precision,  # Add memory efficiency params
+                    "use_half_precision": use_half_precision,
+                    "use_gradient_checkpointing": use_gradient_checkpointing,
+                    "memory_efficient_mode": memory_efficient_mode,
+                    "learn_upsampling": learn_upsampling,  # Add upsampling mode
+                    "use_orthogonal_planes": data_loader_3d.use_orthogonal_planes,  # Add orthogonal planes setting
+                    "train_volume_pool_size": data_loader_3d.train_volume_pool_size,
+                    "val_volume_pool_size": data_loader_3d.val_volume_pool_size,
+                    "checkpoint_every_n_epochs": checkpoint_every_n_epochs,  # Add checkpoint frequency
+                    "enable_detailed_timing": enable_detailed_timing,  # Add timing control
+                    # Data resolution parameters
+                    "min_resolution_for_raw": min_resolution_for_raw,  # Add raw data resolution
+                    "base_resolution": base_resolution,  # Add ground truth resolution
+                    # Additional data loader parameters
+                    "dinov3_stride": getattr(
+                        data_loader_3d, "dinov3_stride", None
+                    ),  # Add DINOv3 stride if available
+                    "verbose": getattr(
+                        data_loader_3d, "verbose", True
+                    ),  # Add verbose setting
+                },
+                "model_config": {
+                    "num_classes": num_classes,
+                    "base_channels": base_channels,
+                    "input_size": data_loader_3d.target_volume_size,  # 3D volume size
+                    "input_channels": current_output_channels,
+                    "model_id": model_id,
+                    "model_type": "dinov3_unet3d",
+                    "dinov3_slice_size": data_loader_3d.dinov3_slice_size,
+                    "learn_upsampling": learn_upsampling,  # Add upsampling mode to model config
+                    "use_orthogonal_planes": data_loader_3d.use_orthogonal_planes,  # Add orthogonal planes
+                    "use_half_precision": use_half_precision,  # Add precision settings
+                    "use_gradient_checkpointing": use_gradient_checkpointing,
+                    # Data resolution parameters for model recreation
+                    "min_resolution_for_raw": min_resolution_for_raw,
+                    "base_resolution": base_resolution,
                 },
             }
 
@@ -1602,7 +2656,7 @@ def train_3d_unet_memory_efficient_v2(
             with open(latest_stats_path, "wb") as f:
                 pickle.dump(stats_data, f)
 
-            # Only save full model checkpoint if this is the best performance
+            # Save full model checkpoint if this is the best performance
             if is_best_model:
                 checkpoint_data = {
                     **stats_data,
@@ -1615,11 +2669,39 @@ def train_3d_unet_memory_efficient_v2(
                 with open(best_path, "wb") as f:
                     pickle.dump(checkpoint_data, f)
 
-                print(f"  *** NEW BEST 3D MODEL SAVED: {val_acc:.4f} ***")
+                print(
+                    f"  *** NEW BEST 3D MODEL SAVED: IoU={current_mean_iou:.4f} (Acc={val_acc:.4f}) ***"
+                )
+
+            # Also save model checkpoint every N epochs if specified
+            elif (
+                checkpoint_every_n_epochs is not None
+                and (epoch + 1) % checkpoint_every_n_epochs == 0
+            ):
+                checkpoint_data = {
+                    **stats_data,
+                    "unet3d_state_dict": unet3d.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
+                }
+
+                epoch_path = os.path.join(
+                    checkpoint_dir, f"checkpoint_epoch_{epoch+1:04d}.pkl"
+                )
+                with open(epoch_path, "wb") as f:
+                    pickle.dump(checkpoint_data, f)
+
+                print(
+                    f"  *** PERIODIC CHECKPOINT SAVED: Epoch {epoch+1} (IoU={current_mean_iou:.4f}) ***"
+                )
 
             print(f"  Stats saved: {os.path.basename(stats_path)}")
 
         print()
+
+        # Final GPU cleanup at end of epoch to ensure fresh start for next epoch
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
         # Early stopping
         if epochs_without_improvement >= patience:
@@ -1636,7 +2718,10 @@ def train_3d_unet_memory_efficient_v2(
         "val_accs": val_accs,
         "train_class_accs": train_class_accs,
         "val_class_accs": val_class_accs,
-        "best_val_acc": best_val_acc,
+        "val_class_precisions": val_class_precisions,
+        "val_class_f1s": val_class_f1s,
+        "val_class_ious": val_class_ious,
+        "best_mean_iou": best_mean_iou,
         "epochs_trained": len(train_losses),
         "checkpoint_dir": checkpoint_dir,
         "export_base_dir": export_base_dir,
@@ -1872,9 +2957,13 @@ def train_3d_unet_memory_efficient(
 def train_3d_unet_with_memory_efficient_loader(
     raw_data,
     gt_data,
+    gt_masks=None,  # NEW PARAMETER for GT extension masks
+    context_data=None,  # NEW PARAMETER for context volumes at lower resolution
+    context_scale=None,  # NEW PARAMETER for context resolution (e.g., 8 for 8nm)
     train_volume_pool_size=20,
     val_volume_pool_size=5,
     num_classes=None,
+    class_names=None,  # NEW PARAMETER for class names (e.g., ['background', 'nuc', 'mito', 'er'])
     target_volume_size=(64, 64, 64),
     volumes_per_batch=1,
     batches_per_epoch=10,
@@ -1890,15 +2979,54 @@ def train_3d_unet_with_memory_efficient_loader(
     model_id=None,
     export_base_dir=None,
     save_checkpoints=True,
+    checkpoint_every_n_epochs=None,  # Save model checkpoint every N epochs (in addition to best)
     use_class_weighting=True,
     # NEW MEMORY EFFICIENCY PARAMETERS
     use_mixed_precision=True,
     use_half_precision=False,
     use_gradient_checkpointing=False,
     memory_efficient_mode="auto",  # "auto", "aggressive", "conservative"
+    learn_upsampling=False,  # NEW PARAMETER
+    dinov3_stride=None,  # NEW PARAMETER for sliding window inference
+    use_orthogonal_planes=False,  # NEW PARAMETER for orthogonal plane processing
+    enable_detailed_timing=True,  # NEW PARAMETER for detailed timing
+    verbose=True,  # NEW PARAMETER to control verbose output
+    # DATA RESOLUTION PARAMETERS
+    min_resolution_for_raw=None,  # NEW PARAMETER for raw data resolution
+    base_resolution=None,  # NEW PARAMETER for ground truth resolution
+    # LOSS FUNCTION PARAMETERS
+    loss_type="weighted_ce",  # 'ce', 'weighted_ce', 'focal', 'dice', 'focal_dice', 'tversky'
+    focal_gamma=2.0,  # Focusing parameter for Focal Loss
+    focal_weight=0.5,  # Weight for focal component in combined loss
+    dice_weight=0.5,  # Weight for dice component in combined loss
+    dice_smooth=1.0,  # Smoothing for Dice loss
+    tversky_alpha=0.5,  # Tversky alpha (FP weight)
+    tversky_beta=0.5,  # Tversky beta (FN weight)
 ):
     """
     Memory-efficient 3D UNet training with multiple precision and memory optimization options.
+
+    Parameters:
+    -----------
+    gt_masks : numpy.ndarray, optional
+        Binary masks indicating valid ground truth regions (1) vs extended regions (0).
+        Shape must match gt_data. Used for GT extension functionality where raw volumes
+        extend beyond ground truth boundaries. If None, all regions are treated as valid.
+    checkpoint_every_n_epochs : int, optional
+        Save full model checkpoint every N epochs, regardless of performance.
+        In addition to always saving the best model, this allows periodic backups.
+        If None (default), only saves the best model and training statistics every epoch.
+        Example: checkpoint_every_n_epochs=10 saves model every 10 epochs.
+    dinov3_stride : int, optional
+        Stride for DINOv3 sliding window inference. If None, uses patch_size (16) for standard inference.
+        Use smaller values (e.g., 8, 4) for higher resolution features at the cost of increased computation:
+        - stride=8: 4x more features, 4x slower
+        - stride=4: 16x more features, 16x slower
+        Best used with learn_upsampling=True to avoid downsampling high-res features.
+    use_orthogonal_planes : bool, optional
+        Whether to use orthogonal plane processing (XY, XZ, YZ slices) for more comprehensive 3D features.
+        When True, processes slices in all three orientations and averages the features.
+        Default is False (standard Z-slice only processing).
     """
 
     # Auto-detect best memory settings
@@ -1939,10 +3067,42 @@ def train_3d_unet_with_memory_efficient_loader(
     print(f"  - Gradient checkpointing: {use_gradient_checkpointing}")
     print(f"  - Adjusted base channels: {base_channels}")
     print(f"  - Volumes per batch: {volumes_per_batch}")
+    # Auto-detect number of classes if not provided
+    if num_classes is None:
+        unique_classes = np.unique(gt_data)
+        num_classes = len(unique_classes)
+        print(
+            f"Auto-detected {num_classes} classes from ground truth data: {unique_classes}"
+        )
+
+    # Generate default class names if not provided
+    if class_names is None:
+        if num_classes == 2:
+            class_names = ["background", "foreground"]
+        else:
+            class_names = ["background"] + [f"class_{i}" for i in range(1, num_classes)]
+        print(f"Generated default class names: {class_names}")
+    else:
+        # Validate class names
+        if len(class_names) != num_classes:
+            print(
+                f"WARNING: Number of class names ({len(class_names)}) doesn't match num_classes ({num_classes})"
+            )
+            print(f"  Provided names: {class_names}")
+            # Adjust class_names to match num_classes
+            if len(class_names) < num_classes:
+                class_names = class_names + [
+                    f"class_{i}" for i in range(len(class_names), num_classes)
+                ]
+            else:
+                class_names = class_names[:num_classes]
+            print(f"  Adjusted names: {class_names}")
+
     print(f"Setting up memory-efficient 3D UNet training:")
     print(f"  Raw data shape: {raw_data.shape}")
     print(f"  GT data shape: {gt_data.shape}")
     print(f"  Number of classes: {num_classes}")
+    print(f"  Classes in data: {np.unique(gt_data)}")
     print(f"  Target volume size: {target_volume_size}")
     print(f"  Training volume pool: {train_volume_pool_size}")
     print(f"  Validation volumes: {val_volume_pool_size}")
@@ -1955,6 +3115,8 @@ def train_3d_unet_with_memory_efficient_loader(
     print(f"  Model ID: {model_id}")
     print(f"  Export directory: {export_base_dir}")
     print(f"  Save checkpoints: {save_checkpoints}")
+    if save_checkpoints and checkpoint_every_n_epochs is not None:
+        print(f"  Periodic checkpoint saving: Every {checkpoint_every_n_epochs} epochs")
     print(f"  Use class weighting: {use_class_weighting}")
     print()
 
@@ -1964,10 +3126,37 @@ def train_3d_unet_with_memory_efficient_loader(
             f"Need at least {val_volume_pool_size + 2} volumes for training"
         )
 
-    if raw_data.shape != gt_data.shape:
+    # Validate shapes with multi-resolution support
+    if raw_data.shape[0] != gt_data.shape[0]:
         raise ValueError(
-            f"Raw and GT data shapes must match: {raw_data.shape} vs {gt_data.shape}"
+            f"Number of volumes must match: {raw_data.shape[0]} vs {gt_data.shape[0]}"
         )
+
+    # For multi-resolution training, we allow different spatial dimensions
+    # The raw data (high-res) and GT data (base-res) can have different sizes
+    raw_shape = raw_data.shape[1:]  # (D, H, W)
+    gt_shape = gt_data.shape[1:]  # (D, H, W)
+
+    if raw_shape == gt_shape:
+        print(f"✓ Same resolution: Raw and GT shapes match {raw_data.shape}")
+        resolution_mode = "same"
+    else:
+        print(f"✓ Multi-resolution training: Raw {raw_shape} vs GT {gt_shape}")
+        resolution_mode = "multi"
+
+        # Validate that dimensions are reasonable multiples/factors
+        # This helps catch obvious mistakes while allowing intentional multi-resolution
+        for dim_name, (raw_dim, gt_dim) in zip(
+            ["D", "H", "W"], zip(raw_shape, gt_shape)
+        ):
+            ratio = raw_dim / gt_dim
+            if ratio < 0.25 or ratio > 8.0:  # Allow 4x smaller to 8x larger
+                print(
+                    f"Warning: {dim_name} dimension ratio ({ratio:.2f}) is quite extreme"
+                )
+
+        print(f"  - Raw data will be processed at {raw_shape} resolution")
+        print(f"  - Features will be downsampled to match GT at {gt_shape} resolution")
 
     if len(raw_data.shape) != 4:
         raise ValueError(
@@ -1979,12 +3168,19 @@ def train_3d_unet_with_memory_efficient_loader(
     data_loader_3d = MemoryEfficientDataLoader3D(
         raw_data=raw_data,
         gt_data=gt_data,
+        gt_masks=gt_masks,  # NEW: GT extension masks
+        context_data=context_data,  # NEW: Context volumes for spatial context
+        context_scale=context_scale,  # NEW: Context resolution in nm
         train_volume_pool_size=train_volume_pool_size,
         val_volume_pool_size=val_volume_pool_size,
         target_volume_size=target_volume_size,
         dinov3_slice_size=dinov3_slice_size,
         seed=seed,
         model_id=model_id,
+        learn_upsampling=learn_upsampling,
+        dinov3_stride=dinov3_stride,  # NEW: Sliding window parameter
+        use_orthogonal_planes=use_orthogonal_planes,  # NEW: Orthogonal planes parameter
+        verbose=verbose,  # NEW: Verbose output parameter
     )
 
     print("Data loader created successfully!")
@@ -2005,10 +3201,27 @@ def train_3d_unet_with_memory_efficient_loader(
         volumes_per_batch=volumes_per_batch,
         batches_per_epoch=batches_per_epoch,
         save_checkpoints=save_checkpoints,
+        checkpoint_every_n_epochs=checkpoint_every_n_epochs,
         model_id=model_id,
         export_base_dir=export_base_dir,
         use_class_weighting=use_class_weighting,
         use_mixed_precision=use_mixed_precision,  # Pass through
+        use_half_precision=use_half_precision,  # Pass through additional params
+        use_gradient_checkpointing=use_gradient_checkpointing,
+        memory_efficient_mode=memory_efficient_mode,
+        learn_upsampling=learn_upsampling,  # Pass through new parameter
+        enable_detailed_timing=enable_detailed_timing,  # Pass through new parameter
+        min_resolution_for_raw=min_resolution_for_raw,  # Pass through data resolution parameters
+        base_resolution=base_resolution,
+        class_names=class_names,  # Pass through class names
+        # Pass through loss function parameters
+        loss_type=loss_type,
+        focal_gamma=focal_gamma,
+        focal_weight=focal_weight,
+        dice_weight=dice_weight,
+        dice_smooth=dice_smooth,
+        tversky_alpha=tversky_alpha,
+        tversky_beta=tversky_beta,
     )
 
     print(f"\n3D UNet training completed!")

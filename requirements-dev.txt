@@ -1,0 +1,19 @@
+# # Development dependencies for dinov3_playground
+# -r requirements.txt
+
+# # Testing
+# pytest
+# pytest-cov
+
+# # Code formatting and linting
+# black
+# flake8
+# isort
+
+# # Documentation
+# sphinx
+# sphinx-rtd-theme
+
+# # Jupyter notebook support (optional)
+# jupyter
+# ipykernel

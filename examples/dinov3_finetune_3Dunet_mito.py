@@ -17,13 +17,9 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 import torch
-import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
-from datetime import datetime
 
-from funlib.geometry import Coordinate, Roi
-from cellmap_flow.image_data_interface import ImageDataInterface
 
 # Import all modularized functions
 from dinov3_playground import (
@@ -44,31 +40,22 @@ reload(visualization)
 reload(memory_efficient_training)
 
 from dinov3_playground.memory_efficient_training import (
-    MemoryEfficientDataLoader,
     MemoryEfficientDataLoader3D,
-    train_unet_memory_efficient,
-    train_3d_unet_with_memory_efficient_loader,  # Updated import
-    load_checkpoint,
-    list_checkpoints,
+    train_3d_unet_with_memory_efficient_loader,  # Updated import,
 )
 
-from dinov3_playground.dinov3_core import enable_amp_inference, process, output_channels
+from dinov3_playground.dinov3_core import process
 
 from dinov3_playground.data_processing import (
-    load_random_training_data,
     load_random_3d_training_data,
-    get_example_dataset_pairs,
-    sample_training_data,
 )
 
 from dinov3_playground.models import (
     DINOv3UNet3D,
     DINOv3UNet3DPipeline,
-    create_model,
     print_model_summary,
 )
 
-from dinov3_playground.visualization import plot_training_history
 
 from dinov3_playground import (
     initialize_dinov3,
@@ -82,7 +69,7 @@ print("DINOV3 3D UNET TRAINING PIPELINE")
 print("=" * 60)
 
 # Model configuration
-MODEL_ID = "facebook/dinov3-vitl16-pretrain-sat493m"
+MODEL_ID = "facebook/dinov3-vitl16-pretrain-lvd1689m"
 IMAGE_SIZE = 128 * 4
 
 # 3D UNet specific configuration
@@ -419,7 +406,7 @@ print("Training 3D UNet with memory-efficient loader...")
 training_results = train_3d_unet_with_memory_efficient_loader(
     raw_data=raw,
     gt_data=gt,
-    train_volume_pool_size=15,  # Use 15 volumes for training pool
+    train_volume_pool_size=95,  # Use 95 volumes for training pool
     val_volume_pool_size=5,  # Use 5 volumes for validation
     num_classes=2,  # Binary classification (background/mitochondria)
     target_volume_size=VOLUME_SIZE,  # Target 3D volume size

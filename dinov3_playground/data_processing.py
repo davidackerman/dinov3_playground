@@ -17,6 +17,8 @@ import random
 from funlib.geometry import Roi
 from cellmap_flow.image_data_interface import ImageDataInterface
 import warnings  # Add this import at the top
+from funlib.geometry import Coordinate
+import numpy as np
 
 
 def apply_augmentation(raw_patch, gt_patch):
@@ -630,8 +632,17 @@ def _sample_single_orientation(
 
         # try:
         # Initialize data interfaces
-        raw_idi = ImageDataInterface(raw_path, output_voxel_size=3 * [base_resolution])
-        gt_idi = ImageDataInterface(gt_path, output_voxel_size=3 * [base_resolution])
+        raw_idi = ImageDataInterface(
+            raw_path,
+            output_voxel_size=3 * [base_resolution],
+            force_pseudo_isotropic=True,
+        )
+        gt_idi = ImageDataInterface(
+            gt_path,
+            output_voxel_size=3 * [base_resolution],
+            force_pseudo_isotropic=True,
+            is_segmentation=True,
+        )
 
         # Get bounds
         raw_begin = np.array(raw_idi.roi.begin)
@@ -882,28 +893,150 @@ def get_example_dataset_pairs():
     """
     Example dataset pairs for testing. Replace with your actual dataset paths.
 
+    Supports both legacy tuple format and new dictionary format for multiple classes.
+
     Returns:
     --------
-    list: List of (raw_path, gt_path) tuples
+    list: List of dictionaries with keys "raw" and any class names (e.g., "nuc", "mito", "vesicles")
+          OR list of (raw_path, gt_path) tuples for backward compatibility
     """
+    # New format supporting multiple classes with descriptive names
     dataset_pairs = [
-        # Dataset 1
-        (
-            "/nrs/cellmap/data/jrc_22ak351-leaf-3mb/jrc_22ak351-leaf-3mb.zarr/recon-1/em/fibsem-uint8/s3",
-            "/groups/cellmap/cellmap/parkg/for Aubrey/3mb_s3.zarr/jrc_22ak351-leaf-3mb_nuc/s0",
-        ),
+        # Dataset 1 - Multiple classes with descriptive names
+        {
+            "raw": "/nrs/cellmap/data/jrc_22ak351-leaf-3mb/jrc_22ak351-leaf-3mb.zarr/recon-1/em/fibsem-uint8/s3",
+            "nuc": "/groups/cellmap/cellmap/parkg/for Aubrey/3mb_s3.zarr/jrc_22ak351-leaf-3mb_nuc/s0",
+            "mito": "/groups/cellmap/cellmap/parkg/for Aubrey/3mb_s3.zarr/jrc_22ak351-leaf-3mb_mito/s0",
+        },
         # Add more dataset pairs here
-        # (
-        #     "/path/to/raw2.zarr",
-        #     "/path/to/gt2.zarr"
-        # ),
-        # (
-        #     "/path/to/raw3.zarr",
-        #     "/path/to/gt3.zarr"
-        # ),
-    ]
+        # {
+        #     "raw": "/path/to/raw2.zarr",
+        #     "nuc": "/path/to/nuclei2.zarr",
+        #     "mito": "/path/to/mito2.zarr",
+        #     "vesicles": "/path/to/vesicles2.zarr",
+        # },
+    ]  # Legacy format (will be converted internally)
+    # dataset_pairs = [
+    #     (
+    #         "/nrs/cellmap/data/jrc_22ak351-leaf-3mb/jrc_22ak351-leaf-3mb.zarr/recon-1/em/fibsem-uint8/s3",
+    #         "/groups/cellmap/cellmap/parkg/for Aubrey/3mb_s3.zarr/jrc_22ak351-leaf-3mb_nuc/s0",
+    #     ),
+    # ]
 
     return dataset_pairs
+
+
+def convert_dataset_pairs_format(dataset_pairs):
+    """
+    Convert dataset pairs to standardized dictionary format.
+
+    Parameters:
+    -----------
+    dataset_pairs : list
+        List of tuples (raw_path, gt_path) or dictionaries {"raw": path, "nuc": path, "mito": path, ...}
+        Class keys can have any descriptive name (e.g., "nuc", "mito", "vesicles", "class_1", etc.)
+
+    Returns:
+    --------
+    list: List of dictionaries with standardized format
+    """
+    converted_pairs = []
+
+    for pair in dataset_pairs:
+        if isinstance(pair, tuple):
+            # Legacy format: (raw_path, gt_path)
+            if len(pair) == 2:
+                converted_pairs.append({"raw": pair[0], "class_1": pair[1]})
+            else:
+                raise ValueError(
+                    f"Tuple format must have exactly 2 elements (raw, gt), got {len(pair)}"
+                )
+        elif isinstance(pair, dict):
+            # New format: already a dictionary
+            if "raw" not in pair:
+                raise ValueError("Dictionary format must contain 'raw' key")
+
+            # Ensure we have at least one class (any key that's not "raw")
+            class_keys = [k for k in pair.keys() if k != "raw"]
+            if not class_keys:
+                raise ValueError(
+                    "Dictionary format must contain at least one class key (any key other than 'raw')"
+                )
+
+            converted_pairs.append(pair.copy())
+        else:
+            raise ValueError(f"Dataset pair must be tuple or dict, got {type(pair)}")
+
+    return converted_pairs
+
+
+def get_num_classes_from_dataset_pairs(dataset_pairs):
+    """
+    Determine the number of classes from dataset pairs.
+
+    Parameters:
+    -----------
+    dataset_pairs : list
+        List of dataset dictionaries or tuples
+
+    Returns:
+    --------
+    int: Number of classes (including background)
+    """
+    converted_pairs = convert_dataset_pairs_format(dataset_pairs)
+
+    if not converted_pairs:
+        return 2  # Default to binary classification
+
+    # Find maximum number of classes across all datasets
+    max_classes = 0
+    for pair in converted_pairs:
+        # Count only organelle/class keys, not raw or context keys
+        class_keys = [
+            k
+            for k in pair.keys()
+            if k != "raw" and not (k.startswith("raw_") and "nm" in k)
+        ]
+        max_classes = max(max_classes, len(class_keys))
+
+    # Add 1 for background class (class 0)
+    return max_classes + 1
+
+
+def get_class_names_from_dataset_pairs(dataset_pairs):
+    """
+    Extract class names from dataset pairs.
+
+    Parameters:
+    -----------
+    dataset_pairs : list
+        List of dataset dictionaries or tuples
+
+    Returns:
+    --------
+    list: List of class names, with "background" as first element
+    """
+    converted_pairs = convert_dataset_pairs_format(dataset_pairs)
+
+    if not converted_pairs:
+        return ["background", "foreground"]  # Default binary classification
+
+    # Collect all unique class keys across all datasets
+    all_class_keys = set()
+    for pair in converted_pairs:
+        # Get only organelle/class keys, not raw or context keys
+        class_keys = [
+            k
+            for k in pair.keys()
+            if k != "raw" and not (k.startswith("raw_") and "nm" in k)
+        ]
+        all_class_keys.update(class_keys)
+
+    # Sort alphabetically for consistent ordering
+    sorted_class_keys = sorted(all_class_keys)
+
+    # Return with background as first class
+    return ["background"] + sorted_class_keys
 
 
 # %%
@@ -915,14 +1048,20 @@ def load_random_3d_training_data(
     min_label_fraction=0.05,
     num_volumes=10,
     seed=42,
+    dinov3_stride=None,
+    min_resolution_for_raw=None,
+    allow_gt_extension=False,  # NEW PARAMETER
+    context_scale=None,  # NEW: Load context data at this resolution
 ):
     """
     Load random 3D volumes from multiple datasets for 3D UNet training.
+    Supports both legacy tuple format and new dictionary format for multiple classes.
 
     Parameters:
     -----------
     dataset_pairs : list
-        List of (raw_path, gt_path) tuples
+        List of dictionaries with keys {"raw": path, "class_1": path, "class_2": path, ...}
+        OR list of (raw_path, gt_path) tuples for backward compatibility
     volume_shape : tuple
         3D shape of volumes to sample (D, H, W), e.g., (64, 64, 64)
     base_resolution : int
@@ -933,132 +1072,1214 @@ def load_random_3d_training_data(
         Number of 3D volumes to sample
     seed : int
         Random seed
+    dinov3_stride : int, optional
+        If provided, will add ROI-level padding for sliding window inference
+        to avoid boundary issues. Padding = 16 - stride pixels per spatial dimension.
+    min_resolution_for_raw : int, default=16
+        Minimum resolution (in nm) for raw data. If base_resolution is lower,
+        raw data will be sampled at this minimum resolution to save memory.
+    allow_gt_extension : bool, default=False
+        If True, allows sampling of raw volumes that extend beyond ground truth regions.
+        This provides more context for training but requires using masks for loss calculation.
+        When True, returns gt_masks indicating valid ground truth regions.
 
     Returns:
     --------
-    tuple: (raw_volumes, gt_volumes, dataset_sources)
-           Each has shape (num_volumes, D, H, W)
+    tuple: (raw_volumes, gt_volumes, dataset_sources, num_classes) or
+           (raw_volumes, gt_volumes, gt_masks, dataset_sources, num_classes)
+        - raw_volumes: np.array of shape (num_volumes, D, H, W) or (num_volumes, D+pad, H+pad, W+pad) if padded
+        - gt_volumes: np.array of shape (num_volumes, D, H, W) with class indices (always unpadded)
+        - gt_masks: np.array of shape (num_volumes, D, H, W) with 1 where GT is valid, 0 elsewhere (only if allow_gt_extension=True)
+        - dataset_sources: list of dataset indices
+        - num_classes: int, total number of classes including background
     """
     if seed is not None:
         np.random.seed(seed)
 
+    # Calculate padding requirements for sliding window inference
+    roi_padding = 0
+    if dinov3_stride is not None and dinov3_stride < 16:
+        roi_padding = 16 - dinov3_stride
+        print(
+            f"ROI-level padding enabled: {roi_padding} pixels per spatial dimension for stride={dinov3_stride}"
+        )
+
+    # Convert dataset pairs to standardized format
+    converted_pairs = convert_dataset_pairs_format(dataset_pairs)
+    num_classes = get_num_classes_from_dataset_pairs(dataset_pairs)
+
+    print(
+        f"Dataset format conversion complete. Found {num_classes} classes (including background)."
+    )
+    print(
+        f"Note: Datasets with TensorStore/Zarr compatibility issues will be automatically skipped."
+    )
+
     # Convert volume shape to nm
     volume_shape_nm = np.array(volume_shape) * base_resolution
 
+    # Calculate padded volume shape for ROI sampling (only for raw data)
+    padded_volume_shape_nm = volume_shape_nm.copy()
+    if roi_padding > 0:
+        # Add padding to spatial dimensions (H, W) but not depth (D)
+        padded_volume_shape_nm[1:] += 2 * roi_padding * base_resolution
+        print(f"Original volume shape (nm): {volume_shape_nm}")
+        print(f"Padded ROI shape (nm): {padded_volume_shape_nm}")
+        print(
+            f"Padding per side: {roi_padding * base_resolution} nm ({roi_padding} pixels at {base_resolution}nm resolution)"
+        )
+
     raw_volumes = []
     gt_volumes = []
+    gt_masks = (
+        []
+    )  # Masks indicating valid GT regions (only used if allow_gt_extension=True)
+    context_volumes = (
+        []
+    )  # Context volumes at lower resolution (if context_scale provided)
     dataset_sources = []
 
     print(
-        f"Sampling {num_volumes} volumes of shape {volume_shape} from {len(dataset_pairs)} datasets..."
+        f"Sampling {num_volumes} volumes of shape {volume_shape} from {len(converted_pairs)} datasets..."
     )
 
     volumes_collected = 0
     max_attempts = num_volumes * 10  # Allow multiple attempts
 
-    for attempt in range(max_attempts):
-        if volumes_collected >= num_volumes:
-            break
+    # Add progress bar for data loading
+    from tqdm import tqdm
 
-        # Randomly select a dataset
-        dataset_idx = np.random.randint(0, len(dataset_pairs))
-        raw_path, gt_path = dataset_pairs[dataset_idx]
+    with tqdm(total=num_volumes, desc="Loading training volumes", unit="vol") as pbar:
+        for attempt in range(max_attempts):
+            if volumes_collected >= num_volumes:
+                break
 
-        try:
-            # Initialize data interfaces
-            raw_idi = ImageDataInterface(
-                raw_path, output_voxel_size=3 * [base_resolution]
-            )
-            gt_idi = ImageDataInterface(
-                gt_path, output_voxel_size=3 * [base_resolution]
-            )
+            # Randomly select a dataset
+            dataset_idx = np.random.randint(0, len(converted_pairs))
+            dataset_dict = converted_pairs[dataset_idx]
+            raw_path = dataset_dict["raw"]
 
-            # Get bounds
+            # try:
+            # Initialize raw data interface
+            # Initialize raw data interface
+            if min_resolution_for_raw:
+                raw_idi = ImageDataInterface(
+                    raw_path,
+                    output_voxel_size=3 * [min_resolution_for_raw],
+                    force_pseudo_isotropic=True,
+                )
+            else:
+                raw_idi = ImageDataInterface(
+                    raw_path, output_voxel_size=3 * [base_resolution]
+                )
+
+            # Initialize context data interface if requested
+            context_idi = None
+            if context_scale is not None:
+                # Find the best matching raw data path for the context resolution
+                # Look for keys like "raw_64nm", "raw_32nm", etc.
+                context_keys = [
+                    k for k in dataset_dict.keys() if k.startswith("raw_") and "nm" in k
+                ]
+
+                if context_keys:
+                    # Find the context key that best matches our desired context_scale
+                    best_context_key = None
+                    min_difference = float("inf")
+
+                    for key in context_keys:
+                        # Extract resolution from key (e.g., "raw_64nm" -> 64)
+                        try:
+                            key_resolution = int(
+                                key.replace("raw_", "").replace("nm", "")
+                            )
+                            difference = abs(key_resolution - context_scale)
+                            if difference < min_difference:
+                                min_difference = difference
+                                best_context_key = key
+                        except ValueError:
+                            continue
+
+                    if best_context_key is not None:
+                        actual_resolution = int(
+                            best_context_key.replace("raw_", "").replace("nm", "")
+                        )
+                        if actual_resolution != context_scale:
+                            print(
+                                f"    ℹ️  Context: requested {context_scale}nm, using closest available {actual_resolution}nm"
+                            )
+
+                        context_idi = ImageDataInterface(
+                            dataset_dict[best_context_key],
+                            output_voxel_size=3
+                            * [context_scale],  # Resample to desired resolution
+                            force_pseudo_isotropic=True,
+                        )
+
+            # Initialize all class data interfaces (any key that's not "raw" and not context)
+            class_keys = [
+                k
+                for k in dataset_dict.keys()
+                if k != "raw" and not (k.startswith("raw_") and "nm" in k)
+            ]
+            class_idis = {}
+            for class_key in class_keys:
+                class_idis[class_key] = ImageDataInterface(
+                    dataset_dict[class_key],
+                    output_voxel_size=3 * [base_resolution],
+                    force_pseudo_isotropic=True,
+                    is_segmentation=True,
+                )
+
+            # Get bounds from raw data
             raw_begin = np.array(raw_idi.roi.begin)
             raw_end = np.array(raw_idi.roi.end)
-            gt_begin = np.array(gt_idi.roi.begin)
-            gt_end = np.array(gt_idi.roi.end)
 
-            # Find overlapping region
-            overlap_begin = np.maximum(raw_begin, gt_begin)
-            overlap_end = np.minimum(raw_end, gt_end)
-            overlap_shape = overlap_end - overlap_begin
+            if allow_gt_extension:
+                # When allowing GT extension, use raw data bounds for sampling
+                # but ensure center of volume intersects with GT regions
+                raw_overlap_begin = raw_begin.copy()
+                raw_overlap_end = raw_end.copy()
 
-            # Check if overlap is large enough for our volume
-            if np.any(overlap_shape < volume_shape_nm):
+                # Find GT overlap region (intersection of all GT datasets)
+                gt_overlap_begin = raw_begin.copy()
+                gt_overlap_end = raw_end.copy()
+                for class_key, class_idi in class_idis.items():
+                    class_begin = np.array(class_idi.roi.begin)
+                    class_end = np.array(class_idi.roi.end)
+                    gt_overlap_begin = np.maximum(gt_overlap_begin, class_begin)
+                    gt_overlap_end = np.minimum(gt_overlap_end, class_end)
+
+                gt_overlap_shape = gt_overlap_end - gt_overlap_begin
+
+                # Check if GT overlap region exists (center constraint only needs a single voxel)
+                if np.any(gt_overlap_shape <= 0):
+                    print(
+                        f"  Dataset {dataset_idx}: No GT overlap region found - GT regions don't intersect"
+                    )
+                    continue
+
+                # Use raw bounds for sampling, but constrain center to GT region
+                overlap_begin = raw_overlap_begin
+                overlap_end = raw_overlap_end
+                overlap_shape = overlap_end - overlap_begin
+
+                # Store GT bounds for mask creation later
+                dataset_gt_bounds = (gt_overlap_begin, gt_overlap_end)
+
+            else:
+                # Original behavior: find overlapping region across all datasets
+                overlap_begin = raw_begin.copy()
+                overlap_end = raw_end.copy()
+
+                for class_key, class_idi in class_idis.items():
+                    class_begin = np.array(class_idi.roi.begin)
+                    class_end = np.array(class_idi.roi.end)
+                    overlap_begin = np.maximum(overlap_begin, class_begin)
+                    overlap_end = np.minimum(overlap_end, class_end)
+
+                overlap_shape = overlap_end - overlap_begin
+                dataset_gt_bounds = None
+
+            # Check if overlap is large enough for our volume (use padded shape for ROI)
+            required_shape = padded_volume_shape_nm
+            if np.any(overlap_shape < required_shape):
                 print(
-                    f"  Dataset {dataset_idx}: overlap {overlap_shape} too small for volume {volume_shape_nm}"
+                    f"  Dataset {dataset_idx}: overlap {overlap_shape} too small for volume {required_shape}"
                 )
                 continue
 
-            # Calculate valid sampling region
-            max_offset = overlap_end - volume_shape_nm
+            # Calculate valid sampling region (use padded shape)
+            max_offset = overlap_end - required_shape
             min_offset = overlap_begin
 
             if np.any(max_offset < min_offset):
                 print(f"  Dataset {dataset_idx}: no valid sampling region")
                 continue
 
-            # Generate random offset (aligned to base_resolution)
-            random_offset = []
-            for i in range(3):
-                min_mult = int(min_offset[i] // base_resolution)
-                max_mult = int(max_offset[i] // base_resolution)
-                offset_mult = np.random.randint(min_mult, max_mult + 1)
-                random_offset.append(offset_mult * base_resolution)
+            if allow_gt_extension and dataset_gt_bounds is not None:
+                # Generate random offset ensuring volume center falls within GT bounds
+                gt_begin, gt_end = dataset_gt_bounds
+                volume_center_offset = np.array(padded_volume_shape_nm) // 2
 
-            random_offset = np.array(random_offset)
+                # Calculate constraints for center to be within GT region
+                center_min = gt_begin
+                center_max = gt_end
 
-            # Create ROI for 3D volume
-            roi = Roi(random_offset, volume_shape_nm)
+                # Calculate corresponding volume start constraints
+                vol_min = center_min - volume_center_offset
+                vol_max = center_max - volume_center_offset
 
-            # Sample GT first to check label fraction
-            gt_volume = gt_idi.to_ndarray_ts(roi)
+                # Intersect with original sampling bounds
+                vol_min = np.maximum(vol_min, min_offset)
+                vol_max = np.minimum(vol_max, max_offset)
 
-            # Convert to boolean and check label fraction
-            if gt_volume.dtype != bool:
-                gt_volume_bool = gt_volume > 0
+                # Generate random offset (aligned to base_resolution)
+                random_offset = []
+                for i in range(3):
+                    min_mult = int(vol_min[i] // base_resolution)
+                    max_mult = int(vol_max[i] // base_resolution)
+                    if max_mult < min_mult:
+                        # Fallback to original bounds if constraints are too tight
+                        min_mult = int(min_offset[i] // base_resolution)
+                        max_mult = int(max_offset[i] // base_resolution)
+                    offset_mult = np.random.randint(min_mult, max_mult + 1)
+                    random_offset.append(offset_mult * base_resolution)
+
+                random_offset = np.array(random_offset)
             else:
-                gt_volume_bool = gt_volume
+                # Original behavior: generate random offset (aligned to base_resolution)
+                random_offset = []
+                for i in range(3):
+                    min_mult = int(min_offset[i] // base_resolution)
+                    max_mult = int(max_offset[i] // base_resolution)
+                    offset_mult = np.random.randint(min_mult, max_mult + 1)
+                    random_offset.append(offset_mult * base_resolution)
 
-            label_fraction = np.sum(gt_volume_bool) / gt_volume_bool.size
+                random_offset = np.array(random_offset)
 
-            if label_fraction < min_label_fraction:
+            # Create ROIs for 3D volume
+            # Use padded ROI for raw data (to include boundary context for sliding window)
+            padded_roi = Roi(random_offset, padded_volume_shape_nm)
+            # Use original ROI for ground truth (to maintain target shape)
+            if roi_padding > 0:
+                # Center the original ROI within the padded ROI
+                gt_offset = random_offset + np.array(
+                    [
+                        0,
+                        roi_padding * base_resolution,
+                        roi_padding * base_resolution,
+                    ]
+                )
+                gt_roi = Roi(gt_offset, volume_shape_nm)
+            else:
+                # No padding, so GT offset is the same as random offset
+                gt_offset = random_offset
+                gt_roi = padded_roi  # Same as padded when no padding
+
+            # Sample all class volumes without padding (maintain target shape)
+            class_volumes = {}
+            failed_classes = []
+
+            crop_failed = False
+            # Print GT ROI information once
+            if class_idis:
                 print(
-                    f"  Dataset {dataset_idx}: label fraction {label_fraction:.3f} too low"
+                    f"    📦 GT ROI: {gt_roi.begin} → {gt_roi.end} (shape: {gt_roi.shape} nm)"
+                )
+                print(
+                    f"       Resolution: {base_resolution}nm, Expected voxels: {gt_roi.shape / base_resolution}"
+                )
+
+            for class_key, class_idi in class_idis.items():
+                try:
+                    class_volumes[class_key] = class_idi.to_ndarray_ts(gt_roi)
+                except (ValueError, RuntimeError, OSError, IndexError) as e:
+                    # Any error with any class should skip the entire crop attempt
+                    # since we need all classes present per ROI
+                    dataset_name = "unknown"
+                    crop_info = "unknown"
+
+                    if "raw" in dataset_dict:
+                        raw_path = dataset_dict["raw"]
+                        path_parts = raw_path.split("/")
+                        for part in path_parts:
+                            if part.startswith("jrc_") or "cellmap" in part:
+                                dataset_name = part
+                                break
+
+                    if class_key in dataset_dict:
+                        class_path = dataset_dict[class_key]
+                        if "crop" in class_path:
+                            crop_parts = class_path.split("crop")
+                            if len(crop_parts) > 1:
+                                crop_num = crop_parts[-1].split("/")[0]
+                                crop_info = f"crop{crop_num}"
+
+                    error_type = (
+                        "Invalid ROI coordinates"
+                        if isinstance(e, IndexError)
+                        else "TensorStore/zarr compatibility error"
+                    )
+                    print(
+                        f"  Dataset {dataset_idx}: {error_type} for '{class_key}' in '{dataset_name}', {crop_info} - skipping this crop"
+                    )
+                    print(f"    ROI: {gt_roi}")
+                    print(f"    Error: {str(e)[:100]}...")
+                    crop_failed = True
+                    break
+
+            # Skip this attempt if any class failed
+            if crop_failed:
+                continue
+
+            # Skip this dataset entirely if no classes could be loaded
+            if not class_volumes:
+                print(
+                    f"    ❌ All organelles failed for dataset {dataset_idx} - skipping entirely"
                 )
                 continue
 
-            # Get raw volume
-            raw_volume = raw_idi.to_ndarray_ts(roi)
+            # Create multi-class ground truth volume
+            # Initialize with background (class 0)
+            gt_volume = np.zeros(volume_shape, dtype=np.uint8)
 
-            # Ensure correct shape
-            if raw_volume.shape != volume_shape or gt_volume_bool.shape != volume_shape:
+            # Assign class labels (assign sequential class numbers starting from 1)
+            # Sort class keys alphabetically for consistent ordering - only use successfully loaded classes
+            successfully_loaded_keys = [
+                key for key in class_keys if key in class_volumes
+            ]
+            sorted_class_keys = sorted(successfully_loaded_keys)
+            class_fractions = (
+                {}
+            )  # Store class masks for later label fraction calculation
+
+            if failed_classes:
                 print(
-                    f"  Dataset {dataset_idx}: shape mismatch - raw: {raw_volume.shape}, gt: {gt_volume_bool.shape}, expected: {volume_shape}"
+                    f"    ℹ️  Processing {len(sorted_class_keys)} organelles (skipped {len(failed_classes)}: {failed_classes})"
+                )
+
+            for class_idx, class_key in enumerate(sorted_class_keys, start=1):
+                class_vol = class_volumes[class_key]
+
+                # Ensure class_vol matches expected volume shape
+                if class_vol.shape != gt_volume.shape:
+                    # Extract dataset and crop information for warning
+                    dataset_name = "unknown"
+                    crop_info = "unknown"
+
+                    # Try to extract dataset name from the dataset_dict
+                    if "raw" in dataset_dict:
+                        raw_path = dataset_dict["raw"]
+                        path_parts = raw_path.split("/")
+                        for part in path_parts:
+                            if part.startswith("jrc_") or "cellmap" in part:
+                                dataset_name = part
+                                break
+
+                    # Try to extract crop information from the class path
+                    if class_key in dataset_dict:
+                        class_path = dataset_dict[class_key]
+                        if "crop" in class_path:
+                            crop_parts = class_path.split("crop")
+                            if len(crop_parts) > 1:
+                                crop_num = crop_parts[-1].split("/")[0]
+                                crop_info = f"crop{crop_num}"
+
+                    print(
+                        f"    ⚠️  WARNING: Shape mismatch for organelle '{class_key}' in dataset '{dataset_name}', {crop_info}:"
+                    )
+                    print(f"       Expected: {gt_volume.shape}, Got: {class_vol.shape}")
+                    print(
+                        f"       Likely due to asymmetric voxel dimensions in zarr data - resizing to match target shape"
+                    )
+
+                    # Resize to match target shape
+                    from scipy.ndimage import zoom
+
+                    zoom_factors = np.array(gt_volume.shape) / np.array(class_vol.shape)
+                    class_vol = (
+                        zoom(class_vol.astype(float), zoom_factors, order=0) > 0.5
+                    )
+                    class_vol = class_vol.astype(class_volumes[class_key].dtype)
+
+                # Convert to boolean mask
+                if class_vol.dtype != bool:
+                    class_mask = class_vol > 0
+                else:
+                    class_mask = class_vol
+
+                # Assign class label where mask is True
+                # Later classes override earlier ones in overlapping regions
+                gt_volume[class_mask] = class_idx
+
+                # Store class fraction for later calculation (after GT mask is created)
+                class_fractions[class_key] = class_mask
+            # Sample raw volume with padding (for sliding window context)
+            try:
+                raw_volume = raw_idi.to_ndarray_ts(padded_roi)
+
+                # Print actual ROI coordinates being used
+                print(
+                    f"    📍 Raw ROI: {padded_roi.begin} → {padded_roi.end} (shape: {padded_roi.shape} nm)"
+                )
+                print(
+                    f"       Resolution: {raw_idi.output_voxel_size[0]}nm, Expected voxels: {padded_roi.shape / raw_idi.output_voxel_size[0]}"
+                )
+                print(f"       Actual shape: {raw_volume.shape}")
+
+            except (ValueError, RuntimeError, OSError, IndexError) as e:
+                print(
+                    f"  Dataset {dataset_idx}: Invalid ROI coordinates - skipping this crop"
+                )
+                print(f"    ROI: {padded_roi}")
+                print(f"    Error: {str(e)[:100]}...")
+                continue
+
+            # Sample context volume if context data interface exists
+            context_volume = None
+            if context_idi is not None:
+                try:
+                    # Create expanded ROI for context to cover larger area at lower resolution
+                    # We want same voxel dimensions but covering larger physical area
+                    raw_resolution = raw_idi.output_voxel_size[0]  # e.g., 4nm
+                    context_resolution = context_idi.output_voxel_size[0]  # e.g., 32nm
+                    resolution_ratio = (
+                        context_resolution / raw_resolution
+                    )  # e.g., 32/4 = 8x
+
+                    # Expand ROI by resolution ratio to cover larger area
+                    roi_center = padded_roi.begin + padded_roi.shape // 2
+                    expanded_shape = padded_roi.shape * resolution_ratio
+                    expanded_begin = roi_center - expanded_shape // 2
+                    context_roi = Roi(expanded_begin, expanded_shape)
+
+                    # Sample from expanded ROI at context resolution
+                    context_volume = context_idi.to_ndarray_ts(context_roi)
+
+                    # Print context ROI coordinates
+                    print(
+                        f"    🌐 Context ROI: {context_roi.begin} → {context_roi.end} (shape: {context_roi.shape} nm)"
+                    )
+                    print(
+                        f"       Resolution: {context_idi.output_voxel_size[0]}nm, Expected voxels: {context_roi.shape / context_idi.output_voxel_size[0]}"
+                    )
+                    print(
+                        f"       Raw coverage ratio: {resolution_ratio:.1f}x larger spatial area"
+                    )
+                    print(f"       Actual shape: {context_volume.shape}")
+
+                    # Context should naturally have same voxel dimensions as raw due to resolution difference
+                    # If not, resample to match raw volume dimensions
+                    if context_volume.shape != raw_volume.shape:
+                        raise Exception(
+                            f"Context shape {context_volume.shape} does not match raw shape {raw_volume.shape}"
+                        )
+                        # from scipy.ndimage import zoom
+
+                        # zoom_factors = np.array(raw_volume.shape) / np.array(
+                        #     context_volume.shape
+                        # )
+                        # context_volume = zoom(
+                        #     context_volume.astype(float), zoom_factors, order=1
+                        # )
+                        # context_volume = context_volume.astype(raw_volume.dtype)
+
+                except (ValueError, RuntimeError, OSError, IndexError) as e:
+                    print(
+                        f"  Dataset {dataset_idx}: Failed to load context data - continuing without context"
+                    )
+                    print(
+                        f"    Context ROI: {context_roi if 'context_roi' in locals() else 'undefined'}"
+                    )
+                    print(f"    Error: {str(e)[:100]}...")
+                    context_volume = None
+
+            # Validate shapes
+            expected_raw_shape = (
+                tuple(padded_volume_shape_nm // raw_idi.voxel_size[0])
+                if roi_padding > 0
+                else tuple(
+                    np.array(volume_shape)
+                    * base_resolution
+                    // raw_idi.output_voxel_size[0]
+                )
+            )
+            if gt_volume.shape != volume_shape:
+                print(
+                    f"  Dataset {dataset_idx}: GT shape mismatch - got: {gt_volume.shape}, expected: {volume_shape}"
                 )
                 continue
 
-            # Store the volumes
+            if raw_volume.shape != expected_raw_shape:
+                # Extract dataset info for warning
+                dataset_name = "unknown"
+                crop_info = "unknown"
+
+                if "raw" in dataset_dict:
+                    raw_path = dataset_dict["raw"]
+                    path_parts = raw_path.split("/")
+                    for part in path_parts:
+                        if part.startswith("jrc_") or "cellmap" in part:
+                            dataset_name = part
+                            break
+
+                print(
+                    f"    ⚠️  WARNING: Raw data shape mismatch in dataset '{dataset_name}':"
+                )
+                print(f"       Expected: {expected_raw_shape}, Got: {raw_volume.shape}")
+                print(
+                    f"       Likely due to asymmetric voxel dimensions in zarr data - resizing to match target shape"
+                )
+
+                # Resize to match expected shape
+                from scipy.ndimage import zoom
+
+                zoom_factors = np.array(expected_raw_shape) / np.array(raw_volume.shape)
+                raw_volume = zoom(raw_volume.astype(float), zoom_factors, order=1)
+                raw_volume = raw_volume.astype(
+                    np.uint8
+                )  # Convert back to uint8 for raw data
+
+            # Create GT mask if GT extension is allowed
+            if allow_gt_extension:
+                # ROBUST APPROACH: Create mask based on actual presence of GT data
+                # This accounts for any resizing that occurred and ensures perfect alignment
+                gt_mask = np.zeros(volume_shape, dtype=np.uint8)
+
+                # Method 1: Use the final GT volume to determine valid regions
+                # Any non-background voxel indicates a valid GT region
+                valid_gt_regions = gt_volume > 0  # Any foreground class
+
+                if np.sum(valid_gt_regions) > 0:
+                    # We have some valid GT data - create mask around it
+                    # Find bounding box of all valid GT data
+                    nonzero_coords = np.where(valid_gt_regions)
+
+                    if len(nonzero_coords[0]) > 0:
+                        min_coords = [np.min(coords) for coords in nonzero_coords]
+                        max_coords = [np.max(coords) for coords in nonzero_coords]
+
+                        # Create a slightly expanded bounding box to be conservative
+                        padding = 2
+                        min_coords = [max(0, c - padding) for c in min_coords]
+                        max_coords = [
+                            min(s - 1, c + padding)
+                            for c, s in zip(max_coords, volume_shape)
+                        ]
+
+                        # Set mask to 1 in regions where we have actual GT data
+                        gt_mask[
+                            min_coords[0] : max_coords[0] + 1,
+                            min_coords[1] : max_coords[1] + 1,
+                            min_coords[2] : max_coords[2] + 1,
+                        ] = 1
+
+                        print(
+                            f"    GT mask created from actual data: {np.sum(gt_mask)} / {gt_mask.size} voxels valid"
+                        )
+                    else:
+                        # Fallback: no valid data found, use full mask
+                        print(
+                            "    ⚠️  Warning: No valid GT data found - using full mask"
+                        )
+                        gt_mask = np.ones(volume_shape, dtype=np.uint8)
+                else:
+                    # No foreground labels at all - this might be a background-only region
+                    # In GT extension mode, we should still have a mask
+                    # Method 2: Try to determine valid regions from original coordinate bounds
+                    if dataset_gt_bounds is not None:
+                        # Calculate intersection of GT ROI with the sampled volume ROI
+                        gt_begin, gt_end = dataset_gt_bounds
+                        gt_roi_full = Roi(gt_begin, gt_end - gt_begin)
+                        sampled_gt_roi = Roi(gt_offset, volume_shape_nm)
+
+                        # Find intersection
+                        intersection_roi = gt_roi_full.intersect(sampled_gt_roi)
+
+                        if intersection_roi is not None and not intersection_roi.empty:
+                            # Convert intersection back to volume coordinates
+                            gt_offset_coord = Coordinate(gt_offset)
+                            intersection_offset = (
+                                intersection_roi.begin - gt_offset_coord
+                            )
+                            intersection_shape = intersection_roi.shape
+
+                            # Convert from nm to voxels
+                            mask_start = intersection_offset // base_resolution
+                            mask_end = mask_start + (
+                                intersection_shape // base_resolution
+                            )
+
+                            # Ensure indices are within bounds and integers
+                            mask_start = np.maximum(0, mask_start).astype(int)
+                            mask_end = np.minimum(volume_shape, mask_end).astype(int)
+
+                            # Set mask to 1 in valid GT region
+                            gt_mask[
+                                mask_start[0] : mask_end[0],
+                                mask_start[1] : mask_end[1],
+                                mask_start[2] : mask_end[2],
+                            ] = 1
+
+                            print(
+                                f"    GT mask created from coordinate bounds: {np.sum(gt_mask)} / {gt_mask.size} voxels valid"
+                            )
+
+                    # Final fallback
+                    if np.sum(gt_mask) == 0:
+                        print(
+                            "    ⚠️  Warning: Could not determine valid GT regions - using full mask"
+                        )
+                        gt_mask = np.ones(volume_shape, dtype=np.uint8)
+
+                # Don't append mask yet - wait until after label fraction check
+                pass
+            else:
+                # For compatibility, add full mask when not using GT extension
+                gt_mask = np.ones(volume_shape, dtype=np.uint8)
+                # Don't append mask yet - wait until after label fraction check
+
+            # Now calculate label fraction within valid GT regions only
+            total_label_fraction = 0.0
+            valid_gt_voxels = np.sum(gt_mask)  # Number of valid GT voxels
+
+            if valid_gt_voxels == 0:
+                print(f"  Dataset {dataset_idx}: No valid GT region found - skipping")
+                continue
+
+            for class_key, class_mask in class_fractions.items():
+                # Only count labels within valid GT regions
+                valid_class_voxels = np.sum(class_mask & (gt_mask == 1))
+                class_fraction = valid_class_voxels / valid_gt_voxels
+                total_label_fraction += class_fraction
+
+            # Check minimum label fraction within valid GT regions
+            if total_label_fraction < min_label_fraction:
+                print(
+                    f"  Dataset {dataset_idx}: label fraction {total_label_fraction:.3f} too low within valid GT regions"
+                )
+                continue
+            print(
+                f"  Dataset {dataset_idx}: label fraction {total_label_fraction:.3f} within valid GT regions, roi {gt_roi}"
+            )
+
+            # Store the volumes and mask (only after all checks pass)
+            gt_masks.append(gt_mask)
             raw_volumes.append(raw_volume)
-            gt_volumes.append(gt_volume_bool.astype(np.uint8))
+            gt_volumes.append(gt_volume)
+            context_volumes.append(context_volume)  # Will be None if no context
             dataset_sources.append(dataset_idx)
             volumes_collected += 1
 
-            print(
-                f"  ✓ Volume {volumes_collected}/{num_volumes} from dataset {dataset_idx} "
-                f"(label fraction: {label_fraction:.3f})"
+            # Print class distribution for this volume
+            unique_classes, class_counts = np.unique(gt_volume, return_counts=True)
+            class_info = ", ".join(
+                [
+                    f"class {c}: {cnt/gt_volume.size:.3f}"
+                    for c, cnt in zip(unique_classes, class_counts)
+                ]
             )
 
-        except Exception as e:
-            print(f"  Dataset {dataset_idx}: error - {e}")
-            continue
+            # Update progress bar
+            pbar.update(1)
+            pbar.set_postfix(
+                {
+                    "dataset": dataset_idx,
+                    "label_frac": f"{total_label_fraction:.3f}",
+                    "classes": len(unique_classes),
+                }
+            )
+
+            # except Exception as e:
+            #     error_msg = str(e)
+            #     if "FAILED_PRECONDITION" in error_msg and "checksum" in error_msg:
+            #         print(
+            #             f"  Dataset {dataset_idx}: TensorStore/Zarr compatibility issue - skipping"
+            #         )
+            #         print(
+            #             f"    Issue: Zarr file contains unsupported 'checksum' field in compressor"
+            #         )
+            #         print(f"    Path: {dataset_dict}")
+            #         print(
+            #             f"    Suggestion: This dataset may need to be re-saved with compatible Zarr format"
+            #         )
+            #     elif "Error opening" in error_msg and "zarr" in error_msg.lower():
+            #         print(f"  Dataset {dataset_idx}: Zarr format issue - skipping")
+            #         print(f"    Path: {dataset_dict}")
+            #         print(f"    Error: {error_msg[:200]}...")
+            #     else:
+            #         print(f"  Dataset {dataset_idx}: error - {e}")
+            #     continue
 
     if volumes_collected < num_volumes:
         print(f"Warning: Only collected {volumes_collected}/{num_volumes} volumes")
 
     # Convert to numpy arrays
     raw_volumes = np.array(raw_volumes)  # Shape: (num_volumes, D, H, W)
-    gt_volumes = np.array(gt_volumes)  # Shape: (num_volumes, D, H, W)
+    gt_volumes = np.array(
+        gt_volumes
+    )  # Shape: (num_volumes, D, H, W) with class indices
+    gt_masks = np.array(gt_masks)  # Shape: (num_volumes, D, H, W) with 0/1 mask
 
-    return raw_volumes, gt_volumes, dataset_sources
+    # Handle context volumes
+    has_context = context_scale is not None and any(
+        cv is not None for cv in context_volumes
+    )
+    if has_context:
+        # Convert context volumes to numpy array, handling None values
+        context_volumes_filtered = [cv for cv in context_volumes if cv is not None]
+        if len(context_volumes_filtered) == len(context_volumes):
+            context_volumes = np.array(context_volumes)
+        else:
+            # Some volumes don't have context - pad with None or handle appropriately
+            print(
+                f"Warning: Only {len(context_volumes_filtered)}/{len(context_volumes)} volumes have context data"
+            )
+            context_volumes = np.array(
+                context_volumes, dtype=object
+            )  # Allow None values
+    else:
+        context_volumes = None
+
+    print(f"Final dataset summary:")
+    print(f"  Raw volumes shape: {raw_volumes.shape}")
+    print(f"  GT volumes shape: {gt_volumes.shape}")
+    print(f"  GT masks shape: {gt_masks.shape}")
+    if has_context and context_volumes is not None:
+        if context_volumes.dtype == object:
+            print(f"  Context volumes: Mixed (some None)")
+        else:
+            print(f"  Context volumes shape: {context_volumes.shape}")
+        print(f"  Context scale: {context_scale}nm")
+    print(f"  Number of classes: {num_classes}")
+    print(f"  Classes found in data: {np.unique(gt_volumes)}")
+    if allow_gt_extension:
+        print(f"  GT extension enabled - masks indicate valid GT regions")
+        valid_mask_fraction = np.mean(gt_masks)
+        print(f"  Average valid GT fraction: {valid_mask_fraction:.3f}")
+
+    if allow_gt_extension:
+        if has_context:
+            return (
+                raw_volumes,
+                gt_volumes,
+                gt_masks,
+                context_volumes,
+                dataset_sources,
+                num_classes,
+            )
+        else:
+            return raw_volumes, gt_volumes, gt_masks, dataset_sources, num_classes
+    else:
+        if has_context:
+            return (
+                raw_volumes,
+                gt_volumes,
+                context_volumes,
+                dataset_sources,
+                num_classes,
+            )
+        else:
+            return raw_volumes, gt_volumes, dataset_sources, num_classes
+
+
+def extract_organelle_directories(base_path="/nrs/cellmap/data", organelle_list=None):
+    """
+    Extract all organelle directories from the cellmap data structure.
+
+    Searches for directories matching the pattern:
+    /nrs/cellmap/data/{dataset}/{dataset}.zarr/recon-1/labels/groundtruth/crop{number}/{organelle}
+
+    Parameters:
+    -----------
+    base_path : str
+        Base path to search (default: "/nrs/cellmap/data")
+    organelle_list : list of str, optional
+        List of specific organelle names to filter for. If provided, only these
+        organelles will be included in the results.
+
+    Returns:
+    --------
+    dict: Dictionary with structure:
+        {
+            'dataset_name': {
+                'crop_number': ['organelle1', 'organelle2', ...],
+                ...
+            },
+            ...
+        }
+    list: Flat list of all unique organelles found across all datasets
+    """
+    import os
+    import glob
+    from pathlib import Path
+
+    print(f"Scanning for organelle directories in: {base_path}")
+
+    organelle_data = {}
+    all_organelles = set()
+
+    # Find all dataset directories
+    if not os.path.exists(base_path):
+        print(f"Error: Base path {base_path} does not exist")
+        return {}, []
+
+    dataset_dirs = [
+        d for d in os.listdir(base_path) if os.path.isdir(os.path.join(base_path, d))
+    ]
+
+    print(f"Found {len(dataset_dirs)} potential dataset directories")
+
+    for dataset in dataset_dirs:
+        dataset_path = os.path.join(base_path, dataset)
+        zarr_path = os.path.join(dataset_path, f"{dataset}.zarr")
+
+        # Check if .zarr directory exists
+        if not os.path.exists(zarr_path):
+            continue
+
+        groundtruth_base = os.path.join(zarr_path, "recon-1", "labels", "groundtruth")
+
+        # Check if groundtruth path exists
+        if not os.path.exists(groundtruth_base):
+            continue
+
+        print(f"  Processing dataset: {dataset}")
+        organelle_data[dataset] = {}
+
+        # Find all crop directories
+        crop_pattern = os.path.join(groundtruth_base, "crop*")
+        crop_dirs = glob.glob(crop_pattern)
+
+        for crop_dir in crop_dirs:
+            crop_name = os.path.basename(crop_dir)  # e.g., "crop001", "crop002"
+
+            # Extract crop number
+            crop_number = crop_name.replace("crop", "")
+
+            # Find all organelle directories in this crop
+            if os.path.isdir(crop_dir):
+                organelles = [
+                    d
+                    for d in os.listdir(crop_dir)
+                    if os.path.isdir(os.path.join(crop_dir, d))
+                ]
+
+                # Filter by organelle_list if provided
+                if organelle_list is not None:
+                    organelles = [org for org in organelles if org in organelle_list]
+
+                if organelles:
+                    organelle_data[dataset][crop_number] = sorted(organelles)
+                    all_organelles.update(organelles)
+                    print(
+                        f"    {crop_name}: {len(organelles)} organelles - {', '.join(sorted(organelles))}"
+                    )
+
+    # Convert set to sorted list
+    all_organelles = sorted(list(all_organelles))
+
+    print(f"\nSummary:")
+    print(f"  Total datasets with organelles: {len(organelle_data)}")
+    print(f"  Unique organelles found: {len(all_organelles)}")
+    print(f"  All organelles: {', '.join(all_organelles)}")
+
+    return organelle_data, all_organelles
+
+
+def get_organelle_paths(
+    dataset_name,
+    crop_number=None,
+    organelle=None,
+    organelle_list=None,
+    base_path="/nrs/cellmap/data",
+):
+    """
+    Get full paths to specific organelle directories.
+
+    Parameters:
+    -----------
+    dataset_name : str
+        Name of the dataset
+    crop_number : str or int, optional
+        Specific crop number (e.g., "001" or 1). If None, returns all crops.
+    organelle : str, optional
+        Specific organelle name. If None, returns all organelles.
+    organelle_list : list of str, optional
+        List of specific organelle names to filter for. If provided, only paths
+        for these organelles will be returned. Takes precedence over 'organelle' parameter.
+    base_path : str
+        Base path to search (default: "/nrs/cellmap/data")
+
+    Returns:
+    --------
+    list: List of full paths matching the criteria
+    """
+    import os
+
+    paths = []
+    zarr_path = os.path.join(base_path, dataset_name, f"{dataset_name}.zarr")
+    groundtruth_base = os.path.join(zarr_path, "recon-1", "labels", "groundtruth")
+
+    if not os.path.exists(groundtruth_base):
+        print(f"Warning: Groundtruth path does not exist: {groundtruth_base}")
+        return paths
+
+    # Handle crop number formatting
+    if crop_number is not None:
+        if isinstance(crop_number, int):
+            crop_number = f"{crop_number:03d}"  # Convert to "001" format
+        crop_dirs = [os.path.join(groundtruth_base, f"crop{crop_number}")]
+    else:
+        import glob
+
+        crop_dirs = glob.glob(os.path.join(groundtruth_base, "crop*"))
+
+    for crop_dir in crop_dirs:
+        if not os.path.exists(crop_dir):
+            continue
+
+        if organelle_list is not None:
+            # Filter by list of specific organelles
+            for org in organelle_list:
+                organelle_path = os.path.join(crop_dir, org)
+                if os.path.exists(organelle_path):
+                    paths.append(organelle_path)
+        elif organelle is not None:
+            # Specific organelle
+            organelle_path = os.path.join(crop_dir, organelle)
+            if os.path.exists(organelle_path):
+                paths.append(organelle_path)
+        else:
+            # All organelles in this crop
+            organelles = [
+                d
+                for d in os.listdir(crop_dir)
+                if os.path.isdir(os.path.join(crop_dir, d))
+            ]
+            for org in organelles:
+                paths.append(os.path.join(crop_dir, org))
+
+    return sorted(paths)
+
+
+def generate_dataset_pairs_for_organelles(
+    organelle_list,
+    max_pairs_per_organelle=10,
+    base_path="/nrs/cellmap/data",
+    base_resolution=None,
+    use_highest_res_for_raw=False,
+    min_resolution_for_raw=None,
+    apply_scale_updates=True,
+):
+    """
+    Generate dataset pairs for specific organelles for training with optional scale handling.
+
+    Parameters:
+    -----------
+    organelle_list : list of str
+        List of organelle names to generate pairs for
+    max_pairs_per_organelle : int
+        Maximum number of dataset pairs to generate per organelle
+    base_path : str
+        Base path to search (default: "/nrs/cellmap/data")
+    base_resolution : int or float, optional
+        Target resolution for labels. If provided with apply_scale_updates=True,
+        will update paths with appropriate scale information.
+    use_highest_res_for_raw : bool, default=False
+        If True, use highest available resolution for raw data instead of base_resolution.
+        Only used when apply_scale_updates=True.
+    min_resolution_for_raw : int, float, or Coordinate, optional
+        Minimum allowed resolution for raw data when use_highest_res_for_raw=True.
+        Only used when apply_scale_updates=True.
+    apply_scale_updates : bool, default=True
+        If True and base_resolution is provided, applies scale updates to dataset paths
+        similar to update_datapaths_with_target_scales().
+
+    Returns:
+    --------
+    dict: Dictionary with organelle names as keys and lists of dataset pairs as values
+        {
+            'organelle_name': [
+                {'raw': 'path_to_raw', 'organelle_name': 'path_to_gt'},
+                ...
+            ],
+            ...
+        }
+    """
+    import os
+
+    result = {}
+
+    # Get all organelle data
+    organelle_data, _ = extract_organelle_directories(
+        base_path=base_path, organelle_list=organelle_list
+    )
+
+    for target_organelle in organelle_list:
+        pairs = []
+        pair_count = 0
+
+        for dataset, crops in organelle_data.items():
+            if pair_count >= max_pairs_per_organelle:
+                break
+
+            for crop_num, organelles in crops.items():
+                if pair_count >= max_pairs_per_organelle:
+                    break
+
+                if target_organelle in organelles:
+                    raw_path = (
+                        f"{base_path}/{dataset}/{dataset}.zarr/recon-1/em/fibsem-uint8"
+                    )
+                    gt_path = f"{base_path}/{dataset}/{dataset}.zarr/recon-1/labels/groundtruth/crop{crop_num}/{target_organelle}"
+
+                    # Verify paths exist
+                    if os.path.exists(raw_path) and os.path.exists(gt_path):
+                        pairs.append({"raw": raw_path, target_organelle: gt_path})
+                        pair_count += 1
+
+        result[target_organelle] = pairs
+        print(f"Generated {len(pairs)} dataset pairs for '{target_organelle}'")
+
+    # Apply scale updates if requested and base_resolution is provided
+    if apply_scale_updates and base_resolution is not None:
+        print(f"Applying scale updates with base_resolution={base_resolution}...")
+        from dinov3_playground.zarr_util import update_datapaths_with_target_scales
+
+        for organelle in result:
+            if result[organelle]:  # Only process if we have pairs
+                updated_pairs = update_datapaths_with_target_scales(
+                    result[organelle],
+                    base_resolution,
+                    use_highest_res_for_raw=use_highest_res_for_raw,
+                    min_resolution_for_raw=min_resolution_for_raw,
+                )
+                result[organelle] = updated_pairs
+                print(
+                    f"Updated {len(updated_pairs)} dataset pairs for '{organelle}' with scale information"
+                )
+
+    return result
+
+
+def generate_multi_organelle_dataset_pairs(
+    organelle_list,
+    max_pairs=np.inf,
+    base_path="/nrs/cellmap/data",
+    base_resolution=None,
+    use_highest_res_for_raw=False,
+    min_resolution_for_raw=None,
+    apply_scale_updates=True,
+    require_all_organelles=False,
+    context_scale=None,  # NEW: Add context data at this resolution (e.g., 8 for 8nm)
+):
+    """
+    Generate multi-organelle dataset pairs where each pair contains multiple organelles from the same dataset/crop.
+
+    Parameters:
+    -----------
+    organelle_list : list of str
+        List of organelle names to include in each dataset pair
+    max_pairs : int
+        Maximum number of dataset pairs to generate
+    base_path : str
+        Base path to search (default: "/nrs/cellmap/data")
+    base_resolution : int or float, optional
+        Target resolution for labels. If provided with apply_scale_updates=True,
+        will update paths with appropriate scale information.
+    use_highest_res_for_raw : bool, default=False
+        If True, use highest available resolution for raw data instead of base_resolution.
+    min_resolution_for_raw : int, float, or Coordinate, optional
+        Minimum allowed resolution for raw data when use_highest_res_for_raw=True.
+    apply_scale_updates : bool, default=True
+        If True and base_resolution is provided, applies scale updates to dataset paths.
+    require_all_organelles : bool, default=False
+        If True, only include dataset pairs that have ALL specified organelles.
+        If False, include pairs that have at least one of the specified organelles.
+    context_scale : int or float, optional
+        If provided, adds a context raw data source at this resolution (e.g., 8 for 8nm).
+        The context data will be named "raw_context" or "raw_{context_scale}nm" in the dataset pair.
+
+    Returns:
+    --------
+    list: List of dataset pairs in multi-class format:
+        [
+            {
+                'raw': 'path_to_raw',
+                'organelle1': 'path_to_organelle1_gt',
+                'organelle2': 'path_to_organelle2_gt',
+                ...
+            },
+            ...
+        ]
+    """
+    import os
+
+    result = []
+
+    # Get all organelle data
+    organelle_data, _ = extract_organelle_directories(
+        base_path=base_path, organelle_list=organelle_list
+    )
+
+    pair_count = 0
+
+    for dataset, crops in organelle_data.items():
+        if pair_count >= max_pairs:
+            break
+
+        for crop_num, available_organelles in crops.items():
+            if pair_count >= max_pairs:
+                break
+
+            # Check if this crop has the required organelles
+            if require_all_organelles:
+                if not all(org in available_organelles for org in organelle_list):
+                    continue
+                organelles_to_include = organelle_list
+            else:
+                # Include any organelles that are available
+                organelles_to_include = [
+                    org for org in organelle_list if org in available_organelles
+                ]
+                if not organelles_to_include:  # Skip if no organelles available
+                    continue
+
+            raw_path = f"{base_path}/{dataset}/{dataset}.zarr/recon-1/em/fibsem-uint8"
+
+            # Verify raw path exists
+            if not os.path.exists(raw_path):
+                continue
+
+            # Build the dataset pair
+            pair = {"raw": raw_path}
+            all_paths_exist = True
+
+            # Add context raw data if requested
+            if context_scale is not None:
+                context_raw_path = (
+                    f"{base_path}/{dataset}/{dataset}.zarr/recon-1/em/fibsem-uint8"
+                )
+                context_key = f"raw_{int(context_scale)}nm"
+                pair[context_key] = context_raw_path
+                # Note: We'll handle the actual scale selection during data loading
+
+            for organelle in organelles_to_include:
+                gt_path = f"{base_path}/{dataset}/{dataset}.zarr/recon-1/labels/groundtruth/crop{crop_num}/{organelle}"
+                if os.path.exists(gt_path):
+                    pair[organelle] = gt_path
+                else:
+                    all_paths_exist = False
+                    break
+
+            if (
+                all_paths_exist and len(pair) > 1
+            ):  # Must have at least raw + one organelle
+                result.append(pair)
+                pair_count += 1
+
+    print(f"Generated {len(result)} multi-organelle dataset pairs")
+    if result:
+        example_organelles = list(result[0].keys())
+        example_organelles.remove("raw")
+        print(f"  Example organelles in pairs: {example_organelles}")
+
+    # Apply scale updates if requested and base_resolution is provided
+    if apply_scale_updates and base_resolution is not None and result:
+        print(f"Applying scale updates with base_resolution={base_resolution}...")
+        from dinov3_playground.zarr_util import update_datapaths_with_target_scales
+
+        result = update_datapaths_with_target_scales(
+            result,
+            base_resolution,
+            use_highest_res_for_raw=use_highest_res_for_raw,
+            min_resolution_for_raw=min_resolution_for_raw,
+            context_scale=context_scale,  # Pass context_scale for context data path updates
+        )
+        print(
+            f"Updated {len(result)} multi-organelle dataset pairs with scale information"
+        )
+
+    return result
