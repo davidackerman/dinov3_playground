@@ -360,6 +360,8 @@ def get_loss_function(loss_type, class_weights=None, **kwargs):
         - 'dice': Dice Loss
         - 'focal_dice': Combined Focal + Dice Loss
         - 'tversky': Tversky Loss
+        - 'affinity': Affinity Loss (BCE with class weighting)
+        - 'boundary_affinity': Boundary-Weighted Affinity Loss (EDT-based)
     class_weights : torch.Tensor, optional
         Class weights for weighted losses
     **kwargs : dict
@@ -370,6 +372,11 @@ def get_loss_function(loss_type, class_weights=None, **kwargs):
         - dice_smooth: Smoothing for Dice loss (default: 1.0)
         - alpha: Tversky alpha parameter (default: 0.5)
         - beta: Tversky beta parameter (default: 0.5)
+        - use_class_weights: For affinity losses (default: True)
+        - pos_weight: Positive class weight for affinity losses (default: None)
+        - boundary_weight: Max weight at boundaries for boundary_affinity (default: 10.0)
+        - sigma: Distance decay for boundary_affinity (default: 5.0)
+        - anisotropy: Voxel anisotropy tuple for boundary_affinity (default: (1.0, 1.0, 1.0))
 
     Returns:
     --------
@@ -378,8 +385,16 @@ def get_loss_function(loss_type, class_weights=None, **kwargs):
 
     Example:
     --------
-    >>> weights = torch.tensor([1.0, 5.0, 10.0, 20.0])
-    >>> criterion = get_loss_function('focal_dice', class_weights=weights, gamma=2.0)
+    >>> # Standard affinity loss
+    >>> criterion = get_loss_function('affinity', use_class_weights=True)
+    >>>
+    >>> # Boundary-weighted affinity loss with custom parameters
+    >>> criterion = get_loss_function(
+    ...     'boundary_affinity',
+    ...     boundary_weight=15.0,  # Strong boundary emphasis
+    ...     sigma=3.0,              # Narrow boundary region
+    ...     anisotropy=(2.0, 1.0, 1.0)  # 2nm z, 1nm xy
+    ... )
     """
     loss_type = loss_type.lower()
 
@@ -418,8 +433,33 @@ def get_loss_function(loss_type, class_weights=None, **kwargs):
         smooth = kwargs.get("dice_smooth", 1.0)
         return TverskyLoss(alpha=alpha, beta=beta, smooth=smooth)
 
+    elif loss_type == "affinity":
+        # Import here to avoid circular imports
+        from .affinity_utils import AffinityLoss
+
+        use_class_weights = kwargs.get("use_class_weights", True)
+        pos_weight = kwargs.get("pos_weight", None)
+        return AffinityLoss(use_class_weights=use_class_weights, pos_weight=pos_weight)
+
+    elif loss_type == "boundary_affinity":
+        # Import here to avoid circular imports
+        from .affinity_utils import BoundaryWeightedAffinityLoss
+
+        boundary_weight = kwargs.get("boundary_weight", 10.0)
+        sigma = kwargs.get("sigma", 5.0)
+        anisotropy = kwargs.get("anisotropy", (1.0, 1.0, 1.0))
+        use_class_weights = kwargs.get("use_class_weights", True)
+        pos_weight = kwargs.get("pos_weight", None)
+        return BoundaryWeightedAffinityLoss(
+            boundary_weight=boundary_weight,
+            sigma=sigma,
+            anisotropy=anisotropy,
+            use_class_weights=use_class_weights,
+            pos_weight=pos_weight,
+        )
+
     else:
         raise ValueError(
             f"Unknown loss type: {loss_type}. "
-            f"Choose from: ce, weighted_ce, focal, dice, focal_dice, tversky"
+            f"Choose from: ce, weighted_ce, focal, dice, focal_dice, tversky, affinity, boundary_affinity"
         )

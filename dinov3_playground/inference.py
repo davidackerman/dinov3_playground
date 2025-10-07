@@ -490,7 +490,8 @@ class DINOv3UNet3DInference:
         self.unet3d.eval()
 
         # Get orthogonal planes setting from training config
-        use_orthogonal_planes = self.training_config.get("use_orthogonal_planes", True)
+        # Default to False for backward compatibility with models trained before orthogonal planes were added
+        use_orthogonal_planes = self.training_config.get("use_orthogonal_planes", False)
         print(f"Using orthogonal planes processing: {use_orthogonal_planes}")
 
         # Create pipeline for easier inference
@@ -613,12 +614,30 @@ class DINOv3UNet3DInference:
                 # Standard inference without context
                 logits = self.unet3d(local_features)
 
-            probabilities = torch.softmax(logits, dim=1)
-            predictions = torch.argmax(logits, dim=1)
+            # Check output type to determine post-processing
+            output_type = self.model_config.get("output_type", "labels")
+
+            if output_type == "affinities":
+                # For affinities: apply sigmoid to get probabilities [0, 1]
+                # Output shape: (batch, num_offsets, D, H, W)
+                probabilities = torch.sigmoid(logits)
+                predictions = (
+                    probabilities  # For affinities, return probabilities as predictions
+                )
+            else:
+                # For classification: apply softmax and argmax
+                probabilities = torch.softmax(logits, dim=1)
+                predictions = torch.argmax(logits, dim=1)
 
         # Convert back to numpy
-        predictions_np = predictions[0].cpu().numpy()
-        probabilities_np = probabilities[0].cpu().numpy()
+        if output_type == "affinities":
+            # Return all channels for affinities (num_offsets, D, H, W)
+            predictions_np = predictions[0].cpu().numpy()
+            probabilities_np = probabilities[0].cpu().numpy()
+        else:
+            # Return class predictions for segmentation
+            predictions_np = predictions[0].cpu().numpy()
+            probabilities_np = probabilities[0].cpu().numpy()
 
         if return_probabilities:
             return predictions_np, probabilities_np

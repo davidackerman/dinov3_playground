@@ -143,6 +143,8 @@ class MemoryEfficientDataLoader3D:
         use_orthogonal_planes=True,  # NEW PARAMETER for 3-plane processing
         enable_detailed_timing=True,  # NEW PARAMETER for detailed timing
         verbose=True,  # NEW PARAMETER to control verbose output
+        output_type="labels",  # NEW PARAMETER: "labels" or "affinities"
+        affinity_offsets=None,  # NEW PARAMETER: list of (z,y,x) offsets for affinities
     ):
         """
         Initialize memory-efficient 3D data loader.
@@ -181,6 +183,12 @@ class MemoryEfficientDataLoader3D:
         use_orthogonal_planes : bool, default=True
             If True, processes slices in all 3 orthogonal planes (XY, XZ, YZ) and averages them.
             If False, processes only XY planes (original behavior).
+        output_type : str, default="labels"
+            Type of output target: "labels" for class labels or "affinities" for affinity graphs.
+            When "affinities", GT will be converted from instance segmentation to affinities.
+        affinity_offsets : list of tuples, optional
+            List of (z, y, x) offsets for computing affinities. If None and output_type="affinities",
+            defaults to [(1,0,0), (0,1,0), (0,0,1)] for +z, +y, +x directions.
         """
 
         # Validate inputs with ROI-level padding support
@@ -286,6 +294,19 @@ class MemoryEfficientDataLoader3D:
         )
         self.verbose = verbose  # Store verbose output mode
 
+        # Handle affinity output
+        self.output_type = output_type
+        if affinity_offsets is None and output_type == "affinities":
+            # Default: affinities in +z, +y, +x directions
+            self.affinity_offsets = [(1, 0, 0), (0, 1, 0), (0, 0, 1)]
+        else:
+            self.affinity_offsets = affinity_offsets
+
+        if output_type == "affinities":
+            print(f"  - Output type: Affinities with offsets {self.affinity_offsets}")
+        else:
+            print(f"  - Output type: Class labels")
+
         # Calculate padding requirements for sliding window
         self._calculate_padding_requirements()
 
@@ -347,8 +368,11 @@ class MemoryEfficientDataLoader3D:
 
         Returns:
         --------
-        tuple: (batch_volumes, batch_gt, batch_masks, batch_context) of shape (batch_size, D, H, W)
-               batch_context will be None if no context data available
+        tuple: (batch_volumes, batch_gt, batch_masks, batch_context)
+               - batch_volumes: shape (batch_size, D, H, W)
+               - batch_gt: shape (batch_size, D, H, W) for labels or (batch_size, num_offsets, D, H, W) for affinities
+               - batch_masks: shape (batch_size, D, H, W)
+               - batch_context: None or shape (batch_size, D, H, W)
         """
         # Sample random volumes from training pool
         sampled_indices = self.rng.choice(
@@ -360,6 +384,21 @@ class MemoryEfficientDataLoader3D:
         batch_volumes = self.raw_data[sampled_indices]
         batch_gt = self.gt_data[sampled_indices]
         batch_masks = self.gt_masks[sampled_indices]
+
+        # Convert to affinities if needed
+        if self.output_type == "affinities":
+            from .affinity_utils import compute_affinities_3d
+
+            # Convert each volume's instance segmentation to affinities
+            batch_affinities = []
+            for gt_volume in batch_gt:
+                affinities = compute_affinities_3d(
+                    gt_volume, offsets=self.affinity_offsets
+                )
+                batch_affinities.append(affinities)
+
+            # Stack into batch: (batch_size, num_offsets, D, H, W)
+            batch_gt = np.stack(batch_affinities, axis=0)
 
         # Add context data if available
         if self.has_context:
@@ -375,12 +414,30 @@ class MemoryEfficientDataLoader3D:
 
         Returns:
         --------
-        tuple: (val_volumes, val_gt, val_masks, val_context) of shape (val_pool_size, D, H, W)
-               val_context will be None if no context data available
+        tuple: (val_volumes, val_gt, val_masks, val_context)
+               - val_volumes: shape (val_pool_size, D, H, W)
+               - val_gt: shape (val_pool_size, D, H, W) for labels or (val_pool_size, num_offsets, D, H, W) for affinities
+               - val_masks: shape (val_pool_size, D, H, W)
+               - val_context: None or shape (val_pool_size, D, H, W)
         """
         val_volumes = self.raw_data[self.val_indices]
         val_gt = self.gt_data[self.val_indices]
         val_masks = self.gt_masks[self.val_indices]
+
+        # Convert to affinities if needed
+        if self.output_type == "affinities":
+            from .affinity_utils import compute_affinities_3d
+
+            # Convert each volume's instance segmentation to affinities
+            val_affinities = []
+            for gt_volume in val_gt:
+                affinities = compute_affinities_3d(
+                    gt_volume, offsets=self.affinity_offsets
+                )
+                val_affinities.append(affinities)
+
+            # Stack into batch: (val_pool_size, num_offsets, D, H, W)
+            val_gt = np.stack(val_affinities, axis=0)
 
         # Add context data if available
         if self.has_context:
@@ -1616,6 +1673,10 @@ def train_3d_unet_memory_efficient_v2(
     min_resolution_for_raw=None,
     base_resolution=None,
     class_names=None,  # NEW PARAMETER for class names
+    # Boundary weighting parameters (for boundary_affinity loss)
+    boundary_weight=10.0,  # Maximum weight at instance boundaries
+    boundary_sigma=5.0,  # Distance decay for boundary weights
+    boundary_anisotropy=None,  # Voxel anisotropy (z,y,x) for EDT
 ):
     """
     Train 3D UNet using memory-efficient data loading with DINOv3 features.
@@ -1806,6 +1867,17 @@ def train_3d_unet_memory_efficient_v2(
     if use_class_weighting and class_weights_tensor is not None:
         loss_class_weights = class_weights_tensor
 
+    # Prepare boundary weighting parameters
+    # Set anisotropy based on resolutions if not provided
+    if (
+        boundary_anisotropy is None
+        and base_resolution is not None
+        and min_resolution_for_raw is not None
+    ):
+        # Use resolution ratio as anisotropy hint
+        # For isotropic data, this will be (1.0, 1.0, 1.0)
+        boundary_anisotropy = (1.0, 1.0, 1.0)
+
     # Get loss function based on type
     criterion = get_loss_function(
         loss_type=loss_type,
@@ -1816,6 +1888,10 @@ def train_3d_unet_memory_efficient_v2(
         dice_smooth=dice_smooth,
         alpha=tversky_alpha,
         beta=tversky_beta,
+        # Boundary-weighted affinity parameters
+        boundary_weight=boundary_weight,
+        sigma=boundary_sigma,
+        anisotropy=boundary_anisotropy,
     )
 
     # Print loss configuration
@@ -1841,6 +1917,13 @@ def train_3d_unet_memory_efficient_v2(
     elif loss_type == "weighted_ce":
         if loss_class_weights is not None:
             print(f"  - Class weights: {loss_class_weights.cpu().numpy()}")
+    elif loss_type == "affinity":
+        print(f"  - Using class weighting: {use_class_weighting}")
+    elif loss_type == "boundary_affinity":
+        print(f"  - Boundary weight: {boundary_weight}")
+        print(f"  - Boundary sigma: {boundary_sigma}")
+        print(f"  - Boundary anisotropy: {boundary_anisotropy}")
+        print(f"  - Using class weighting: {use_class_weighting}")
 
     optimizer = optim.Adam(
         unet3d.parameters(), lr=learning_rate, weight_decay=weight_decay
@@ -1854,18 +1937,29 @@ def train_3d_unet_memory_efficient_v2(
     train_accs, val_accs = [], []
     train_class_accs, val_class_accs = [], []
     val_class_precisions, val_class_f1s, val_class_ious = [], [], []
-    best_mean_iou = 0.0  # Changed from best_val_acc to best_mean_iou
+    best_metric = (
+        0.0  # Best validation metric (IoU for segmentation, accuracy for affinities)
+    )
     epochs_without_improvement = 0
 
     # Helper function to compute loss (handles both CE-based and Dice-based losses)
-    def compute_loss(criterion, logits, targets):
+    def compute_loss(criterion, logits, targets, masks=None, instance_seg=None):
         """
         Compute loss, handling different loss function signatures.
 
         Some losses (Dice, Focal+Dice, Tversky) need num_classes parameter.
+        Affinity losses (affinity, boundary_affinity) need mask and instance_seg.
         """
         if loss_type in ["dice", "focal_dice", "tversky"]:
             return criterion(logits, targets, num_classes)
+        elif loss_type in ["affinity", "boundary_affinity"]:
+            # Affinity losses expect different signature
+            if loss_type == "boundary_affinity":
+                # Boundary-weighted loss needs instance segmentation
+                return criterion(logits, targets, instance_seg=instance_seg, mask=masks)
+            else:
+                # Standard affinity loss
+                return criterion(logits, targets, mask=masks)
         else:
             return criterion(logits, targets)
 
@@ -1928,7 +2022,18 @@ def train_3d_unet_memory_efficient_v2(
             dinov3_end = time.time()
             dinov3_time = dinov3_end - dinov3_start
 
-            train_labels = torch.tensor(train_gt_volumes, dtype=torch.long).to(device)
+            # Handle both label and affinity formats
+            if data_loader_3d.output_type == "affinities":
+                # Affinities are float32: (batch, num_offsets, D, H, W)
+                train_labels = torch.tensor(train_gt_volumes, dtype=torch.float32).to(
+                    device
+                )
+            else:
+                # Class labels are long: (batch, D, H, W)
+                train_labels = torch.tensor(train_gt_volumes, dtype=torch.long).to(
+                    device
+                )
+
             train_masks_tensor = torch.tensor(train_masks, dtype=torch.float32).to(
                 device
             )
@@ -2007,10 +2112,30 @@ def train_3d_unet_memory_efficient_v2(
 
                             masked_loss = per_pixel_loss * train_masks_tensor
                             loss = masked_loss.sum() / train_masks_tensor.sum()
+                        elif loss_type in ["affinity", "boundary_affinity"]:
+                            # Affinity losses handle masking internally
+                            # For boundary_affinity, pass the instance segmentation (train_gt_volumes)
+                            loss = compute_loss(
+                                criterion,
+                                logits,
+                                train_labels,
+                                masks=train_masks_tensor,
+                                instance_seg=train_gt_volumes,  # Original instance seg before affinity conversion
+                            )
                         else:
                             # For Dice-based losses, compute on full volume and weight the loss
                             # This is an approximation; ideally Dice should only use masked regions
-                            loss_full = compute_loss(criterion, logits, train_labels)
+                            loss_full = compute_loss(
+                                criterion,
+                                logits,
+                                train_labels,
+                                masks=train_masks_tensor,
+                                instance_seg=(
+                                    train_gt_volumes
+                                    if loss_type == "boundary_affinity"
+                                    else None
+                                ),
+                            )
                             # Weight by fraction of valid voxels
                             loss = loss_full
 
@@ -2019,7 +2144,17 @@ def train_3d_unet_memory_efficient_v2(
                             print(f"    final loss: {loss.item():.4f}")
                     else:
                         # Use standard loss when no masking needed
-                        loss = compute_loss(criterion, logits, train_labels)
+                        loss = compute_loss(
+                            criterion,
+                            logits,
+                            train_labels,
+                            masks=None,
+                            instance_seg=(
+                                train_gt_volumes
+                                if loss_type == "boundary_affinity"
+                                else None
+                            ),
+                        )
 
                         # Debug: Print unmasked loss for first batch of first epoch
                         if epoch == 0 and batch_idx == 0:
@@ -2071,38 +2206,68 @@ def train_3d_unet_memory_efficient_v2(
             with autocast(
                 device_type="cuda" if device.type == "cuda" else "cpu", enabled=False
             ):  # Disable autocast for metric calculations
-                predictions = torch.argmax(logits.float(), dim=1)
-                if use_masks:
-                    # Only for masked regions
-                    train_mask_bool = train_masks_tensor.bool()
-                    correct = (
-                        ((predictions == train_labels) & train_mask_bool).sum().item()
-                    )
-                    total = train_masks_tensor.sum().item()
+
+                # Handle different output types
+                if data_loader_3d.output_type == "affinities":
+                    # For affinities: apply sigmoid and threshold at 0.5
+                    predictions = (torch.sigmoid(logits.float()) > 0.5).float()
+                    # Compare binary predictions with binary targets
+                    if use_masks:
+                        # Expand mask to match affinity dimensions: (batch, D, H, W) -> (batch, num_offsets, D, H, W)
+                        train_mask_expanded = (
+                            train_masks_tensor.unsqueeze(1)
+                            .expand_as(predictions)
+                            .bool()
+                        )
+                        correct = (
+                            ((predictions == train_labels) & train_mask_expanded)
+                            .sum()
+                            .item()
+                        )
+                        total = train_mask_expanded.sum().item()
+                    else:
+                        correct = (predictions == train_labels).sum().item()
+                        total = train_labels.numel()
                 else:
-                    # All regions when no masking
-                    correct = (predictions == train_labels).sum().item()
-                    total = train_labels.numel()
+                    # For class labels: use argmax
+                    predictions = torch.argmax(logits.float(), dim=1)
+                    if use_masks:
+                        # Only for masked regions
+                        train_mask_bool = train_masks_tensor.bool()
+                        correct = (
+                            ((predictions == train_labels) & train_mask_bool)
+                            .sum()
+                            .item()
+                        )
+                        total = train_masks_tensor.sum().item()
+                    else:
+                        # All regions when no masking
+                        correct = (predictions == train_labels).sum().item()
+                        total = train_labels.numel()
 
             epoch_train_loss += loss.item() * total
             epoch_train_correct += correct
             epoch_train_total += total
 
             # Track per-class accuracy (conditional on mask usage)
-            for class_id in range(num_classes):
-                if use_masks:
-                    # Only in masked regions
-                    train_mask_bool = train_masks_tensor.bool()
-                    class_mask = (train_labels == class_id) & train_mask_bool
-                else:
-                    # All regions when no masking
-                    class_mask = train_labels == class_id
+            # Skip per-class metrics for affinity output since it's binary per direction
+            if data_loader_3d.output_type != "affinities":
+                for class_id in range(num_classes):
+                    if use_masks:
+                        # Only in masked regions
+                        train_mask_bool = train_masks_tensor.bool()
+                        class_mask = (train_labels == class_id) & train_mask_bool
+                    else:
+                        # All regions when no masking
+                        class_mask = train_labels == class_id
 
-                if class_mask.sum() > 0:
-                    class_correct = (predictions[class_mask] == class_id).sum().item()
-                    class_total = class_mask.sum().item()
-                    epoch_train_class_correct[class_id] += class_correct
-                    epoch_train_class_total[class_id] += class_total
+                    if class_mask.sum() > 0:
+                        class_correct = (
+                            (predictions[class_mask] == class_id).sum().item()
+                        )
+                        class_total = class_mask.sum().item()
+                        epoch_train_class_correct[class_id] += class_correct
+                        epoch_train_class_total[class_id] += class_total
 
             # TIMING: Print timing breakdown for this batch
             total_batch_time = dinov3_time + training_time
@@ -2246,11 +2411,22 @@ def train_3d_unet_memory_efficient_v2(
                 val_dinov3_time = val_dinov3_end - val_dinov3_start
 
                 # Get ground truth and mask for this volume and move to GPU
-                vol_gt = (
-                    torch.tensor(val_gt_volumes[vol_idx], dtype=torch.long)
-                    .unsqueeze(0)
-                    .to(device)
-                )
+                # Handle both label and affinity formats
+                if data_loader_3d.output_type == "affinities":
+                    # Affinities are float32: (1, num_offsets, D, H, W)
+                    vol_gt = (
+                        torch.tensor(val_gt_volumes[vol_idx], dtype=torch.float32)
+                        .unsqueeze(0)
+                        .to(device)
+                    )
+                else:
+                    # Class labels are long: (1, D, H, W)
+                    vol_gt = (
+                        torch.tensor(val_gt_volumes[vol_idx], dtype=torch.long)
+                        .unsqueeze(0)
+                        .to(device)
+                    )
+
                 vol_mask = (
                     torch.tensor(val_masks[vol_idx], dtype=torch.float32)
                     .unsqueeze(0)
@@ -2292,14 +2468,41 @@ def train_3d_unet_memory_efficient_v2(
                                 vol_loss = (
                                     vol_masked_loss.sum() / vol_mask.sum()
                                 ).item()
+                            elif loss_type in ["affinity", "boundary_affinity"]:
+                                # Affinity losses handle masking internally
+                                vol_loss = compute_loss(
+                                    criterion,
+                                    vol_logits,
+                                    vol_gt,
+                                    masks=vol_mask,
+                                    instance_seg=val_gt_volumes[
+                                        vol_idx
+                                    ],  # Original instance seg
+                                ).item()
                             else:
                                 vol_loss = compute_loss(
-                                    criterion, vol_logits, vol_gt
+                                    criterion,
+                                    vol_logits,
+                                    vol_gt,
+                                    masks=vol_mask,
+                                    instance_seg=(
+                                        val_gt_volumes[vol_idx]
+                                        if loss_type == "boundary_affinity"
+                                        else None
+                                    ),
                                 ).item()
                         else:
                             # Use standard loss when no masking needed
                             vol_loss = compute_loss(
-                                criterion, vol_logits, vol_gt
+                                criterion,
+                                vol_logits,
+                                vol_gt,
+                                masks=None,
+                                instance_seg=(
+                                    val_gt_volume
+                                    if loss_type == "boundary_affinity"
+                                    else None
+                                ),
                             ).item()
                 else:
                     # Pass raw and context features separately for proper fusion
@@ -2322,13 +2525,40 @@ def train_3d_unet_memory_efficient_v2(
 
                             vol_masked_loss = vol_per_pixel_loss * vol_mask
                             vol_loss = (vol_masked_loss.sum() / vol_mask.sum()).item()
+                        elif loss_type in ["affinity", "boundary_affinity"]:
+                            # Affinity losses handle masking internally
+                            vol_loss = compute_loss(
+                                criterion,
+                                vol_logits,
+                                vol_gt,
+                                masks=vol_mask,
+                                instance_seg=val_gt_volume,  # Original instance seg
+                            ).item()
                         else:
                             vol_loss = compute_loss(
-                                criterion, vol_logits, vol_gt
+                                criterion,
+                                vol_logits,
+                                vol_gt,
+                                masks=vol_mask,
+                                instance_seg=(
+                                    val_gt_volume
+                                    if loss_type == "boundary_affinity"
+                                    else None
+                                ),
                             ).item()
                     else:
                         # Use standard loss when no masking needed
-                        vol_loss = compute_loss(criterion, vol_logits, vol_gt).item()
+                        vol_loss = compute_loss(
+                            criterion,
+                            vol_logits,
+                            vol_gt,
+                            masks=None,
+                            instance_seg=(
+                                val_gt_volume
+                                if loss_type == "boundary_affinity"
+                                else None
+                            ),
+                        ).item()
 
                 # TIMING: End validation inference
                 val_inference_end = time.time()
@@ -2339,52 +2569,76 @@ def train_3d_unet_memory_efficient_v2(
                 total_val_inference_time += val_inference_time
 
                 # Convert to predictions
-                vol_predictions = torch.argmax(vol_logits.float(), dim=1)
+                if data_loader_3d.output_type == "affinities":
+                    # For affinities: apply sigmoid and threshold at 0.5
+                    vol_predictions = (torch.sigmoid(vol_logits.float()) > 0.5).float()
+                else:
+                    # For class labels: use argmax
+                    vol_predictions = torch.argmax(vol_logits.float(), dim=1)
 
                 # Accumulate basic metrics (conditional on mask usage)
-                if use_vol_masks:
-                    # Only for masked regions
-                    vol_mask_bool = vol_mask.bool()
-                    vol_correct = (
-                        ((vol_predictions == vol_gt) & vol_mask_bool).sum().item()
-                    )
-                    vol_valid_voxels = vol_mask.sum().item()
+                if data_loader_3d.output_type == "affinities":
+                    # For affinities, expand mask to match affinity dimensions
+                    if use_vol_masks:
+                        vol_mask_expanded = (
+                            vol_mask.unsqueeze(1).expand_as(vol_predictions).bool()
+                        )
+                        vol_correct = (
+                            ((vol_predictions == vol_gt) & vol_mask_expanded)
+                            .sum()
+                            .item()
+                        )
+                        vol_valid_voxels = vol_mask_expanded.sum().item()
+                    else:
+                        vol_correct = (vol_predictions == vol_gt).sum().item()
+                        vol_valid_voxels = vol_gt.numel()
                 else:
-                    # All regions when no masking
-                    vol_correct = (vol_predictions == vol_gt).sum().item()
-                    vol_valid_voxels = vol_gt.numel()
+                    # For class labels
+                    if use_vol_masks:
+                        # Only for masked regions
+                        vol_mask_bool = vol_mask.bool()
+                        vol_correct = (
+                            ((vol_predictions == vol_gt) & vol_mask_bool).sum().item()
+                        )
+                        vol_valid_voxels = vol_mask.sum().item()
+                    else:
+                        # All regions when no masking
+                        vol_correct = (vol_predictions == vol_gt).sum().item()
+                        vol_valid_voxels = vol_gt.numel()
 
                 val_total_loss += vol_loss * vol_valid_voxels
                 val_total_correct += vol_correct
                 val_total_voxels += vol_valid_voxels
 
                 # Accumulate per-class metrics (convert to CPU for efficiency, conditional on mask usage)
-                vol_gt_cpu = vol_gt.cpu().numpy()
-                vol_pred_cpu = vol_predictions.cpu().numpy()
+                # Skip per-class metrics for affinity output
+                if data_loader_3d.output_type != "affinities":
+                    vol_gt_cpu = vol_gt.cpu().numpy()
+                    vol_pred_cpu = vol_predictions.cpu().numpy()
 
-                if use_vol_masks:
-                    vol_mask_cpu = vol_mask.cpu().numpy().astype(bool)
-                else:
-                    # Create a full mask when no masking is needed
-                    vol_mask_cpu = np.ones_like(vol_gt_cpu, dtype=bool)
+                    if use_vol_masks:
+                        vol_mask_cpu = vol_mask.cpu().numpy().astype(bool)
+                    else:
+                        # Create a full mask when no masking is needed
+                        vol_mask_cpu = np.ones_like(vol_gt_cpu, dtype=bool)
 
-                for class_id in range(num_classes):
-                    # For confusion matrix, we need to consider the valid region
-                    valid_gt_mask = (vol_gt_cpu == class_id) & vol_mask_cpu
-                    valid_not_gt_mask = (vol_gt_cpu != class_id) & vol_mask_cpu
-                    valid_pred_mask = (vol_pred_cpu == class_id) & vol_mask_cpu
+                    for class_id in range(num_classes):
+                        # For confusion matrix, we need to consider the valid region
+                        valid_gt_mask = (vol_gt_cpu == class_id) & vol_mask_cpu
+                        valid_not_gt_mask = (vol_gt_cpu != class_id) & vol_mask_cpu
+                        valid_pred_mask = (vol_pred_cpu == class_id) & vol_mask_cpu
 
-                    # Confusion matrix components (only in valid regions)
-                    true_positives = np.sum(valid_gt_mask & valid_pred_mask)
-                    false_positives = np.sum(valid_not_gt_mask & valid_pred_mask)
-                    false_negatives = np.sum(valid_gt_mask & ~valid_pred_mask)
+                        # Confusion matrix components (only in valid regions)
+                        true_positives = np.sum(valid_gt_mask & valid_pred_mask)
+                        false_positives = np.sum(valid_not_gt_mask & valid_pred_mask)
+                        false_negatives = np.sum(valid_gt_mask & ~valid_pred_mask)
 
-                    # Accumulate
-                    val_class_true_positives[class_id] += true_positives
-                    val_class_false_positives[class_id] += false_positives
-                    val_class_false_negatives[class_id] += false_negatives
-                    val_class_total_gt[class_id] += np.sum(valid_gt_mask)
-                    val_class_total_pred[class_id] += np.sum(valid_pred_mask)
+                        # Accumulate
+                        val_class_true_positives[class_id] += true_positives
+                        val_class_false_positives[class_id] += false_positives
+                        val_class_false_negatives[class_id] += false_negatives
+                        val_class_total_gt[class_id] += np.sum(valid_gt_mask)
+                        val_class_total_pred[class_id] += np.sum(valid_pred_mask)
 
                 # Immediately free GPU memory for this volume
                 del vol_features, vol_logits, vol_predictions, vol_gt, vol_mask
@@ -2515,17 +2769,27 @@ def train_3d_unet_memory_efficient_v2(
         val_class_ious.append(val_class_iou)
 
         # Calculate mean IoU for both scheduler and best model selection
-        current_mean_iou = np.mean(val_class_iou)
+        # For affinities, use validation accuracy instead of IoU
+        if data_loader_3d.output_type == "affinities":
+            # For affinity training, use validation accuracy as the metric
+            current_metric = val_acc
+            metric_name = "Val Accuracy"
+            current_mean_iou = None  # Not applicable for affinities
+        else:
+            # For segmentation, use mean IoU
+            current_mean_iou = np.mean(val_class_iou)
+            current_metric = current_mean_iou
+            metric_name = "Mean IoU"
 
         # Learning rate scheduling
         old_lr = optimizer.param_groups[0]["lr"]
-        scheduler.step(current_mean_iou)
+        scheduler.step(current_metric)
         new_lr = optimizer.param_groups[0]["lr"]
 
-        # Check if this is the best mean IoU so far
+        # Check if this is the best metric so far
         is_best_model = False
-        if current_mean_iou > best_mean_iou + min_delta:
-            best_mean_iou = current_mean_iou
+        if current_metric > best_metric + min_delta:
+            best_metric = current_metric  # Store best metric (IoU or accuracy)
             epochs_without_improvement = 0
             is_best_model = True
         else:
@@ -2539,33 +2803,40 @@ def train_3d_unet_memory_efficient_v2(
         print(
             f"  Train: Loss={train_loss:.4f}, Acc={train_acc:.4f} (from {epoch_train_total} voxels)"
         )
-        print(
-            f"  Val:   Loss={val_loss:.4f}, IoU={current_mean_iou:.4f}, Acc={val_acc:.4f}"
-        )
 
-        # Print comprehensive per-class metrics in a nice table
-        train_class_percentages = [
-            count / epoch_train_total * 100 for count in epoch_train_class_total
-        ]
-        val_class_counts = val_class_total_gt  # Use the counts we already calculated
-        val_class_percentages = [
-            count / val_total_voxels * 100 for count in val_class_counts
-        ]
+        if data_loader_3d.output_type == "affinities":
+            print(f"  Val:   Loss={val_loss:.4f}, Acc={val_acc:.4f}")
+        else:
+            print(
+                f"  Val:   Loss={val_loss:.4f}, IoU={current_metric:.4f}, Acc={val_acc:.4f}"
+            )
 
-        print_class_metrics_table(
-            class_names=class_names,
-            train_recall=train_class_acc,
-            train_dist=train_class_percentages,
-            val_recall=val_class_acc,
-            val_precision=val_class_precision,
-            val_f1=val_class_f1,
-            val_iou=val_class_iou,
-            val_dist=val_class_percentages,
-        )
+        # Print comprehensive per-class metrics in a nice table (only for segmentation)
+        if data_loader_3d.output_type != "affinities":
+            train_class_percentages = [
+                count / epoch_train_total * 100 for count in epoch_train_class_total
+            ]
+            val_class_counts = (
+                val_class_total_gt  # Use the counts we already calculated
+            )
+            val_class_percentages = [
+                count / val_total_voxels * 100 for count in val_class_counts
+            ]
 
-        print(f"  Mean IoU: {current_mean_iou:.4f}")
+            print_class_metrics_table(
+                class_names=class_names,
+                train_recall=train_class_acc,
+                train_dist=train_class_percentages,
+                val_recall=val_class_acc,
+                val_precision=val_class_precision,
+                val_f1=val_class_f1,
+                val_iou=val_class_iou,
+                val_dist=val_class_percentages,
+            )
 
-        print(f"  Best Mean IoU: {best_mean_iou:.4f}, LR: {current_lr:.6f}")
+            print(f"  Mean IoU: {current_metric:.4f}")
+
+        print(f"  Best {metric_name}: {best_metric:.4f}, LR: {current_lr:.6f}")
         print(f"  Epochs without improvement: {epochs_without_improvement}")
         if new_lr < old_lr:
             print(f"  Learning rate reduced: {old_lr:.6f} -> {new_lr:.6f}")
@@ -2573,7 +2844,7 @@ def train_3d_unet_memory_efficient_v2(
         # Save checkpoints
         if save_checkpoints:
             # For backward compatibility with checkpoint system, alias the best metric
-            best_val_acc = best_mean_iou
+            best_val_acc = best_metric
             stats_data = {
                 "epoch": epoch + 1,
                 "train_losses": train_losses,
@@ -2591,6 +2862,7 @@ def train_3d_unet_memory_efficient_v2(
                 ),
                 "training_config": {
                     "num_classes": num_classes,
+                    "class_names": class_names,  # Add class names
                     "learning_rate": learning_rate,
                     "weight_decay": weight_decay,
                     "patience": patience,
@@ -2603,6 +2875,15 @@ def train_3d_unet_memory_efficient_v2(
                     "model_id": model_id,
                     "input_channels": current_output_channels,
                     "use_class_weighting": use_class_weighting,
+                    # Loss function parameters
+                    "loss_type": loss_type,
+                    "focal_gamma": focal_gamma,
+                    "focal_weight": focal_weight,
+                    "dice_weight": dice_weight,
+                    "dice_smooth": dice_smooth,
+                    "tversky_alpha": tversky_alpha,
+                    "tversky_beta": tversky_beta,
+                    # Volume and feature sizes
                     "target_volume_size": data_loader_3d.target_volume_size,
                     "dinov3_slice_size": data_loader_3d.dinov3_slice_size,
                     "image_size": data_loader_3d.dinov3_slice_size,  # For DINOv3 initialization
@@ -2620,6 +2901,11 @@ def train_3d_unet_memory_efficient_v2(
                     # Data resolution parameters
                     "min_resolution_for_raw": min_resolution_for_raw,  # Add raw data resolution
                     "base_resolution": base_resolution,  # Add ground truth resolution
+                    # Context fusion parameters
+                    "use_context_fusion": use_context_fusion,  # Add context fusion flag
+                    "context_scale": getattr(
+                        data_loader_3d, "context_scale", None
+                    ),  # Add context resolution if available
                     # Additional data loader parameters
                     "dinov3_stride": getattr(
                         data_loader_3d, "dinov3_stride", None
@@ -2627,6 +2913,13 @@ def train_3d_unet_memory_efficient_v2(
                     "verbose": getattr(
                         data_loader_3d, "verbose", True
                     ),  # Add verbose setting
+                    # Affinity parameters
+                    "output_type": getattr(
+                        data_loader_3d, "output_type", "labels"
+                    ),  # Add output type
+                    "affinity_offsets": getattr(
+                        data_loader_3d, "affinity_offsets", None
+                    ),  # Add affinity offsets
                 },
                 "model_config": {
                     "num_classes": num_classes,
@@ -2643,6 +2936,18 @@ def train_3d_unet_memory_efficient_v2(
                     # Data resolution parameters for model recreation
                     "min_resolution_for_raw": min_resolution_for_raw,
                     "base_resolution": base_resolution,
+                    # Context fusion parameters
+                    "use_context_fusion": use_context_fusion,  # Add context fusion flag
+                    "context_scale": getattr(
+                        data_loader_3d, "context_scale", None
+                    ),  # Add context resolution
+                    # Affinity parameters
+                    "output_type": getattr(
+                        data_loader_3d, "output_type", "labels"
+                    ),  # Add output type
+                    "affinity_offsets": getattr(
+                        data_loader_3d, "affinity_offsets", None
+                    ),  # Add affinity offsets
                 },
             }
 
@@ -2669,9 +2974,14 @@ def train_3d_unet_memory_efficient_v2(
                 with open(best_path, "wb") as f:
                     pickle.dump(checkpoint_data, f)
 
-                print(
-                    f"  *** NEW BEST 3D MODEL SAVED: IoU={current_mean_iou:.4f} (Acc={val_acc:.4f}) ***"
-                )
+                if data_loader_3d.output_type == "affinities":
+                    print(
+                        f"  *** NEW BEST 3D MODEL SAVED: Acc={current_metric:.4f} ***"
+                    )
+                else:
+                    print(
+                        f"  *** NEW BEST 3D MODEL SAVED: IoU={current_metric:.4f} (Acc={val_acc:.4f}) ***"
+                    )
 
             # Also save model checkpoint every N epochs if specified
             elif (
@@ -2691,9 +3001,14 @@ def train_3d_unet_memory_efficient_v2(
                 with open(epoch_path, "wb") as f:
                     pickle.dump(checkpoint_data, f)
 
-                print(
-                    f"  *** PERIODIC CHECKPOINT SAVED: Epoch {epoch+1} (IoU={current_mean_iou:.4f}) ***"
-                )
+                if data_loader_3d.output_type == "affinities":
+                    print(
+                        f"  *** PERIODIC CHECKPOINT SAVED: Epoch {epoch+1} (Acc={current_metric:.4f}) ***"
+                    )
+                else:
+                    print(
+                        f"  *** PERIODIC CHECKPOINT SAVED: Epoch {epoch+1} (IoU={current_metric:.4f}) ***"
+                    )
 
             print(f"  Stats saved: {os.path.basename(stats_path)}")
 
@@ -2721,7 +3036,8 @@ def train_3d_unet_memory_efficient_v2(
         "val_class_precisions": val_class_precisions,
         "val_class_f1s": val_class_f1s,
         "val_class_ious": val_class_ious,
-        "best_mean_iou": best_mean_iou,
+        "best_metric": best_metric,  # Best validation metric (IoU or accuracy)
+        "best_mean_iou": best_metric,  # Backward compatibility
         "epochs_trained": len(train_losses),
         "checkpoint_dir": checkpoint_dir,
         "export_base_dir": export_base_dir,
@@ -2995,13 +3311,20 @@ def train_3d_unet_with_memory_efficient_loader(
     min_resolution_for_raw=None,  # NEW PARAMETER for raw data resolution
     base_resolution=None,  # NEW PARAMETER for ground truth resolution
     # LOSS FUNCTION PARAMETERS
-    loss_type="weighted_ce",  # 'ce', 'weighted_ce', 'focal', 'dice', 'focal_dice', 'tversky'
+    loss_type="weighted_ce",  # 'ce', 'weighted_ce', 'focal', 'dice', 'focal_dice', 'tversky', 'affinity', 'boundary_affinity'
     focal_gamma=2.0,  # Focusing parameter for Focal Loss
     focal_weight=0.5,  # Weight for focal component in combined loss
     dice_weight=0.5,  # Weight for dice component in combined loss
     dice_smooth=1.0,  # Smoothing for Dice loss
     tversky_alpha=0.5,  # Tversky alpha (FP weight)
     tversky_beta=0.5,  # Tversky beta (FN weight)
+    # BOUNDARY WEIGHTING PARAMETERS (for boundary_affinity loss)
+    boundary_weight=10.0,  # Maximum weight at instance boundaries (1.0 = no weighting)
+    boundary_sigma=5.0,  # Distance decay for boundary weights in pixels
+    boundary_anisotropy=None,  # Voxel anisotropy (z,y,x) for EDT; None = isotropic
+    # AFFINITY PARAMETERS
+    output_type="labels",  # 'labels' or 'affinities'
+    affinity_offsets=None,  # List of (z,y,x) tuples for affinity computation
 ):
     """
     Memory-efficient 3D UNet training with multiple precision and memory optimization options.
@@ -3027,6 +3350,13 @@ def train_3d_unet_with_memory_efficient_loader(
         Whether to use orthogonal plane processing (XY, XZ, YZ slices) for more comprehensive 3D features.
         When True, processes slices in all three orientations and averages the features.
         Default is False (standard Z-slice only processing).
+    output_type : str, optional
+        Type of output target: 'labels' for class labels or 'affinities' for affinity graphs.
+        When 'affinities', GT is converted from instance segmentation to binary affinities.
+        Default is 'labels'.
+    affinity_offsets : list of tuples, optional
+        List of (z, y, x) offsets for computing affinities. Only used when output_type='affinities'.
+        If None and output_type='affinities', defaults to [(1,0,0), (0,1,0), (0,0,1)] for +z, +y, +x directions.
     """
 
     # Auto-detect best memory settings
@@ -3181,6 +3511,8 @@ def train_3d_unet_with_memory_efficient_loader(
         dinov3_stride=dinov3_stride,  # NEW: Sliding window parameter
         use_orthogonal_planes=use_orthogonal_planes,  # NEW: Orthogonal planes parameter
         verbose=verbose,  # NEW: Verbose output parameter
+        output_type=output_type,  # NEW: Output type (labels or affinities)
+        affinity_offsets=affinity_offsets,  # NEW: Affinity offsets
     )
 
     print("Data loader created successfully!")
@@ -3222,6 +3554,10 @@ def train_3d_unet_with_memory_efficient_loader(
         dice_smooth=dice_smooth,
         tversky_alpha=tversky_alpha,
         tversky_beta=tversky_beta,
+        # Pass through boundary weighting parameters
+        boundary_weight=boundary_weight,
+        boundary_sigma=boundary_sigma,
+        boundary_anisotropy=boundary_anisotropy,
     )
 
     print(f"\n3D UNet training completed!")

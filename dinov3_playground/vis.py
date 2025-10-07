@@ -80,6 +80,7 @@ def gif_2d(
         - "labels": Label data with random colormap
         - "pca": PCA-transformed data
         - "affs": Affinity data
+        - "rgb": RGB data (3 channels)
         - "combined": Overlay labels on raw data with transparency (requires tuple of arrays)
     filename : str
         Output filename for the GIF
@@ -210,15 +211,33 @@ def gif_2d(
                         raw_display.max() - raw_display.min() + 1e-8
                     )
 
-                # Create labels overlay with transparency
-                labels_colored = label_cmap((labels_x % 256) / 255.0)
-                # Extract only RGB channels (drop alpha channel)
-                labels_rgb = labels_colored[..., :3]
-
-                # Create alpha mask (transparent where labels are 0/background)
-                alpha_mask = (labels_x > 0).astype(
-                    float
-                ) * 0.4  # 40% opacity for labels
+                # Handle labels/overlay - check if already RGB or needs colormap
+                if labels_x.ndim == 3:
+                    # Check if channels are first (3, H, W) or last (H, W, 3)
+                    if labels_x.shape[0] == 3:
+                        # Channels first (e.g., affinity visualization) - transpose to (H, W, 3)
+                        labels_rgb = labels_x.transpose(1, 2, 0)
+                        # For continuous values (like affinities 0-1), use the max across RGB channels
+                        # to control alpha, scaled by max opacity of 0.4
+                        # This makes higher affinity values more opaque, lower values more transparent
+                        alpha_mask = np.max(labels_rgb, axis=-1) * 0.4
+                    elif labels_x.shape[-1] == 3:
+                        # Channels last - already in correct format
+                        labels_rgb = labels_x
+                        # For continuous values, use max across RGB channels for alpha
+                        alpha_mask = np.max(labels_rgb, axis=-1) * 0.4
+                    else:
+                        # Not RGB, treat as labels
+                        labels_colored = label_cmap((labels_x % 256) / 255.0)
+                        labels_rgb = labels_colored[..., :3]
+                        alpha_mask = (labels_x > 0).astype(float) * 0.4
+                else:
+                    # Apply colormap for label data
+                    labels_colored = label_cmap((labels_x % 256) / 255.0)
+                    # Extract only RGB channels (drop alpha channel)
+                    labels_rgb = labels_colored[..., :3]
+                    # Create alpha mask (transparent where labels are 0/background)
+                    alpha_mask = (labels_x > 0).astype(float) * 0.4
 
                 # Ensure raw_display is RGB (3 channels)
                 if raw_display.ndim == 3:
@@ -244,6 +263,35 @@ def gif_2d(
 
                 im = axes[jj].imshow(
                     combined,
+                    animated=ii != 0,
+                )
+            elif array_types[key] == "rgb":
+                # Handle RGB arrays (e.g., affinity visualizations as RGB)
+                roi = arr.roi.copy()
+                roi.offset += Coordinate((ii,) + (0,) * (roi.dims - 1)) * arr.voxel_size
+                roi.shape = Coordinate((arr.voxel_size[0], *roi.shape[1:]))
+                # Show the RGB data
+                x = arr[roi].squeeze(-arr.voxel_size.dims)  # squeeze out z dim
+                shape = x.shape
+
+                # Handle channels-first (3, H, W) or channels-last (H, W, 3)
+                if len(shape) == 3:
+                    if shape[0] == 3:
+                        # Channels first (3, H, W) - transpose to (H, W, 3)
+                        x = x.transpose(1, 2, 0)
+                    elif shape[-1] != 3:
+                        raise ValueError(
+                            f"RGB array must have 3 channels, got shape {shape}"
+                        )
+                    # Now x is (H, W, 3)
+                    scale_factor = x.shape[0] // 256 if x.shape[0] > 256 else 1
+                    x = x[::scale_factor, ::scale_factor, :]
+                else:
+                    raise ValueError(f"RGB array must be 3D, got shape {shape}")
+
+                # Display RGB directly
+                im = axes[jj].imshow(
+                    x,
                     animated=ii != 0,
                 )
             elif array_types[key] == "raw" or array_types[key] == "pca":
@@ -537,6 +585,211 @@ def cube(
     plt.close(fig)
 
 
-# %%
-get_cmap()
-# %%
+import numpy as np
+from pathlib import Path
+import imageio.v3 as iio
+from funlib.geometry import Coordinate
+from matplotlib.colors import ListedColormap
+
+
+def _to_uint8(img):
+    # expects float in [0,1] or any numeric; returns uint8 [0,255]
+    img = np.asarray(img)
+    if img.dtype != np.uint8:
+        mn = np.nanmin(img)
+        mx = np.nanmax(img)
+        if mx > mn:
+            img = (img - mn) / (mx - mn)
+        else:
+            img = np.zeros_like(img, dtype=np.float32)
+        img = (img * 255.0 + 0.5).astype(np.uint8)
+    return img
+
+
+def _ensure_rgb(x):
+    x = np.asarray(x)
+    if x.ndim == 2:  # H,W
+        x = np.stack([x] * 3, axis=-1)
+    elif x.ndim == 3:
+        if x.shape[0] == 3 and x.shape[-1] != 3:  # 3,H,W -> H,W,3
+            x = x.transpose(1, 2, 0)
+        elif x.shape[-1] == 1:
+            x = np.repeat(x, 3, axis=-1)
+        elif x.shape[-1] != 3:
+            raise ValueError(f"Expected RGB, got shape {x.shape}")
+    else:
+        raise ValueError("Expected 2D or 3D array for image")
+    return x
+
+
+def _slice_and_downscale(arr, ii, target_hw=256):
+    # Extract z-slice ii and downscale by integer stride to ~target size
+    roi = arr.roi.copy()
+    roi.offset += Coordinate((ii,) + (0,) * (roi.dims - 1)) * arr.voxel_size
+    roi.shape = Coordinate((arr.voxel_size[0], *roi.shape[1:]))
+    x = arr[roi].squeeze(-arr.voxel_size.dims)  # remove z
+    h = x.shape[-2] if x.ndim == 3 else x.shape[0]
+    stride = max(1, h // target_hw)
+    if x.ndim == 2:
+        return x[::stride, ::stride]
+    elif x.ndim == 3:
+        return x[:, ::stride, ::stride]
+    else:
+        raise ValueError("slice must be 2D or 3D (C,H,W)")
+
+
+def _labels_to_rgb(labels2d, cmap: ListedColormap):
+    # labels2d int -> RGB uint8 using fixed palette (fast, deterministic)
+    # Expect labels in [0, ...], we mod 256 like your code
+    idx = (labels2d % 256).astype(np.uint8)
+    rgba = (cmap(np.arange(256)) * 255 + 0.5).astype(np.uint8)  # (256,4)
+    lut = rgba[:, :3]  # RGB
+    return lut[idx]
+
+
+def gif_2d_fast(
+    arrays: dict[str, Array],
+    array_types: dict[str, str],
+    filename: str,
+    title: str,  # kept for API parity; not drawn (GIFs don't have titles)
+    fps: int = 10,
+    overwrite: bool = False,
+    target_hw: int = 256,  # matches your downscale intent
+):
+    """
+    Faster GIF writer: render frames as RGB uint8 numpy arrays and save with imageio.
+    Visual quality is unchanged; filesize may vary (optimize is off for speed).
+    """
+    if Path(filename).exists() and not overwrite:
+        return
+
+    # Precompute transformed arrays (match your pca/labels/raw handling)
+    label_cmap = get_cmap()
+    transformed = {}
+    for key, arr in arrays.items():
+        t = array_types[key]
+        if t == "combined":
+            raw_arr, labels_arr = arr
+            transformed[key] = (raw_arr, labels_arr)
+        elif t == "pca":
+            transformed[key] = pca_nd(arr)
+        else:
+            transformed[key] = arr
+    arrays = transformed
+
+    # Determine common number of z-slices
+    z_slices = None
+    for key, arr in arrays.items():
+        if array_types[key] == "combined":
+            raw_arr, _ = arr
+            n = raw_arr.roi.shape[0] // raw_arr.voxel_size[0]
+        else:
+            n = arr.roi.shape[0] // arr.voxel_size[0]
+        z_slices = (
+            n
+            if z_slices is None
+            else (
+                z_slices
+                if z_slices == n
+                else (_ for _ in ()).throw(
+                    AssertionError("All arrays must have same z length")
+                )
+            )
+        )
+    # Build frames (down & blend once per slice, no Matplotlib)
+    frames = []
+    for ii in range(z_slices):
+        # For N panels, horizontally concatenate per-key tiles (like your subplot row)
+        tiles = []
+        for key, arr in arrays.items():
+            t = array_types[key]
+
+            if t == "labels":
+                lab = _slice_and_downscale(arr, ii, target_hw)
+                if lab.ndim == 2:
+                    rgb = _labels_to_rgb(lab, label_cmap)  # (H,W,3) uint8
+                else:
+                    # If labels provided as C,H,W or H,W,C with C==3, pass through as RGB
+                    rgb = _ensure_rgb(
+                        lab.transpose(1, 2, 0) if lab.shape[0] == 3 else lab
+                    )
+                    rgb = _to_uint8(rgb)
+                tiles.append(rgb)
+
+            elif t == "rgb":
+                x = _slice_and_downscale(arr, ii, target_hw)
+                rgb = _ensure_rgb(x)
+                rgb = _to_uint8(rgb)
+                tiles.append(rgb)
+
+            elif t in ("raw", "pca", "affs"):
+                x = _slice_and_downscale(arr, ii, target_hw)
+                if x.ndim == 2:
+                    rgb = _ensure_rgb(_to_uint8(x))
+                else:
+                    # C,H,W in [0..1] or arbitrary -> H,W,C uint8
+                    if t == "affs":
+                        # expect floats 0..1, show directly
+                        rgb = _ensure_rgb(x.transpose(1, 2, 0))
+                        rgb = _to_uint8(rgb)
+                    else:
+                        # raw/pca normalize to 0..255
+                        rgb = _ensure_rgb(x.transpose(1, 2, 0))
+                        rgb = _to_uint8(rgb)
+                tiles.append(rgb)
+
+            elif t == "combined":
+                raw_arr, labels_arr = arr
+                raw = _slice_and_downscale(raw_arr, ii, target_hw)
+                lab = _slice_and_downscale(labels_arr, ii, target_hw)
+
+                # raw -> RGB float [0,1]
+                if raw.ndim == 2:
+                    r = raw
+                    r = (r - r.min()) / (r.max() - r.min() + 1e-8)
+                    raw_rgb = np.stack([r, r, r], axis=-1)
+                else:
+                    rr = raw.transpose(1, 2, 0) if raw.shape[0] == 3 else raw
+                    rr = (rr - rr.min()) / (rr.max() - rr.min() + 1e-8)
+                    raw_rgb = rr
+
+                # labels -> RGB + alpha (like your path)
+                if lab.ndim == 2:
+                    lab_rgb = _labels_to_rgb(lab, label_cmap).astype(np.float32) / 255.0
+                    alpha = (lab > 0).astype(np.float32) * 0.4
+                else:
+                    lr = lab.transpose(1, 2, 0) if lab.shape[0] == 3 else lab
+                    if lr.shape[-1] == 3:
+                        lab_rgb = (lr - lr.min()) / (lr.max() - lr.min() + 1e-8)
+                        alpha = np.max(lab_rgb, axis=-1) * 0.4
+                    else:
+                        lab_rgb = (
+                            _labels_to_rgb(lab, label_cmap).astype(np.float32) / 255.0
+                        )
+                        alpha = (lab > 0).astype(np.float32) * 0.4
+
+                # blend
+                alpha = alpha[..., None]
+                combined = (1.0 - alpha) * raw_rgb + alpha * lab_rgb
+                rgb = _to_uint8(combined)
+                tiles.append(rgb)
+            else:
+                raise ValueError(f"Unknown type {t}")
+
+        # concat tiles horizontally to mimic 1×len(arrays) subplot row
+        frame = np.concatenate(tiles, axis=1)  # (H, sumW, 3)
+        frames.append(frame)
+
+    # Boomerang effect like your ims = ims + ims[::-1]
+    frames = frames + frames[::-1]
+
+    # Write GIF (fast path). Quality unchanged; optimization off for speed.
+    # duration is per-frame seconds; loop=0 infinite loop.
+    iio.imwrite(
+        uri=filename,
+        image=np.stack(frames, axis=0),
+        plugin="pillow",  # default; explicit for clarity
+        duration=1000 // fps,  # ms per frame
+        loop=0,
+        optimize=False,  # faster; same visual quality
+    )

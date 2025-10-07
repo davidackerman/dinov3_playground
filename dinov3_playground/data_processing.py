@@ -1052,6 +1052,7 @@ def load_random_3d_training_data(
     min_resolution_for_raw=None,
     allow_gt_extension=False,  # NEW PARAMETER
     context_scale=None,  # NEW: Load context data at this resolution
+    min_unique_ids=None,  # NEW: Minimum number of unique instance IDs required
 ):
     """
     Load random 3D volumes from multiple datasets for 3D UNet training.
@@ -1082,6 +1083,12 @@ def load_random_3d_training_data(
         If True, allows sampling of raw volumes that extend beyond ground truth regions.
         This provides more context for training but requires using masks for loss calculation.
         When True, returns gt_masks indicating valid ground truth regions.
+    min_unique_ids : int, optional
+        Minimum number of unique instance IDs required in the ground truth region.
+        Useful for affinity training where you want boundary examples between multiple instances.
+        For example, min_unique_ids=2 ensures at least 2 different cell IDs (excluding background),
+        avoiding regions deep within a single cell that only have one ID.
+        If None (default), no minimum ID check is performed.
 
     Returns:
     --------
@@ -1483,15 +1490,32 @@ def load_random_3d_training_data(
                     )
                     class_vol = class_vol.astype(class_volumes[class_key].dtype)
 
-                # Convert to boolean mask
-                if class_vol.dtype != bool:
-                    class_mask = class_vol > 0
+                # IMPORTANT: For single-class instance segmentation (e.g., for affinity training),
+                # preserve the original instance IDs instead of converting to class labels
+                if len(sorted_class_keys) == 1 and class_vol.dtype in [
+                    np.uint8,
+                    np.uint16,
+                    np.uint32,
+                    np.uint64,
+                    np.int32,
+                    np.int64,
+                ]:
+                    # Single class with integer values - likely instance segmentation
+                    # Preserve original instance IDs for affinity training
+                    # Just copy the instance IDs directly (background=0 is preserved)
+                    gt_volume = class_vol.copy()
+                    class_mask = class_vol > 0  # For label fraction calculation
                 else:
-                    class_mask = class_vol
+                    # Multi-class segmentation: convert to class labels
+                    # Convert to boolean mask
+                    if class_vol.dtype != bool:
+                        class_mask = class_vol > 0
+                    else:
+                        class_mask = class_vol
 
-                # Assign class label where mask is True
-                # Later classes override earlier ones in overlapping regions
-                gt_volume[class_mask] = class_idx
+                    # Assign class label where mask is True
+                    # Later classes override earlier ones in overlapping regions
+                    gt_volume[class_mask] = class_idx
 
                 # Store class fraction for later calculation (after GT mask is created)
                 class_fractions[class_key] = class_mask
@@ -1740,6 +1764,28 @@ def load_random_3d_training_data(
                     f"  Dataset {dataset_idx}: label fraction {total_label_fraction:.3f} too low within valid GT regions"
                 )
                 continue
+
+            # Check minimum unique IDs if specified (for affinity training)
+            if min_unique_ids is not None:
+                # Count unique instance IDs in the valid GT region only
+                valid_gt_volume = (
+                    gt_volume[gt_mask == 1] if np.any(gt_mask == 1) else gt_volume
+                )
+                unique_ids = np.unique(valid_gt_volume)
+                # Exclude background (0) from count
+                num_unique_ids = len(unique_ids[unique_ids > 0])
+
+                if num_unique_ids < min_unique_ids:
+                    print(
+                        f"  Dataset {dataset_idx}: only {num_unique_ids} unique instance IDs "
+                        f"(need {min_unique_ids}) within valid GT regions - skipping"
+                    )
+                    continue
+                print(
+                    f"  Dataset {dataset_idx}: {num_unique_ids} unique instance IDs found "
+                    f"(>= {min_unique_ids} required)"
+                )
+
             print(
                 f"  Dataset {dataset_idx}: label fraction {total_label_fraction:.3f} within valid GT regions, roi {gt_roi}"
             )
@@ -1864,12 +1910,15 @@ def load_random_3d_training_data(
             return raw_volumes, gt_volumes, dataset_sources, num_classes
 
 
-def extract_organelle_directories(base_path="/nrs/cellmap/data", organelle_list=None):
+def extract_organelle_directories(
+    base_path="/nrs/cellmap/data", organelle_list=None, annotation_type="gt"
+):
     """
     Extract all organelle directories from the cellmap data structure.
 
-    Searches for directories matching the pattern:
-    /nrs/cellmap/data/{dataset}/{dataset}.zarr/recon-1/labels/groundtruth/crop{number}/{organelle}
+    Searches for directories matching the pattern based on annotation_type:
+    - "gt": /nrs/cellmap/data/{dataset}/{dataset}.zarr/recon-1/labels/groundtruth/crop{number}/{organelle}
+    - "inference": /nrs/cellmap/data/{dataset}/{dataset}.zarr/recon-1/labels/inference/segmentations/{organelle}
 
     Parameters:
     -----------
@@ -1878,14 +1927,26 @@ def extract_organelle_directories(base_path="/nrs/cellmap/data", organelle_list=
     organelle_list : list of str, optional
         List of specific organelle names to filter for. If provided, only these
         organelles will be included in the results.
+    annotation_type : str, default="gt"
+        Type of annotations to search for:
+        - "gt": Ground truth annotations in crop directories
+        - "inference": Inference segmentations (no crop structure)
 
     Returns:
     --------
     dict: Dictionary with structure:
+        For "gt":
         {
             'dataset_name': {
                 'crop_number': ['organelle1', 'organelle2', ...],
                 ...
+            },
+            ...
+        }
+        For "inference":
+        {
+            'dataset_name': {
+                'inference': ['organelle1', 'organelle2', ...],
             },
             ...
         }
@@ -1895,7 +1956,13 @@ def extract_organelle_directories(base_path="/nrs/cellmap/data", organelle_list=
     import glob
     from pathlib import Path
 
-    print(f"Scanning for organelle directories in: {base_path}")
+    # Validate annotation_type
+    if annotation_type not in ["gt", "inference"]:
+        raise ValueError(
+            f"annotation_type must be 'gt' or 'inference', got '{annotation_type}'"
+        )
+
+    print(f"Scanning for {annotation_type} organelle directories in: {base_path}")
 
     organelle_data = {}
     all_organelles = set()
@@ -1919,31 +1986,67 @@ def extract_organelle_directories(base_path="/nrs/cellmap/data", organelle_list=
         if not os.path.exists(zarr_path):
             continue
 
-        groundtruth_base = os.path.join(zarr_path, "recon-1", "labels", "groundtruth")
+        if annotation_type == "gt":
+            # Ground truth path with crop structure
+            labels_base = os.path.join(zarr_path, "recon-1", "labels", "groundtruth")
 
-        # Check if groundtruth path exists
-        if not os.path.exists(groundtruth_base):
-            continue
+            # Check if groundtruth path exists
+            if not os.path.exists(labels_base):
+                continue
 
-        print(f"  Processing dataset: {dataset}")
-        organelle_data[dataset] = {}
+            print(f"  Processing dataset: {dataset}")
+            organelle_data[dataset] = {}
 
-        # Find all crop directories
-        crop_pattern = os.path.join(groundtruth_base, "crop*")
-        crop_dirs = glob.glob(crop_pattern)
+            # Find all crop directories
+            crop_pattern = os.path.join(labels_base, "crop*")
+            crop_dirs = glob.glob(crop_pattern)
 
-        for crop_dir in crop_dirs:
-            crop_name = os.path.basename(crop_dir)  # e.g., "crop001", "crop002"
+            for crop_dir in crop_dirs:
+                crop_name = os.path.basename(crop_dir)  # e.g., "crop001", "crop002"
 
-            # Extract crop number
-            crop_number = crop_name.replace("crop", "")
+                # Extract crop number
+                crop_number = crop_name.replace("crop", "")
 
-            # Find all organelle directories in this crop
-            if os.path.isdir(crop_dir):
+                # Find all organelle directories in this crop
+                if os.path.isdir(crop_dir):
+                    organelles = [
+                        d
+                        for d in os.listdir(crop_dir)
+                        if os.path.isdir(os.path.join(crop_dir, d))
+                    ]
+
+                    # Filter by organelle_list if provided
+                    if organelle_list is not None:
+                        organelles = [
+                            org for org in organelles if org in organelle_list
+                        ]
+
+                    if organelles:
+                        organelle_data[dataset][crop_number] = sorted(organelles)
+                        all_organelles.update(organelles)
+                        print(
+                            f"    {crop_name}: {len(organelles)} organelles - {', '.join(sorted(organelles))}"
+                        )
+
+        elif annotation_type == "inference":
+            # Inference path without crop structure
+            labels_base = os.path.join(
+                zarr_path, "recon-1", "labels", "inference", "segmentations"
+            )
+
+            # Check if inference path exists
+            if not os.path.exists(labels_base):
+                continue
+
+            print(f"  Processing dataset: {dataset}")
+            organelle_data[dataset] = {}
+
+            # Find all organelle directories directly in segmentations
+            if os.path.isdir(labels_base):
                 organelles = [
                     d
-                    for d in os.listdir(crop_dir)
-                    if os.path.isdir(os.path.join(crop_dir, d))
+                    for d in os.listdir(labels_base)
+                    if os.path.isdir(os.path.join(labels_base, d))
                 ]
 
                 # Filter by organelle_list if provided
@@ -1951,10 +2054,11 @@ def extract_organelle_directories(base_path="/nrs/cellmap/data", organelle_list=
                     organelles = [org for org in organelles if org in organelle_list]
 
                 if organelles:
-                    organelle_data[dataset][crop_number] = sorted(organelles)
+                    # Use 'inference' as a pseudo-crop identifier for consistency
+                    organelle_data[dataset]["inference"] = sorted(organelles)
                     all_organelles.update(organelles)
                     print(
-                        f"    {crop_name}: {len(organelles)} organelles - {', '.join(sorted(organelles))}"
+                        f"    inference: {len(organelles)} organelles - {', '.join(sorted(organelles))}"
                     )
 
     # Convert set to sorted list
@@ -2151,9 +2255,12 @@ def generate_multi_organelle_dataset_pairs(
     base_resolution=None,
     use_highest_res_for_raw=False,
     min_resolution_for_raw=None,
+    min_resolution_for_gt=None,  # NEW: Minimum resolution for GT (filter out finer resolutions)
     apply_scale_updates=True,
     require_all_organelles=False,
     context_scale=None,  # NEW: Add context data at this resolution (e.g., 8 for 8nm)
+    crop_filter=None,  # NEW: Filter for specific crop numbers (e.g., [115, 203, 315])
+    annotation_type="gt",  # NEW: "gt" for ground truth, "inference" for inference segmentations
 ):
     """
     Generate multi-organelle dataset pairs where each pair contains multiple organelles from the same dataset/crop.
@@ -2173,6 +2280,12 @@ def generate_multi_organelle_dataset_pairs(
         If True, use highest available resolution for raw data instead of base_resolution.
     min_resolution_for_raw : int, float, or Coordinate, optional
         Minimum allowed resolution for raw data when use_highest_res_for_raw=True.
+        Resolutions finer (smaller values) than this will be skipped.
+    min_resolution_for_gt : int, float, or Coordinate, optional
+        Minimum allowed resolution for ground truth data. GT datasets with resolutions
+        finer (smaller values) than this will be excluded. Useful for focusing on
+        large-scale segmentations (e.g., full cells) while ignoring fine-resolution
+        organelle data. For example, set to 8 to exclude 4nm GT data.
     apply_scale_updates : bool, default=True
         If True and base_resolution is provided, applies scale updates to dataset paths.
     require_all_organelles : bool, default=False
@@ -2181,6 +2294,14 @@ def generate_multi_organelle_dataset_pairs(
     context_scale : int or float, optional
         If provided, adds a context raw data source at this resolution (e.g., 8 for 8nm).
         The context data will be named "raw_context" or "raw_{context_scale}nm" in the dataset pair.
+    crop_filter : list of int, optional
+        If provided, only include crops with these specific crop numbers.
+        For example, crop_filter=[115, 203, 315] will only include crop115, crop203, and crop315.
+        If None (default), all crops are included.
+    annotation_type : str, default="gt"
+        Type of annotations to use:
+        - "gt": Use ground truth annotations from recon-1/labels/groundtruth/crop{num}/{organelle}
+        - "inference": Use inference segmentations from recon-1/labels/inference/segmentations/{organelle}
 
     Returns:
     --------
@@ -2188,8 +2309,8 @@ def generate_multi_organelle_dataset_pairs(
         [
             {
                 'raw': 'path_to_raw',
-                'organelle1': 'path_to_organelle1_gt',
-                'organelle2': 'path_to_organelle2_gt',
+                'organelle1': 'path_to_organelle1_gt_or_inference',
+                'organelle2': 'path_to_organelle2_gt_or_inference',
                 ...
             },
             ...
@@ -2199,12 +2320,39 @@ def generate_multi_organelle_dataset_pairs(
 
     result = []
 
-    # Get all organelle data
+    # Validate annotation_type
+    if annotation_type not in ["gt", "inference"]:
+        raise ValueError(
+            f"annotation_type must be 'gt' or 'inference', got '{annotation_type}'"
+        )
+
+    # Get all organelle data with the specified annotation type
     organelle_data, _ = extract_organelle_directories(
-        base_path=base_path, organelle_list=organelle_list
+        base_path=base_path,
+        organelle_list=organelle_list,
+        annotation_type=annotation_type,
     )
 
     pair_count = 0
+
+    # Convert crop_filter integers to strings for comparison
+    # crop_num from extract_organelle_directories is a string like "001", "110", etc.
+    # Note: crop_filter is only applicable for "gt" annotation_type
+    if crop_filter is not None and annotation_type == "gt":
+        # Convert integers to zero-padded strings (e.g., 115 -> "115", 1 -> "001")
+        crop_filter_strs = set()
+        for crop in crop_filter:
+            # Try both zero-padded and non-padded versions
+            crop_str = str(crop)
+            crop_filter_strs.add(crop_str)  # "115"
+            crop_filter_strs.add(crop_str.zfill(3))  # "115" (already 3 digits)
+            crop_filter_strs.add(str(int(crop_str)))  # Remove leading zeros if any
+        crop_filter = crop_filter_strs
+    elif crop_filter is not None and annotation_type == "inference":
+        print(
+            "  Warning: crop_filter is not applicable for annotation_type='inference' - ignoring"
+        )
+        crop_filter = None
 
     for dataset, crops in organelle_data.items():
         if pair_count >= max_pairs:
@@ -2213,6 +2361,11 @@ def generate_multi_organelle_dataset_pairs(
         for crop_num, available_organelles in crops.items():
             if pair_count >= max_pairs:
                 break
+
+            # Filter by crop number if specified
+            if crop_filter is not None:
+                if crop_num not in crop_filter:
+                    continue
 
             # Check if this crop has the required organelles
             if require_all_organelles:
@@ -2247,9 +2400,67 @@ def generate_multi_organelle_dataset_pairs(
                 # Note: We'll handle the actual scale selection during data loading
 
             for organelle in organelles_to_include:
-                gt_path = f"{base_path}/{dataset}/{dataset}.zarr/recon-1/labels/groundtruth/crop{crop_num}/{organelle}"
-                if os.path.exists(gt_path):
-                    pair[organelle] = gt_path
+                # Construct path based on annotation_type
+                if annotation_type == "gt":
+                    label_path = f"{base_path}/{dataset}/{dataset}.zarr/recon-1/labels/groundtruth/crop{crop_num}/{organelle}"
+                elif annotation_type == "inference":
+                    label_path = f"{base_path}/{dataset}/{dataset}.zarr/recon-1/labels/inference/segmentations/{organelle}"
+                else:
+                    raise ValueError(
+                        f"Invalid annotation_type: {annotation_type}"
+                    )  # Should never happen due to earlier validation
+
+                if os.path.exists(label_path):
+                    # Check GT resolution if min_resolution_for_gt is specified
+                    if min_resolution_for_gt is not None:
+                        import zarr
+                        from funlib.geometry import Coordinate
+
+                        try:
+                            zarr_grp = zarr.open_group(label_path, mode="r")
+                            from dinov3_playground.zarr_util import get_scale_info
+
+                            _, resolutions, _ = get_scale_info(zarr_grp)
+
+                            # Convert min_resolution_for_gt to Coordinate
+                            if (
+                                type(min_resolution_for_gt) is int
+                                or type(min_resolution_for_gt) is float
+                            ):
+                                min_res = Coordinate(3 * [min_resolution_for_gt])
+                            else:
+                                min_res = Coordinate(min_resolution_for_gt)
+
+                            # Find the finest resolution available
+                            finest_resolution = None
+
+                            for scale, res in resolutions.items():
+                                res_coord = Coordinate(res)
+
+                                # Track the finest resolution available
+                                if finest_resolution is None or all(
+                                    r <= fr
+                                    for r, fr in zip(res_coord, finest_resolution)
+                                ):
+                                    finest_resolution = res_coord
+
+                            # Skip if finest resolution is finer than min_resolution_for_gt
+                            if finest_resolution is not None and any(
+                                r < min_r
+                                for r, min_r in zip(finest_resolution, min_res)
+                            ):
+                                print(
+                                    f"Skipping {dataset}/crop{crop_num}/{organelle}: finest resolution {finest_resolution} is finer than min_resolution_for_gt {min_res}"
+                                )
+                                all_paths_exist = False
+                                break
+                        except Exception as e:
+                            print(
+                                f"Warning: Could not check resolution for {label_path}: {e}"
+                            )
+                            # Continue anyway if we can't check resolution
+
+                    pair[organelle] = label_path
                 else:
                     all_paths_exist = False
                     break
@@ -2261,6 +2472,13 @@ def generate_multi_organelle_dataset_pairs(
                 pair_count += 1
 
     print(f"Generated {len(result)} multi-organelle dataset pairs")
+    print(f"  Annotation type: {annotation_type}")
+    if crop_filter is not None:
+        print(f"  Crop filter active: only including crops {crop_filter}")
+    if min_resolution_for_gt is not None:
+        print(
+            f"  GT resolution filter active: excluding GT data finer than {min_resolution_for_gt}nm"
+        )
     if result:
         example_organelles = list(result[0].keys())
         example_organelles.remove("raw")
