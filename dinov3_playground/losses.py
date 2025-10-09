@@ -362,6 +362,7 @@ def get_loss_function(loss_type, class_weights=None, **kwargs):
         - 'tversky': Tversky Loss
         - 'affinity': Affinity Loss (BCE with class weighting)
         - 'boundary_affinity': Boundary-Weighted Affinity Loss (EDT-based)
+        - 'affinity_lsds': Combined Affinity + LSDS Loss (BCE + MSE)
     class_weights : torch.Tensor, optional
         Class weights for weighted losses
     **kwargs : dict
@@ -377,6 +378,9 @@ def get_loss_function(loss_type, class_weights=None, **kwargs):
         - boundary_weight: Max weight at boundaries for boundary_affinity (default: 10.0)
         - sigma: Distance decay for boundary_affinity (default: 5.0)
         - anisotropy: Voxel anisotropy tuple for boundary_affinity (default: (1.0, 1.0, 1.0))
+        - num_lsds: Number of LSDS channels for affinity_lsds (default: 10)
+        - lsds_weight: Weight for LSDS component in affinity_lsds (default: 1.0)
+        - affinity_weight: Weight for affinity component in affinity_lsds (default: 1.0)
 
     Returns:
     --------
@@ -394,6 +398,13 @@ def get_loss_function(loss_type, class_weights=None, **kwargs):
     ...     boundary_weight=15.0,  # Strong boundary emphasis
     ...     sigma=3.0,              # Narrow boundary region
     ...     anisotropy=(2.0, 1.0, 1.0)  # 2nm z, 1nm xy
+    ... )
+    >>>
+    >>> # Combined affinity + LSDS loss
+    >>> criterion = get_loss_function(
+    ...     'affinity_lsds',
+    ...     lsds_weight=1.0,       # Weight for LSDS MSE loss
+    ...     affinity_weight=1.0    # Weight for affinity BCE loss
     ... )
     """
     loss_type = loss_type.lower()
@@ -458,8 +469,25 @@ def get_loss_function(loss_type, class_weights=None, **kwargs):
             pos_weight=pos_weight,
         )
 
+    elif loss_type == "affinity_lsds":
+        # Import here to avoid circular imports
+        from .affinity_utils import AffinityLSDSLoss
+
+        num_lsds = kwargs.get("num_lsds", 10)
+        use_class_weights = kwargs.get("use_class_weights", True)
+        pos_weight = kwargs.get("pos_weight", None)
+        lsds_weight = kwargs.get("lsds_weight", 1.0)
+        affinity_weight = kwargs.get("affinity_weight", 1.0)
+        return AffinityLSDSLoss(
+            num_lsds=num_lsds,
+            use_class_weights=use_class_weights,
+            pos_weight=pos_weight,
+            lsds_weight=lsds_weight,
+            affinity_weight=affinity_weight,
+        )
+
     else:
         raise ValueError(
             f"Unknown loss type: {loss_type}. "
-            f"Choose from: ce, weighted_ce, focal, dice, focal_dice, tversky, affinity, boundary_affinity"
+            f"Choose from: ce, weighted_ce, focal, dice, focal_dice, tversky, affinity, boundary_affinity, affinity_lsds"
         )

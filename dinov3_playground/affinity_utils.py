@@ -21,13 +21,55 @@ except ImportError:
     print("Warning: edt not available. Install with: pip install edt")
     print("Boundary-weighted loss will not be available.")
 
+try:
+    from lsd_lite import get_affs, get_lsds
+
+    HAS_LSDS = True
+except ImportError:
+    HAS_LSDS = False
+    print("Warning: lsd_lite package not available. Install with: pip install lsd_lite")
+    print("LSDS computation will not be available.")
+
+
+def safe_get_lsds(segmentation, sigma=20.0):
+    """
+    Safely compute LSDs, handling all-zero arrays.
+
+    get_lsds() fails when the array contains only zeros (no instances/labels).
+    This wrapper returns zeros with the correct shape in that case.
+
+    Parameters:
+    -----------
+    segmentation : numpy.ndarray
+        Instance segmentation where each unique non-zero value represents
+        a different instance
+    sigma : float, default=20.0
+        Sigma parameter for LSDS computation (controls smoothing scale)
+
+    Returns:
+    --------
+    numpy.ndarray
+        LSDs of shape (10, *segmentation.shape)
+    """
+    if not HAS_LSDS:
+        raise ImportError(
+            "lsd_lite package required for LSDS computation. "
+            "Install with: pip install lsd_lite"
+        )
+
+    if np.any(segmentation > 0):
+        return get_lsds(segmentation, sigma=sigma)
+    else:
+        # Return zeros with correct shape (10 LSD channels)
+        return np.zeros((10, *segmentation.shape), dtype=np.float32)
+
 
 def compute_affinities_3d(instance_segmentation, offsets=None):
     """
-    Convert 3D instance segmentation to affinity graph.
+    Convert 3D instance segmentation to affinity graph using lsd_lite.
 
+    This is a wrapper around lsd_lite.get_affs for backward compatibility.
     Affinities indicate whether neighboring pixels belong to the same instance.
-    For each pixel, we compute affinity to its neighbor at a given offset.
 
     Parameters:
     -----------
@@ -45,125 +87,43 @@ def compute_affinities_3d(instance_segmentation, offsets=None):
         affinity in the corresponding offset direction. Values are 1 if neighbors
         belong to same instance, 0 otherwise.
     """
+    if not HAS_LSDS:
+        raise ImportError(
+            "lsd_lite package required for affinity computation. "
+            "Install with: pip install lsd_lite"
+        )
+
     if offsets is None:
         # Default: affinities in +z, +y, +x directions
         offsets = [(1, 0, 0), (0, 1, 0), (0, 0, 1)]
 
     is_torch = isinstance(instance_segmentation, torch.Tensor)
 
+    # Convert to numpy if needed
     if is_torch:
         device = instance_segmentation.device
-        dtype = instance_segmentation.dtype
-        affinities = torch.zeros(
-            (len(offsets), *instance_segmentation.shape),
-            dtype=torch.float32,
-            device=device,
-        )
+        instance_seg_np = instance_segmentation.cpu().numpy()
     else:
-        affinities = np.zeros(
-            (len(offsets), *instance_segmentation.shape), dtype=np.float32
-        )
+        instance_seg_np = instance_segmentation
 
-    for idx, (dz, dy, dx) in enumerate(offsets):
-        # For each offset, check if pixel and its neighbor belong to same instance
-        if is_torch:
-            affinity = _compute_single_affinity_torch(instance_segmentation, dz, dy, dx)
-        else:
-            affinity = _compute_single_affinity_numpy(instance_segmentation, dz, dy, dx)
+    # Convert offsets to numpy array format expected by lsd_lite
+    neighborhood = np.array(offsets, dtype=np.int32)
 
-        affinities[idx] = affinity
+    # Compute affinities using lsd_lite (exclude background with dist="equality-no-bg")
+    affinities = get_affs(instance_seg_np, neighborhood, dist="equality-no-bg")
+
+    # Convert back to torch if needed
+    if is_torch:
+        affinities = torch.from_numpy(affinities).to(device)
 
     return affinities
 
 
-def _compute_single_affinity_numpy(instances, dz, dy, dx):
-    """
-    Compute affinity for a single offset direction using numpy.
-
-    Parameters:
-    -----------
-    instances : numpy.ndarray
-        Instance segmentation of shape (D, H, W)
-    dz, dy, dx : int
-        Offset in z, y, x directions
-
-    Returns:
-    --------
-    numpy.ndarray
-        Affinity map of shape (D, H, W)
-    """
-    D, H, W = instances.shape
-    affinity = np.zeros((D, H, W), dtype=np.float32)
-
-    # Calculate valid regions (where both pixel and neighbor exist)
-    z_start = max(0, -dz)
-    z_end = min(D, D - dz)
-    y_start = max(0, -dy)
-    y_end = min(H, H - dy)
-    x_start = max(0, -dx)
-    x_end = min(W, W - dx)
-
-    # Get current pixels and their neighbors
-    current = instances[z_start:z_end, y_start:y_end, x_start:x_end]
-    neighbor = instances[
-        z_start + dz : z_end + dz, y_start + dy : y_end + dy, x_start + dx : x_end + dx
-    ]
-
-    # Affinity is 1 if both pixels belong to the same instance (and not background)
-    # Background is typically 0, so we need both to be non-zero AND equal
-    same_instance = (current == neighbor) & (current > 0)
-
-    affinity[z_start:z_end, y_start:y_end, x_start:x_end] = same_instance.astype(
-        np.float32
-    )
-
-    return affinity
-
-
-def _compute_single_affinity_torch(instances, dz, dy, dx):
-    """
-    Compute affinity for a single offset direction using PyTorch.
-
-    Parameters:
-    -----------
-    instances : torch.Tensor
-        Instance segmentation of shape (D, H, W)
-    dz, dy, dx : int
-        Offset in z, y, x directions
-
-    Returns:
-    --------
-    torch.Tensor
-        Affinity map of shape (D, H, W)
-    """
-    D, H, W = instances.shape
-    affinity = torch.zeros((D, H, W), dtype=torch.float32, device=instances.device)
-
-    # Calculate valid regions (where both pixel and neighbor exist)
-    z_start = max(0, -dz)
-    z_end = min(D, D - dz)
-    y_start = max(0, -dy)
-    y_end = min(H, H - dy)
-    x_start = max(0, -dx)
-    x_end = min(W, W - dx)
-
-    # Get current pixels and their neighbors
-    current = instances[z_start:z_end, y_start:y_end, x_start:x_end]
-    neighbor = instances[
-        z_start + dz : z_end + dz, y_start + dy : y_end + dy, x_start + dx : x_end + dx
-    ]
-
-    # Affinity is 1 if both pixels belong to the same instance (and not background)
-    same_instance = (current == neighbor) & (current > 0)
-
-    affinity[z_start:z_end, y_start:y_end, x_start:x_end] = same_instance.float()
-
-    return affinity
-
-
 def compute_affinities_2d(instance_segmentation, offsets=None):
     """
-    Convert 2D instance segmentation to affinity graph.
+    Convert 2D instance segmentation to affinity graph using lsd_lite.
+
+    This is a wrapper around lsd_lite.get_affs for backward compatibility.
 
     Parameters:
     -----------
@@ -179,71 +139,36 @@ def compute_affinities_2d(instance_segmentation, offsets=None):
     numpy.ndarray or torch.Tensor
         Affinities of shape (num_offsets, H, W)
     """
+    if not HAS_LSDS:
+        raise ImportError(
+            "lsd_lite package required for affinity computation. "
+            "Install with: pip install lsd_lite"
+        )
+
     if offsets is None:
         # Default: affinities in +y, +x directions
         offsets = [(1, 0), (0, 1)]
 
     is_torch = isinstance(instance_segmentation, torch.Tensor)
 
+    # Convert to numpy if needed
     if is_torch:
         device = instance_segmentation.device
-        affinities = torch.zeros(
-            (len(offsets), *instance_segmentation.shape),
-            dtype=torch.float32,
-            device=device,
-        )
+        instance_seg_np = instance_segmentation.cpu().numpy()
     else:
-        affinities = np.zeros(
-            (len(offsets), *instance_segmentation.shape), dtype=np.float32
-        )
+        instance_seg_np = instance_segmentation
 
-    for idx, (dy, dx) in enumerate(offsets):
-        if is_torch:
-            affinity = _compute_single_affinity_2d_torch(instance_segmentation, dy, dx)
-        else:
-            affinity = _compute_single_affinity_2d_numpy(instance_segmentation, dy, dx)
+    # Convert offsets to numpy array format expected by lsd_lite
+    neighborhood = np.array(offsets, dtype=np.int32)
 
-        affinities[idx] = affinity
+    # Compute affinities using lsd_lite (exclude background with dist="equality-no-bg")
+    affinities = get_affs(instance_seg_np, neighborhood, dist="equality-no-bg")
+
+    # Convert back to torch if needed
+    if is_torch:
+        affinities = torch.from_numpy(affinities).to(device)
 
     return affinities
-
-
-def _compute_single_affinity_2d_numpy(instances, dy, dx):
-    """Compute 2D affinity for a single offset using numpy."""
-    H, W = instances.shape
-    affinity = np.zeros((H, W), dtype=np.float32)
-
-    y_start = max(0, -dy)
-    y_end = min(H, H - dy)
-    x_start = max(0, -dx)
-    x_end = min(W, W - dx)
-
-    current = instances[y_start:y_end, x_start:x_end]
-    neighbor = instances[y_start + dy : y_end + dy, x_start + dx : x_end + dx]
-
-    same_instance = (current == neighbor) & (current > 0)
-    affinity[y_start:y_end, x_start:x_end] = same_instance.astype(np.float32)
-
-    return affinity
-
-
-def _compute_single_affinity_2d_torch(instances, dy, dx):
-    """Compute 2D affinity for a single offset using PyTorch."""
-    H, W = instances.shape
-    affinity = torch.zeros((H, W), dtype=torch.float32, device=instances.device)
-
-    y_start = max(0, -dy)
-    y_end = min(H, H - dy)
-    x_start = max(0, -dx)
-    x_end = min(W, W - dx)
-
-    current = instances[y_start:y_end, x_start:x_end]
-    neighbor = instances[y_start + dy : y_end + dy, x_start + dx : x_end + dx]
-
-    same_instance = (current == neighbor) & (current > 0)
-    affinity[y_start:y_end, x_start:x_end] = same_instance.float()
-
-    return affinity
 
 
 def compute_boundary_weights(
@@ -700,6 +625,203 @@ def affinities_to_instances(affinities, threshold=0.5):
         instances, num_instances = ndimage.label(foreground)
 
     return instances
+
+
+def compute_affinities_and_lsds_3d(
+    instance_segmentation, offsets=None, lsds_sigma=20.0
+):
+    """
+    Convert 3D instance segmentation to both affinities and LSDs.
+
+    Uses the lsd_lite package to compute affinities and Local Shape Descriptors.
+    LSDs provide 10 channels of shape information that complement affinities.
+
+    Parameters:
+    -----------
+    instance_segmentation : numpy.ndarray
+        3D instance segmentation of shape (D, H, W) where each unique non-zero
+        value represents a different instance
+    offsets : list of tuples, optional
+        List of (z, y, x) offsets for affinities. Default is [(1,0,0), (0,1,0), (0,0,1)]
+    lsds_sigma : float, default=20.0
+        Sigma parameter for LSDS computation (controls smoothing scale)
+
+    Returns:
+    --------
+    numpy.ndarray
+        Combined array of shape (10 + num_offsets, D, H, W) where:
+        - First 10 channels are LSDs
+        - Remaining channels are affinities
+    """
+    if not HAS_LSDS:
+        raise ImportError(
+            "lsd_lite package required for LSDS computation. "
+            "Install with: pip install lsd_lite"
+        )
+
+    if offsets is None:
+        # Default: affinities in +z, +y, +x directions
+        offsets = [(1, 0, 0), (0, 1, 0), (0, 0, 1)]
+
+    # Convert to numpy if needed
+    if isinstance(instance_segmentation, torch.Tensor):
+        instance_segmentation = instance_segmentation.cpu().numpy()
+
+    # Convert offsets to numpy array format expected by lsds
+    neighborhood = np.array(offsets, dtype=np.int32)
+
+    # Compute affinities using lsd_lite (exclude background with dist="equality-no-bg")
+    # get_affs expects (gt_seg, neighborhood) and returns (num_offsets, D, H, W)
+    affinities = get_affs(instance_segmentation, neighborhood, dist="equality-no-bg")
+
+    # Compute LSDs using safe wrapper (handles all-zero arrays)
+    # get_lsds expects (gt_seg, sigma) and returns (10, D, H, W)
+    lsds = safe_get_lsds(instance_segmentation, sigma=lsds_sigma)
+
+    # Concatenate LSDs and affinities: (10 + num_offsets, D, H, W)
+    combined = np.concatenate([lsds, affinities], axis=0)
+
+    return combined
+
+
+class AffinityLSDSLoss(torch.nn.Module):
+    """
+    Combined loss for affinity and LSDS prediction.
+
+    Computes MSE loss for LSDS channels and BCE loss for affinity channels.
+    The total loss is the sum of LSDS MSE loss and affinity BCE loss.
+
+    Parameters:
+    -----------
+    num_lsds : int, default=10
+        Number of LSDS channels (typically 10)
+    use_class_weights : bool, default=True
+        Whether to use class weights for affinity loss
+    pos_weight : float, optional
+        Weight for positive affinity examples
+    lsds_weight : float, default=1.0
+        Weight for LSDS loss component
+    affinity_weight : float, default=1.0
+        Weight for affinity loss component
+    """
+
+    def __init__(
+        self,
+        num_lsds=10,
+        use_class_weights=True,
+        pos_weight=None,
+        lsds_weight=1.0,
+        affinity_weight=1.0,
+    ):
+        super(AffinityLSDSLoss, self).__init__()
+        self.num_lsds = num_lsds
+        self.use_class_weights = use_class_weights
+        self.pos_weight = pos_weight
+        self.lsds_weight = lsds_weight
+        self.affinity_weight = affinity_weight
+
+        # MSE loss for LSDS
+        self.mse_loss = torch.nn.MSELoss(reduction="none")
+
+    def forward(self, predictions, targets, mask=None):
+        """
+        Compute combined affinity and LSDS loss.
+
+        Parameters:
+        -----------
+        predictions : torch.Tensor
+            Predicted affinities and LSDs of shape (batch, 10 + num_offsets, D, H, W)
+            First 10 channels are LSDS predictions, remaining are affinity predictions
+        targets : torch.Tensor
+            Target affinities and LSDs of shape (batch, 10 + num_offsets, D, H, W)
+            First 10 channels are LSDS targets, remaining are affinity targets
+        mask : torch.Tensor, optional
+            Valid region mask of shape (batch, D, H, W)
+
+        Returns:
+        --------
+        torch.Tensor
+            Scalar combined loss value
+        """
+        # Split predictions and targets into LSDS and affinities
+        pred_lsds = predictions[:, : self.num_lsds, ...]  # (batch, 10, D, H, W)
+        pred_affs = predictions[
+            :, self.num_lsds :, ...
+        ]  # (batch, num_offsets, D, H, W)
+
+        target_lsds = targets[:, : self.num_lsds, ...]  # (batch, 10, D, H, W)
+        target_affs = targets[:, self.num_lsds :, ...]  # (batch, num_offsets, D, H, W)
+
+        # Compute LSDS loss (MSE)
+        lsds_loss_per_pixel = self.mse_loss(pred_lsds, target_lsds)
+
+        if mask is not None:
+            # Expand mask to match LSDS channels
+            mask_expanded = mask.unsqueeze(1).expand_as(lsds_loss_per_pixel)
+            lsds_loss_per_pixel = lsds_loss_per_pixel * mask_expanded
+
+            # Average only over valid regions
+            num_valid = mask_expanded.sum()
+            if num_valid > 0:
+                lsds_loss = lsds_loss_per_pixel.sum() / num_valid
+            else:
+                lsds_loss = lsds_loss_per_pixel.sum()
+        else:
+            lsds_loss = lsds_loss_per_pixel.mean()
+
+        # Compute affinity loss (BCE)
+        # Calculate pos_weight if needed
+        pos_weight = self.pos_weight
+        if self.use_class_weights and pos_weight is None:
+            # Count positive and negative examples
+            if mask is not None:
+                mask_expanded_aff = mask.unsqueeze(1).expand_as(target_affs)
+                valid_targets = target_affs[mask_expanded_aff > 0]
+            else:
+                valid_targets = target_affs
+
+            num_pos = (valid_targets > 0.5).sum().float()
+            num_neg = (valid_targets < 0.5).sum().float()
+
+            if num_pos > 0:
+                pos_weight = num_neg / num_pos
+            else:
+                pos_weight = 1.0
+
+        # Use BCEWithLogitsLoss for numerical stability
+        if pos_weight is not None:
+            if isinstance(pos_weight, torch.Tensor):
+                pos_weight_tensor = pos_weight.detach().clone().to(predictions.device)
+            else:
+                pos_weight_tensor = torch.tensor(
+                    pos_weight, device=predictions.device, dtype=predictions.dtype
+                )
+            criterion = torch.nn.BCEWithLogitsLoss(
+                pos_weight=pos_weight_tensor, reduction="none"
+            )
+        else:
+            criterion = torch.nn.BCEWithLogitsLoss(reduction="none")
+
+        # Compute affinity loss
+        affinity_loss_per_pixel = criterion(pred_affs, target_affs)
+
+        # Apply mask if provided
+        if mask is not None:
+            mask_expanded_aff = mask.unsqueeze(1).expand_as(affinity_loss_per_pixel)
+            affinity_loss_per_pixel = affinity_loss_per_pixel * mask_expanded_aff
+
+            num_valid = mask_expanded_aff.sum()
+            if num_valid > 0:
+                affinity_loss = affinity_loss_per_pixel.sum() / num_valid
+            else:
+                affinity_loss = affinity_loss_per_pixel.sum()
+        else:
+            affinity_loss = affinity_loss_per_pixel.mean()
+
+        # Combine losses
+        total_loss = self.lsds_weight * lsds_loss + self.affinity_weight * affinity_loss
+
+        return total_loss
 
 
 # Example usage and testing

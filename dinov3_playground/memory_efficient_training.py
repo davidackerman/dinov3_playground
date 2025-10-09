@@ -143,8 +143,9 @@ class MemoryEfficientDataLoader3D:
         use_orthogonal_planes=True,  # NEW PARAMETER for 3-plane processing
         enable_detailed_timing=True,  # NEW PARAMETER for detailed timing
         verbose=True,  # NEW PARAMETER to control verbose output
-        output_type="labels",  # NEW PARAMETER: "labels" or "affinities"
+        output_type="labels",  # NEW PARAMETER: "labels", "affinities", or "affinities_lsds"
         affinity_offsets=None,  # NEW PARAMETER: list of (z,y,x) offsets for affinities
+        lsds_sigma=20.0,  # NEW PARAMETER: sigma for LSDS computation
     ):
         """
         Initialize memory-efficient 3D data loader.
@@ -184,11 +185,16 @@ class MemoryEfficientDataLoader3D:
             If True, processes slices in all 3 orthogonal planes (XY, XZ, YZ) and averages them.
             If False, processes only XY planes (original behavior).
         output_type : str, default="labels"
-            Type of output target: "labels" for class labels or "affinities" for affinity graphs.
+            Type of output target: "labels" for class labels, "affinities" for affinity graphs,
+            or "affinities_lsds" for combined affinities and LSDs.
             When "affinities", GT will be converted from instance segmentation to affinities.
+            When "affinities_lsds", GT will be converted to both affinities and LSDs.
         affinity_offsets : list of tuples, optional
-            List of (z, y, x) offsets for computing affinities. If None and output_type="affinities",
-            defaults to [(1,0,0), (0,1,0), (0,0,1)] for +z, +y, +x directions.
+            List of (z, y, x) offsets for computing affinities. If None and output_type="affinities"
+            or "affinities_lsds", defaults to [(1,0,0), (0,1,0), (0,0,1)] for +z, +y, +x directions.
+        lsds_sigma : float, default=20.0
+            Sigma parameter for LSDS computation (only used when output_type="affinities_lsds").
+            Controls the smoothing scale for Local Shape Descriptors.
         """
 
         # Validate inputs with ROI-level padding support
@@ -296,7 +302,12 @@ class MemoryEfficientDataLoader3D:
 
         # Handle affinity output
         self.output_type = output_type
-        if affinity_offsets is None and output_type == "affinities":
+        self.lsds_sigma = lsds_sigma  # Store LSDS sigma parameter
+
+        if affinity_offsets is None and output_type in [
+            "affinities",
+            "affinities_lsds",
+        ]:
             # Default: affinities in +z, +y, +x directions
             self.affinity_offsets = [(1, 0, 0), (0, 1, 0), (0, 0, 1)]
         else:
@@ -304,6 +315,13 @@ class MemoryEfficientDataLoader3D:
 
         if output_type == "affinities":
             print(f"  - Output type: Affinities with offsets {self.affinity_offsets}")
+        elif output_type == "affinities_lsds":
+            print(f"  - Output type: Affinities + LSDs")
+            print(f"    - Affinity offsets: {self.affinity_offsets}")
+            print(f"    - LSDS sigma: {lsds_sigma}")
+            print(
+                f"    - Total output channels: 10 (LSDs) + {len(self.affinity_offsets)} (affinities) = {10 + len(self.affinity_offsets)}"
+            )
         else:
             print(f"  - Output type: Class labels")
 
@@ -385,7 +403,7 @@ class MemoryEfficientDataLoader3D:
         batch_gt = self.gt_data[sampled_indices]
         batch_masks = self.gt_masks[sampled_indices]
 
-        # Convert to affinities if needed
+        # Convert to affinities or affinities+lsds if needed
         if self.output_type == "affinities":
             from .affinity_utils import compute_affinities_3d
 
@@ -399,6 +417,20 @@ class MemoryEfficientDataLoader3D:
 
             # Stack into batch: (batch_size, num_offsets, D, H, W)
             batch_gt = np.stack(batch_affinities, axis=0)
+
+        elif self.output_type == "affinities_lsds":
+            from .affinity_utils import compute_affinities_and_lsds_3d
+
+            # Convert each volume's instance segmentation to affinities and LSDs
+            batch_combined = []
+            for gt_volume in batch_gt:
+                combined = compute_affinities_and_lsds_3d(
+                    gt_volume, offsets=self.affinity_offsets, lsds_sigma=self.lsds_sigma
+                )
+                batch_combined.append(combined)
+
+            # Stack into batch: (batch_size, 10 + num_offsets, D, H, W)
+            batch_gt = np.stack(batch_combined, axis=0)
 
         # Add context data if available
         if self.has_context:
@@ -416,7 +448,9 @@ class MemoryEfficientDataLoader3D:
         --------
         tuple: (val_volumes, val_gt, val_masks, val_context)
                - val_volumes: shape (val_pool_size, D, H, W)
-               - val_gt: shape (val_pool_size, D, H, W) for labels or (val_pool_size, num_offsets, D, H, W) for affinities
+               - val_gt: shape (val_pool_size, D, H, W) for labels,
+                         (val_pool_size, num_offsets, D, H, W) for affinities,
+                         or (val_pool_size, 10 + num_offsets, D, H, W) for affinities_lsds
                - val_masks: shape (val_pool_size, D, H, W)
                - val_context: None or shape (val_pool_size, D, H, W)
         """
@@ -424,7 +458,7 @@ class MemoryEfficientDataLoader3D:
         val_gt = self.gt_data[self.val_indices]
         val_masks = self.gt_masks[self.val_indices]
 
-        # Convert to affinities if needed
+        # Convert to affinities or affinities+lsds if needed
         if self.output_type == "affinities":
             from .affinity_utils import compute_affinities_3d
 
@@ -438,6 +472,20 @@ class MemoryEfficientDataLoader3D:
 
             # Stack into batch: (val_pool_size, num_offsets, D, H, W)
             val_gt = np.stack(val_affinities, axis=0)
+
+        elif self.output_type == "affinities_lsds":
+            from .affinity_utils import compute_affinities_and_lsds_3d
+
+            # Convert each volume's instance segmentation to affinities and LSDs
+            val_combined = []
+            for gt_volume in val_gt:
+                combined = compute_affinities_and_lsds_3d(
+                    gt_volume, offsets=self.affinity_offsets, lsds_sigma=self.lsds_sigma
+                )
+                val_combined.append(combined)
+
+            # Stack into batch: (val_pool_size, 10 + num_offsets, D, H, W)
+            val_gt = np.stack(val_combined, axis=0)
 
         # Add context data if available
         if self.has_context:
@@ -1924,6 +1972,10 @@ def train_3d_unet_memory_efficient_v2(
         print(f"  - Boundary sigma: {boundary_sigma}")
         print(f"  - Boundary anisotropy: {boundary_anisotropy}")
         print(f"  - Using class weighting: {use_class_weighting}")
+    elif loss_type == "affinity_lsds":
+        print(f"  - LSDS channels: 10")
+        print(f"  - Affinity channels: {num_classes - 10}")
+        print(f"  - Using class weighting for affinities: {use_class_weighting}")
 
     optimizer = optim.Adam(
         unet3d.parameters(), lr=learning_rate, weight_decay=weight_decay
@@ -1940,6 +1992,7 @@ def train_3d_unet_memory_efficient_v2(
     best_metric = (
         0.0  # Best validation metric (IoU for segmentation, accuracy for affinities)
     )
+    best_val_loss = float("inf")  # Track best validation loss for affinities/LSDs
     epochs_without_improvement = 0
 
     # Helper function to compute loss (handles both CE-based and Dice-based losses)
@@ -1948,17 +2001,17 @@ def train_3d_unet_memory_efficient_v2(
         Compute loss, handling different loss function signatures.
 
         Some losses (Dice, Focal+Dice, Tversky) need num_classes parameter.
-        Affinity losses (affinity, boundary_affinity) need mask and instance_seg.
+        Affinity losses (affinity, boundary_affinity, affinity_lsds) need mask and instance_seg.
         """
         if loss_type in ["dice", "focal_dice", "tversky"]:
             return criterion(logits, targets, num_classes)
-        elif loss_type in ["affinity", "boundary_affinity"]:
+        elif loss_type in ["affinity", "boundary_affinity", "affinity_lsds"]:
             # Affinity losses expect different signature
             if loss_type == "boundary_affinity":
                 # Boundary-weighted loss needs instance segmentation
                 return criterion(logits, targets, instance_seg=instance_seg, mask=masks)
             else:
-                # Standard affinity loss
+                # Standard affinity loss or affinity_lsds loss
                 return criterion(logits, targets, mask=masks)
         else:
             return criterion(logits, targets)
@@ -2023,8 +2076,8 @@ def train_3d_unet_memory_efficient_v2(
             dinov3_time = dinov3_end - dinov3_start
 
             # Handle both label and affinity formats
-            if data_loader_3d.output_type == "affinities":
-                # Affinities are float32: (batch, num_offsets, D, H, W)
+            if data_loader_3d.output_type in ["affinities", "affinities_lsds"]:
+                # Affinities/LSDs are float32: (batch, num_offsets, D, H, W) or (batch, 10+num_offsets, D, H, W)
                 train_labels = torch.tensor(train_gt_volumes, dtype=torch.float32).to(
                     device
                 )
@@ -2228,6 +2281,11 @@ def train_3d_unet_memory_efficient_v2(
                     else:
                         correct = (predictions == train_labels).sum().item()
                         total = train_labels.numel()
+                elif data_loader_3d.output_type == "affinities_lsds":
+                    # For affinities+LSDs: don't compute accuracy (use loss as metric instead)
+                    # This is a regression+binary task, so accuracy doesn't make sense
+                    correct = 0
+                    total = 1  # Avoid division by zero, accuracy will be 0
                 else:
                     # For class labels: use argmax
                     predictions = torch.argmax(logits.float(), dim=1)
@@ -2250,8 +2308,8 @@ def train_3d_unet_memory_efficient_v2(
             epoch_train_total += total
 
             # Track per-class accuracy (conditional on mask usage)
-            # Skip per-class metrics for affinity output since it's binary per direction
-            if data_loader_3d.output_type != "affinities":
+            # Skip per-class metrics for affinity and affinity_lsds outputs since they're not classification
+            if data_loader_3d.output_type not in ["affinities", "affinities_lsds"]:
                 for class_id in range(num_classes):
                     if use_masks:
                         # Only in masked regions
@@ -2315,7 +2373,9 @@ def train_3d_unet_memory_efficient_v2(
             )
 
             # Clear processed volumes from GPU memory after each batch
-            del train_features, train_labels, logits, predictions, train_masks_tensor
+            del train_features, train_labels, logits, train_masks_tensor
+            if "predictions" in locals():
+                del predictions
             if train_context_features is not None:
                 del train_context_features
             if "train_volumes" in locals():
@@ -2412,8 +2472,8 @@ def train_3d_unet_memory_efficient_v2(
 
                 # Get ground truth and mask for this volume and move to GPU
                 # Handle both label and affinity formats
-                if data_loader_3d.output_type == "affinities":
-                    # Affinities are float32: (1, num_offsets, D, H, W)
+                if data_loader_3d.output_type in ["affinities", "affinities_lsds"]:
+                    # Affinities/LSDs are float32: (1, num_channels, D, H, W)
                     vol_gt = (
                         torch.tensor(val_gt_volumes[vol_idx], dtype=torch.float32)
                         .unsqueeze(0)
@@ -2572,6 +2632,9 @@ def train_3d_unet_memory_efficient_v2(
                 if data_loader_3d.output_type == "affinities":
                     # For affinities: apply sigmoid and threshold at 0.5
                     vol_predictions = (torch.sigmoid(vol_logits.float()) > 0.5).float()
+                elif data_loader_3d.output_type == "affinities_lsds":
+                    # For affinities+LSDs: don't compute predictions (use loss as metric)
+                    vol_predictions = None
                 else:
                     # For class labels: use argmax
                     vol_predictions = torch.argmax(vol_logits.float(), dim=1)
@@ -2592,6 +2655,10 @@ def train_3d_unet_memory_efficient_v2(
                     else:
                         vol_correct = (vol_predictions == vol_gt).sum().item()
                         vol_valid_voxels = vol_gt.numel()
+                elif data_loader_3d.output_type == "affinities_lsds":
+                    # For affinities+LSDs: don't compute accuracy (use loss only)
+                    vol_correct = 0
+                    vol_valid_voxels = 1  # Avoid division by zero
                 else:
                     # For class labels
                     if use_vol_masks:
@@ -2611,8 +2678,8 @@ def train_3d_unet_memory_efficient_v2(
                 val_total_voxels += vol_valid_voxels
 
                 # Accumulate per-class metrics (convert to CPU for efficiency, conditional on mask usage)
-                # Skip per-class metrics for affinity output
-                if data_loader_3d.output_type != "affinities":
+                # Skip per-class metrics for affinity and affinity_lsds outputs
+                if data_loader_3d.output_type not in ["affinities", "affinities_lsds"]:
                     vol_gt_cpu = vol_gt.cpu().numpy()
                     vol_pred_cpu = vol_predictions.cpu().numpy()
 
@@ -2641,7 +2708,9 @@ def train_3d_unet_memory_efficient_v2(
                         val_class_total_pred[class_id] += np.sum(valid_pred_mask)
 
                 # Immediately free GPU memory for this volume
-                del vol_features, vol_logits, vol_predictions, vol_gt, vol_mask
+                del vol_features, vol_logits, vol_gt, vol_mask
+                if "vol_predictions" in locals():
+                    del vol_predictions
                 if vol_context_features is not None:
                     del vol_context_features
                 if "single_vol" in locals():
@@ -2769,8 +2838,15 @@ def train_3d_unet_memory_efficient_v2(
         val_class_ious.append(val_class_iou)
 
         # Calculate mean IoU for both scheduler and best model selection
-        # For affinities, use validation accuracy instead of IoU
-        if data_loader_3d.output_type == "affinities":
+        # For affinities/LSDs, use validation loss instead of IoU or accuracy
+        if data_loader_3d.output_type in ["affinities", "affinities_lsds"]:
+            # For affinity/LSDS training, use validation LOSS as the metric (lower is better)
+            current_metric = (
+                -val_loss
+            )  # Negative so we can still use "higher is better" logic
+            metric_name = "Val Loss"
+            current_mean_iou = None  # Not applicable for affinities
+        elif data_loader_3d.output_type == "affinities":
             # For affinity training, use validation accuracy as the metric
             current_metric = val_acc
             metric_name = "Val Accuracy"
@@ -2789,9 +2865,12 @@ def train_3d_unet_memory_efficient_v2(
         # Check if this is the best metric so far
         is_best_model = False
         if current_metric > best_metric + min_delta:
-            best_metric = current_metric  # Store best metric (IoU or accuracy)
+            best_metric = current_metric  # Store best metric (IoU or accuracy or -loss)
             epochs_without_improvement = 0
             is_best_model = True
+            # Update best_val_loss for affinities/LSDs
+            if data_loader_3d.output_type in ["affinities", "affinities_lsds"]:
+                best_val_loss = val_loss
         else:
             epochs_without_improvement += 1
 
@@ -2800,19 +2879,25 @@ def train_3d_unet_memory_efficient_v2(
         print(
             f"Epoch {epoch+1}/{epochs} - Time: {total_epoch_time:.1f}s (Train: {training_time:.1f}s, Val: {val_time:.1f}s)"
         )
-        print(
-            f"  Train: Loss={train_loss:.4f}, Acc={train_acc:.4f} (from {epoch_train_total} voxels)"
-        )
 
-        if data_loader_3d.output_type == "affinities":
-            print(f"  Val:   Loss={val_loss:.4f}, Acc={val_acc:.4f}")
+        # Different output formats based on output type
+        if data_loader_3d.output_type in ["affinities", "affinities_lsds"]:
+            # For affinities/LSDs: only show loss (accuracy not meaningful)
+            print(f"  Train: Loss={train_loss:.4f}")
+            print(f"  Val:   Loss={val_loss:.4f}")
+            print(f"  Best Val Loss: {best_val_loss:.4f}, LR: {current_lr:.6f}")
         else:
+            # For segmentation: show loss, accuracy, and IoU
+            print(
+                f"  Train: Loss={train_loss:.4f}, Acc={train_acc:.4f} (from {epoch_train_total} voxels)"
+            )
             print(
                 f"  Val:   Loss={val_loss:.4f}, IoU={current_metric:.4f}, Acc={val_acc:.4f}"
             )
+            print(f"  Best Val Acc: {best_val_acc:.4f}, LR: {current_lr:.6f}")
 
         # Print comprehensive per-class metrics in a nice table (only for segmentation)
-        if data_loader_3d.output_type != "affinities":
+        if data_loader_3d.output_type not in ["affinities", "affinities_lsds"]:
             train_class_percentages = [
                 count / epoch_train_total * 100 for count in epoch_train_class_total
             ]
@@ -2920,6 +3005,9 @@ def train_3d_unet_memory_efficient_v2(
                     "affinity_offsets": getattr(
                         data_loader_3d, "affinity_offsets", None
                     ),  # Add affinity offsets
+                    "lsds_sigma": getattr(
+                        data_loader_3d, "lsds_sigma", 20.0
+                    ),  # Add LSDS sigma parameter
                 },
                 "model_config": {
                     "num_classes": num_classes,
@@ -2948,6 +3036,9 @@ def train_3d_unet_memory_efficient_v2(
                     "affinity_offsets": getattr(
                         data_loader_3d, "affinity_offsets", None
                     ),  # Add affinity offsets
+                    "lsds_sigma": getattr(
+                        data_loader_3d, "lsds_sigma", 20.0
+                    ),  # Add LSDS sigma parameter
                 },
             }
 
@@ -2974,10 +3065,8 @@ def train_3d_unet_memory_efficient_v2(
                 with open(best_path, "wb") as f:
                     pickle.dump(checkpoint_data, f)
 
-                if data_loader_3d.output_type == "affinities":
-                    print(
-                        f"  *** NEW BEST 3D MODEL SAVED: Acc={current_metric:.4f} ***"
-                    )
+                if data_loader_3d.output_type in ["affinities", "affinities_lsds"]:
+                    print(f"  *** NEW BEST 3D MODEL SAVED: Loss={val_loss:.4f} ***")
                 else:
                     print(
                         f"  *** NEW BEST 3D MODEL SAVED: IoU={current_metric:.4f} (Acc={val_acc:.4f}) ***"
@@ -3036,8 +3125,10 @@ def train_3d_unet_memory_efficient_v2(
         "val_class_precisions": val_class_precisions,
         "val_class_f1s": val_class_f1s,
         "val_class_ious": val_class_ious,
-        "best_metric": best_metric,  # Best validation metric (IoU or accuracy)
+        "best_metric": best_metric,  # Best validation metric (IoU or accuracy or -loss)
         "best_mean_iou": best_metric,  # Backward compatibility
+        "best_val_acc": best_metric,  # Backward compatibility (note: for affinities_lsds this is -loss)
+        "best_val_loss": best_val_loss,  # Best validation loss for affinities/LSDs
         "epochs_trained": len(train_losses),
         "checkpoint_dir": checkpoint_dir,
         "export_base_dir": export_base_dir,
@@ -3323,8 +3414,9 @@ def train_3d_unet_with_memory_efficient_loader(
     boundary_sigma=5.0,  # Distance decay for boundary weights in pixels
     boundary_anisotropy=None,  # Voxel anisotropy (z,y,x) for EDT; None = isotropic
     # AFFINITY PARAMETERS
-    output_type="labels",  # 'labels' or 'affinities'
+    output_type="labels",  # 'labels' or 'affinities' or 'affinities_lsds'
     affinity_offsets=None,  # List of (z,y,x) tuples for affinity computation
+    lsds_sigma=20.0,  # Sigma parameter for LSDS computation (only used when output_type='affinities_lsds')
 ):
     """
     Memory-efficient 3D UNet training with multiple precision and memory optimization options.
@@ -3511,8 +3603,9 @@ def train_3d_unet_with_memory_efficient_loader(
         dinov3_stride=dinov3_stride,  # NEW: Sliding window parameter
         use_orthogonal_planes=use_orthogonal_planes,  # NEW: Orthogonal planes parameter
         verbose=verbose,  # NEW: Verbose output parameter
-        output_type=output_type,  # NEW: Output type (labels or affinities)
+        output_type=output_type,  # NEW: Output type (labels or affinities or affinities_lsds)
         affinity_offsets=affinity_offsets,  # NEW: Affinity offsets
+        lsds_sigma=lsds_sigma,  # NEW: LSDS sigma parameter
     )
 
     print("Data loader created successfully!")
@@ -3561,7 +3654,13 @@ def train_3d_unet_with_memory_efficient_loader(
     )
 
     print(f"\n3D UNet training completed!")
-    print(f"  Best validation accuracy: {results['best_val_acc']:.4f}")
+
+    # Print different metrics based on output type
+    if output_type in ["affinities", "affinities_lsds"]:
+        print(f"  Best validation loss: {results['best_val_loss']:.4f}")
+    else:
+        print(f"  Best validation accuracy: {results['best_val_acc']:.4f}")
+
     print(f"  Epochs trained: {results['epochs_trained']}")
 
     if save_checkpoints:
