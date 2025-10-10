@@ -778,7 +778,7 @@ class AffinityLSDSLoss(torch.nn.Module):
         target_affs = targets[:, self.num_lsds :, ...]  # (batch, num_offsets, D, H, W)
 
         # Compute LSDS loss (MSE on sigmoid(predictions) vs targets)
-        lsds_loss_per_pixel = self.mse_loss(torch.sigmoid(pred_lsds), target_lsds)
+        lsds_loss_per_pixel = self.mse_loss(pred_lsds, target_lsds)
 
         if mask is not None:
             # Expand mask to match LSDS channels

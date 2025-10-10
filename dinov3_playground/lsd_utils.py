@@ -283,26 +283,30 @@ def get_lsds_torch(
 
 # # %%
 
-# # %%
-# # Interactive comparison: PyTorch LSD vs original lsd_lite LSD
 # import numpy as np
 # import matplotlib.pyplot as plt
 # from lsd_lite import get_lsds as get_lsds_original
+# from matplotlib import cm
+# import time
 
 # # Create a test segmentation
 # np.random.seed(42)
-# gt = np.zeros((128, 128, 128), dtype=np.int32)
+# test_seg = np.zeros((128, 128, 128), dtype=np.uint8)
 # # make sphere in center of gt filled with 1
 # # z, y, x = np.ogrid[-64:64, -64:64, -64:64]
 # # mask = x**2 + y**2 + z**2 <= 32**2
 # # gt[mask] = 1
-# gt[32:96, 32:96, 1:-1] = 1
-
+# test_seg[32:96, 32:96, 1:-1] = 1
+# test_seg = gt[0]
 # sigma = 20.0
+# t0 = time.time()
 # print(f"Computing LSDs with sigma={sigma}...")
-# lsds_original = get_lsds_original(gt, sigma=sigma)
-# lsds_torch = get_lsds_torch(gt, sigma=sigma)
-
+# lsds_original = get_lsds_original(test_seg, sigma=sigma)
+# t1 = time.time()
+# print(f"  - Original (lsd_lite) took {t1 - t0:.2f} seconds")
+# lsds_torch = get_lsds_torch(test_seg, sigma=sigma)
+# t2 = time.time()
+# print(f"  - PyTorch implementation took {t2 - t1:.2f} seconds")
 # # Compute differences
 # abs_diff = np.abs(lsds_original - lsds_torch)
 # rel_diff = abs_diff / (np.abs(lsds_original) + 1e-8)
@@ -342,39 +346,138 @@ def get_lsds_torch(
 # print(f"  Difference:     {abs_diff[max_diff_idx]:.6f}")
 
 # # Interactive plotting
-# import ipywidgets as widgets
-# from IPython.display import display
+# # Plot 4 slices spread throughout the dataset and overlay channels as RGB,
+# # add a delta row and extra spacer rows between slice groups, include colorbars.
 
-# z_slider = widgets.IntSlider(
-#     min=0, max=gt.shape[0] - 1, step=1, value=gt.shape[0] // 2, description="Z slice:"
+# slices = np.linspace(0, test_seg.shape[0] - 1, 4, dtype=int)
+# rgb_groups = [(0, 3), (3, 6), (6, 9)]  # (start, end) for RGB overlays
+# n_cols = len(rgb_groups) + 1  # 3 RGB overlays + 1 mass channel
+
+# # rows per slice: original, pytorch, delta, spacer -> bigger space between groups
+# rows_per_slice = 4
+# n_rows = len(slices) * rows_per_slice
+
+# fig, axes = plt.subplots(
+#     n_rows, n_cols, figsize=(4 * n_cols, 2.5 * n_rows), squeeze=False
 # )
-# ch_slider = widgets.IntSlider(min=0, max=9, step=1, value=0, description="Channel:")
 
-# fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-# plt.close(fig)
+# for i, z in enumerate(slices):
+#     base_row = i * rows_per_slice
 
+#     # Original and PyTorch rows
+#     for rel_row, data, label in [
+#         (0, lsds_original, "Original"),
+#         (1, lsds_torch, "PyTorch"),
+#     ]:
+#         row = base_row + rel_row
+#         for col, (ch_start, ch_end) in enumerate(rgb_groups):
+#             # Use raw channel values without any normalization
+#             rgb = np.stack(
+#                 [data[ch, z].astype(np.float32) for ch in range(ch_start, ch_end)],
+#                 axis=-1,
+#             )
+#             # imshow for RGB expects 0..1 floats or 0..255 ints; we intentionally do not normalize
+#             axes[row, col].imshow(rgb)
+#             axes[row, col].set_title(f"{label} Z={z} Ch[{ch_start}:{ch_end}]")
+#             axes[row, col].axis("off")
 
-# # Update function for interactive plot
-# def update(z, ch):
-#     axes[0].cla()
-#     axes[1].cla()
-#     axes[2].cla()
-#     axes[0].imshow(lsds_original[ch, z], cmap="viridis", vmin=0, vmax=1)
-#     axes[0].set_title(f"Original: {channel_names[ch]}")
-#     axes[1].imshow(lsds_torch[ch, z], cmap="viridis", vmin=0, vmax=1)
-#     axes[1].set_title(f"PyTorch: {channel_names[ch]}")
-#     diff_img = axes[2].imshow(abs_diff[ch, z], cmap="hot")
-#     axes[2].set_title(f"Abs Diff (max={abs_diff[ch, z].max():.4f})")
-#     for ax in axes:
-#         ax.axis("off")
-#     fig.suptitle(f"Z={z}, Channel={channel_names[ch]}", fontsize=14)
-#     fig.colorbar(diff_img, ax=axes[2], fraction=0.046, pad=0.04)
-#     fig.canvas.draw_idle()
+#         # Mass channel (grayscale) - show raw values, scale by actual min/max for visibility
+#         mass_img = data[9, z].astype(np.float32)
+#         vmin = float(np.nanmin(mass_img))
+#         vmax = float(np.nanmax(mass_img))
+#         if vmax == vmin:
+#             vmax = vmin + 1.0
+#         im_mass = axes[row, -1].imshow(mass_img, cmap="gray", vmin=vmin, vmax=vmax)
+#         axes[row, -1].set_title(f"{label} Z={z} Mass")
+#         axes[row, -1].axis("off")
+#         fig.colorbar(im_mass, ax=axes[row, -1], fraction=0.046, pad=0.01)
 
+#     # Delta row: absolute differences (Original - PyTorch)
+#     row_delta = base_row + 2
+#     for col, (ch_start, ch_end) in enumerate(rgb_groups):
+#         # compute per-channel abs diff WITHOUT per-channel normalization
+#         chs = []
+#         vmax_ch = 0.0
+#         for ch in range(ch_start, ch_end):
+#             diff = np.abs(
+#                 lsds_original[ch, z].astype(np.float32)
+#                 - lsds_torch[ch, z].astype(np.float32)
+#             )
+#             chs.append(diff)
+#             vmax_ch = max(vmax_ch, float(np.nanmax(diff)))
+#         rgb_delta = np.stack(chs, axis=-1)
 
-# widgets.interact(update, z=z_slider, ch=ch_slider)
-# display(fig)
+#         # Display raw differences without normalizing channels; scale for display only if needed
+#         if vmax_ch > 1.0:
+#             rgb_disp = rgb_delta / vmax_ch
+#         else:
+#             rgb_disp = rgb_delta
 
-# # # %%
+#         axes[row_delta, col].imshow(rgb_disp)
+#         axes[row_delta, col].set_title(f"Delta Z={z} Ch[{ch_start}:{ch_end}]")
+#         axes[row_delta, col].axis("off")
 
+#         # colorbar that reflects raw delta range for this slice (0..vmax_ch)
+#         cmax = vmax_ch if vmax_ch > 0 else 1.0
+#         m = cm.ScalarMappable(cmap="viridis")
+#         m.set_array(np.linspace(0, cmax, 256))
+#         m.set_clim(0, cmax)
+#         fig.colorbar(m, ax=axes[row_delta, col], fraction=0.046, pad=0.01)
+
+#     # Delta for mass - show raw absolute difference, use vmin=0 so not centered/normalized by min
+#     mass_delta = np.abs(
+#         lsds_original[9, z].astype(np.float32) - lsds_torch[9, z].astype(np.float32)
+#     )
+#     vmax = float(np.nanmax(mass_delta))
+#     if vmax == 0:
+#         vmax = 1.0
+#     im_mass_delta = axes[row_delta, -1].imshow(
+#         mass_delta, cmap="gray", vmin=0.0, vmax=vmax
+#     )
+#     axes[row_delta, -1].set_title(f"Delta Z={z} Mass")
+#     axes[row_delta, -1].axis("off")
+#     fig.colorbar(im_mass_delta, ax=axes[row_delta, -1], fraction=0.046, pad=0.01)
+
+#     # Spacer row to increase separation
+#     spacer_row = base_row + 3
+#     for c in range(n_cols):
+#         axes[spacer_row, c].axis("off")
+
+# plt.tight_layout()
+# plt.show()
 # # %%
+# Plot per-channel histograms of the PyTorch (lsds_torch) output, excluding zeros.
+lsds_torch = get_lsds_torch(gt[8], sigma=5)
+C = lsds_torch.shape[0]
+names = channel_names if "channel_names" in globals() else [f"Ch {i}" for i in range(C)]
+
+ncols = 5
+nrows = ceil(C / ncols)
+for current_lsd in [lsds_original, lsds_torch]:
+    fig, axes = plt.subplots(
+        nrows, ncols, figsize=(4 * ncols, 3 * nrows), squeeze=False
+    )
+    bins = 100
+    for i in range(C):
+        ax = axes[i // ncols][i % ncols]
+        vals = current_lsd[i].ravel().astype(np.float32)
+        vals_nz = vals[vals != 0]
+        if vals_nz.size == 0:
+            ax.text(0.5, 0.5, "no non-zero values", ha="center", va="center")
+            ax.set_title(names[i])
+            ax.set_xlabel("value")
+            ax.set_ylabel("count")
+            continue
+        ax.hist(vals_nz, bins=bins, range=(0.0, 1.0), color="C0", alpha=0.8)
+        ax.set_title(f"{names[i]} (n={vals_nz.size:,})")
+        ax.set_xlabel("value")
+        ax.set_ylabel("count")
+
+    # hide any empty subplots
+    for j in range(C, nrows * ncols):
+        axes[j // ncols][j % ncols].axis("off")
+
+    plt.tight_layout()
+    plt.show()
+
+# %%
