@@ -21,14 +21,31 @@ except ImportError:
     print("Warning: edt not available. Install with: pip install edt")
     print("Boundary-weighted loss will not be available.")
 
+# Try to import lsd_lite's get_affs/get_lsds (C/NumPy implementation)
 try:
-    from lsd_lite import get_affs, get_lsds
+    from lsd_lite import get_affs as _get_affs_lib, get_lsds as _get_lsds_lib
 
-    HAS_LSDS = True
-except ImportError:
-    HAS_LSDS = False
+    HAS_LSDS_LIB = True
+except Exception:
+    _get_affs_lib = None
+    _get_lsds_lib = None
+    HAS_LSDS_LIB = False
     print("Warning: lsd_lite package not available. Install with: pip install lsd_lite")
-    print("LSDS computation will not be available.")
+    print("lsd_lite.get_affs/get_lsds will not be available.")
+
+# Prefer our PyTorch implementation if available
+try:
+    from .lsd_utils import get_lsds_torch
+
+    HAS_LSDS_TORCH = True
+except Exception:
+    get_lsds_torch = None
+    HAS_LSDS_TORCH = False
+
+# Presence of any LSDS backend
+HAS_LSDS = HAS_LSDS_LIB or HAS_LSDS_TORCH
+get_affs = _get_affs_lib
+get_lsds_original = _get_lsds_lib
 
 
 def safe_get_lsds(segmentation, sigma=20.0):
@@ -53,15 +70,23 @@ def safe_get_lsds(segmentation, sigma=20.0):
     """
     if not HAS_LSDS:
         raise ImportError(
-            "lsd_lite package required for LSDS computation. "
-            "Install with: pip install lsd_lite"
+            "No LSDS backend available. Install lsd_lite or ensure get_lsds_torch is importable."
         )
 
-    if np.any(segmentation > 0):
-        return get_lsds(segmentation, sigma=sigma)
-    else:
-        # Return zeros with correct shape (10 LSD channels)
+    # If segmentation is empty (no labels) return zeros of correct shape
+    if not np.any(segmentation > 0):
         return np.zeros((10, *segmentation.shape), dtype=np.float32)
+
+    # Prefer the PyTorch implementation if available
+    if HAS_LSDS_TORCH and get_lsds_torch is not None:
+        return get_lsds_torch(segmentation, sigma=sigma)
+
+    # Fallback to lsd_lite implementation
+    if HAS_LSDS_LIB and get_lsds_original is not None:
+        return get_lsds_original(segmentation, sigma=sigma)
+
+    # Shouldn't reach here due to HAS_LSDS guard, but keep safe
+    raise ImportError("LSDS computation failed: no available backend")
 
 
 def compute_affinities_3d(instance_segmentation, offsets=None):
@@ -653,10 +678,10 @@ def compute_affinities_and_lsds_3d(
         - First 10 channels are LSDs
         - Remaining channels are affinities
     """
-    if not HAS_LSDS:
+    # Ensure we have an affinity backend
+    if get_affs is None:
         raise ImportError(
-            "lsd_lite package required for LSDS computation. "
-            "Install with: pip install lsd_lite"
+            "No affinity backend available. Install lsd_lite to compute affinities (get_affs)."
         )
 
     if offsets is None:
@@ -670,12 +695,12 @@ def compute_affinities_and_lsds_3d(
     # Convert offsets to numpy array format expected by lsds
     neighborhood = np.array(offsets, dtype=np.int32)
 
-    # Compute affinities using lsd_lite (exclude background with dist="equality-no-bg")
+    # Compute affinities using the available get_affs backend (exclude background with dist="equality-no-bg")
     # get_affs expects (gt_seg, neighborhood) and returns (num_offsets, D, H, W)
     affinities = get_affs(instance_segmentation, neighborhood, dist="equality-no-bg")
 
-    # Compute LSDs using safe wrapper (handles all-zero arrays)
-    # get_lsds expects (gt_seg, sigma) and returns (10, D, H, W)
+    # Compute LSDs using safe wrapper (handles all-zero arrays).
+    # safe_get_lsds will prefer the PyTorch implementation if available, otherwise fall back to lsd_lite.
     lsds = safe_get_lsds(instance_segmentation, sigma=lsds_sigma)
 
     # Concatenate LSDs and affinities: (10 + num_offsets, D, H, W)
@@ -752,8 +777,8 @@ class AffinityLSDSLoss(torch.nn.Module):
         target_lsds = targets[:, : self.num_lsds, ...]  # (batch, 10, D, H, W)
         target_affs = targets[:, self.num_lsds :, ...]  # (batch, num_offsets, D, H, W)
 
-        # Compute LSDS loss (MSE)
-        lsds_loss_per_pixel = self.mse_loss(pred_lsds, target_lsds)
+        # Compute LSDS loss (MSE on sigmoid(predictions) vs targets)
+        lsds_loss_per_pixel = self.mse_loss(torch.sigmoid(pred_lsds), target_lsds)
 
         if mask is not None:
             # Expand mask to match LSDS channels

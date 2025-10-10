@@ -114,6 +114,15 @@ class DINOv3UNetInference:
 
         # Extract model configuration from checkpoint or training config
         self.model_config = checkpoint.get("model_config", {})
+        # Ensure output_type and affinity_offsets are available in model_config
+        if "output_type" not in self.model_config:
+            if "output_type" in self.training_config:
+                self.model_config["output_type"] = self.training_config["output_type"]
+        if "affinity_offsets" not in self.model_config:
+            if "affinity_offsets" in self.training_config:
+                self.model_config["affinity_offsets"] = self.training_config[
+                    "affinity_offsets"
+                ]
         if not self.model_config and self.training_config:
             # Try to reconstruct from training config with better field mapping
             # Handle different field names between old and new configs
@@ -355,6 +364,15 @@ class DINOv3UNet3DInference:
 
         # Extract model configuration
         self.model_config = checkpoint.get("model_config", {})
+        # Ensure output_type and affinity_offsets are available in model_config
+        if "output_type" not in self.model_config:
+            if "output_type" in self.training_config:
+                self.model_config["output_type"] = self.training_config["output_type"]
+        if "affinity_offsets" not in self.model_config:
+            if "affinity_offsets" in self.training_config:
+                self.model_config["affinity_offsets"] = self.training_config[
+                    "affinity_offsets"
+                ]
         if not self.model_config and self.training_config:
             # Better fallback reconstruction for 3D models
             target_volume_size = self.training_config.get(
@@ -617,7 +635,7 @@ class DINOv3UNet3DInference:
             # Check output type to determine post-processing
             output_type = self.model_config.get("output_type", "labels")
 
-            if output_type == "affinities":
+            if output_type in ("affinities", "affinities_lsds"):
                 # For affinities: apply sigmoid to get probabilities [0, 1]
                 # Output shape: (batch, num_offsets, D, H, W)
                 probabilities = torch.sigmoid(logits)
@@ -630,7 +648,7 @@ class DINOv3UNet3DInference:
                 predictions = torch.argmax(logits, dim=1)
 
         # Convert back to numpy
-        if output_type == "affinities":
+        if output_type in ("affinities", "affinities_lsds"):
             # Return all channels for affinities (num_offsets, D, H, W)
             predictions_np = predictions[0].cpu().numpy()
             probabilities_np = probabilities[0].cpu().numpy()

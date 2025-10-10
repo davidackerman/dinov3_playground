@@ -1989,9 +1989,13 @@ def train_3d_unet_memory_efficient_v2(
     train_accs, val_accs = [], []
     train_class_accs, val_class_accs = [], []
     val_class_precisions, val_class_f1s, val_class_ious = [], [], []
-    best_metric = (
-        0.0  # Best validation metric (IoU for segmentation, accuracy for affinities)
-    )
+    # Best validation metric: for segmentation this is IoU/accuracy (start at 0.0).
+    # For affinity/affinities_lsds we use negative val_loss as the working metric (higher is better),
+    # so initialize to -inf so the first measured val_loss will be able to improve it.
+    if data_loader_3d.output_type in ["affinities", "affinities_lsds"]:
+        best_metric = -float("inf")
+    else:
+        best_metric = 0.0
     best_val_loss = float("inf")  # Track best validation loss for affinities/LSDs
     epochs_without_improvement = 0
 
@@ -2862,17 +2866,27 @@ def train_3d_unet_memory_efficient_v2(
         scheduler.step(current_metric)
         new_lr = optimizer.param_groups[0]["lr"]
 
-        # Check if this is the best metric so far
+        # Check if this is the best metric so far.
+        # For affinities/affinities_lsds we prefer lower validation LOSS (val_loss).
         is_best_model = False
-        if current_metric > best_metric + min_delta:
-            best_metric = current_metric  # Store best metric (IoU or accuracy or -loss)
-            epochs_without_improvement = 0
-            is_best_model = True
-            # Update best_val_loss for affinities/LSDs
-            if data_loader_3d.output_type in ["affinities", "affinities_lsds"]:
+        if data_loader_3d.output_type in ["affinities", "affinities_lsds"]:
+            # Lower val_loss is better
+            if val_loss < best_val_loss - min_delta:
                 best_val_loss = val_loss
+                best_metric = -best_val_loss
+                epochs_without_improvement = 0
+                is_best_model = True
+            else:
+                epochs_without_improvement += 1
+            # Keep current_metric consistent (scheduler expects higher-is-better)
+            current_metric = -val_loss
         else:
-            epochs_without_improvement += 1
+            if current_metric > best_metric + min_delta:
+                best_metric = current_metric  # Store best metric (IoU or accuracy)
+                epochs_without_improvement = 0
+                is_best_model = True
+            else:
+                epochs_without_improvement += 1
 
         # Print progress every epoch with timing
         current_lr = optimizer.param_groups[0]["lr"]
@@ -2921,7 +2935,15 @@ def train_3d_unet_memory_efficient_v2(
 
             print(f"  Mean IoU: {current_metric:.4f}")
 
-        print(f"  Best {metric_name}: {best_metric:.4f}, LR: {current_lr:.6f}")
+        # For user-facing display, show the human-friendly best value:
+        # - For affinity/LSDS: show positive best_val_loss
+        # - Otherwise show best_metric (e.g., IoU or accuracy)
+        if data_loader_3d.output_type in ["affinities", "affinities_lsds"]:
+            display_best = best_val_loss
+        else:
+            display_best = best_metric
+
+        print(f"  Best {metric_name}: {display_best:.4f}, LR: {current_lr:.6f}")
         print(f"  Epochs without improvement: {epochs_without_improvement}")
         if new_lr < old_lr:
             print(f"  Learning rate reduced: {old_lr:.6f} -> {new_lr:.6f}")
@@ -3008,6 +3030,8 @@ def train_3d_unet_memory_efficient_v2(
                     "lsds_sigma": getattr(
                         data_loader_3d, "lsds_sigma", 20.0
                     ),  # Add LSDS sigma parameter
+                    "compute_lsds": getattr(data_loader_3d, "output_type", "labels")
+                    == "affinities_lsds",
                 },
                 "model_config": {
                     "num_classes": num_classes,
@@ -3039,6 +3063,8 @@ def train_3d_unet_memory_efficient_v2(
                     "lsds_sigma": getattr(
                         data_loader_3d, "lsds_sigma", 20.0
                     ),  # Add LSDS sigma parameter
+                    "compute_lsds": getattr(data_loader_3d, "output_type", "labels")
+                    == "affinities_lsds",
                 },
             }
 
