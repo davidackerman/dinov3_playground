@@ -19,6 +19,7 @@ from cellmap_flow.image_data_interface import ImageDataInterface
 import warnings  # Add this import at the top
 from funlib.geometry import Coordinate
 import numpy as np
+import gc
 
 
 def apply_augmentation(raw_patch, gt_patch):
@@ -1142,15 +1143,33 @@ def load_random_3d_training_data(
             f"Padding per side: {roi_padding * base_resolution} nm ({roi_padding} pixels at {base_resolution}nm resolution)"
         )
 
-    raw_volumes = []
-    gt_volumes = []
+    # initialize as numpy arrays
+    raw_volume_shape = (
+        int(base_resolution / min_resolution_for_raw)
+        * np.array(volume_shape, dtype=int)
+        if min_resolution_for_raw
+        else volume_shape
+    )
+    raw_volumes = np.empty((num_volumes, *raw_volume_shape), dtype=np.uint16)
+    gt_volumes = np.empty((num_volumes, *volume_shape), dtype=np.uint8)
     gt_masks = (
-        []
-    )  # Masks indicating valid GT regions (only used if allow_gt_extension=True)
-    context_volumes = (
-        []
-    )  # Context volumes at lower resolution (if context_scale provided)
-    dataset_sources = []
+        np.empty((num_volumes, *volume_shape), dtype=np.uint8)
+        if allow_gt_extension
+        else None
+    )
+    # Context volumes at lower resolution (if context_scale provided).
+    # Preallocate to avoid list growth and retain predictable memory usage.
+    if context_scale is not None:
+        # Use object dtype because some entries may be None when context is unavailable
+        context_volumes = np.empty((num_volumes,), dtype=object)
+        # Initialize to None explicitly
+        for i in range(num_volumes):
+            context_volumes[i] = None
+    else:
+        context_volumes = None
+
+    # Preallocate dataset sources as integer array to avoid repeated appends
+    dataset_sources = np.empty((num_volumes,), dtype=np.int32)
 
     print(
         f"Sampling {num_volumes} volumes of shape {volume_shape} from {len(converted_pairs)} datasets..."
@@ -1833,13 +1852,14 @@ def load_random_3d_training_data(
             )
 
             # Store the volumes and mask (only after all checks pass)
-            gt_masks.append(gt_mask)
-            raw_volumes.append(raw_volume)
-            gt_volumes.append(gt_volume)
-            context_volumes.append(context_volume)  # Will be None if no context
-            dataset_sources.append(dataset_idx)
+            gt_masks[volumes_collected] = gt_mask
+            raw_volumes[volumes_collected] = raw_volume
+            gt_volumes[volumes_collected] = gt_volume
+            # Store into preallocated arrays/lists by index
+            if context_volumes is not None:
+                context_volumes[volumes_collected] = context_volume  # May be None
+            dataset_sources[volumes_collected] = dataset_idx
             volumes_collected += 1
-
             # Print class distribution for this volume
             unique_classes, class_counts = np.unique(gt_volume, return_counts=True)
             class_info = ", ".join(
@@ -1858,7 +1878,8 @@ def load_random_3d_training_data(
                     "classes": len(unique_classes),
                 }
             )
-
+            del gt_mask, raw_volume, gt_volume, class_volumes, raw_idi, class_idis
+            gc.collect()
             # except Exception as e:
             #     error_msg = str(e)
             #     if "FAILED_PRECONDITION" in error_msg and "checksum" in error_msg:
@@ -1883,37 +1904,34 @@ def load_random_3d_training_data(
     if volumes_collected < num_volumes:
         print(f"Warning: Only collected {volumes_collected}/{num_volumes} volumes")
 
-    # Convert to numpy arrays
-    raw_volumes = np.array(raw_volumes)  # Shape: (num_volumes, D, H, W)
-    gt_volumes = np.array(
-        gt_volumes
-    )  # Shape: (num_volumes, D, H, W) with class indices
-    gt_masks = np.array(gt_masks)  # Shape: (num_volumes, D, H, W) with 0/1 mask
-
     # Handle context volumes
-    has_context = context_scale is not None and any(
-        cv is not None for cv in context_volumes
-    )
-    if has_context:
-        # Convert context volumes to numpy array, handling None values
-        context_volumes_filtered = [cv for cv in context_volumes if cv is not None]
-        if len(context_volumes_filtered) == len(context_volumes):
-            context_volumes = np.array(context_volumes)
-        else:
-            # Some volumes don't have context - pad with None or handle appropriately
-            print(
-                f"Warning: Only {len(context_volumes_filtered)}/{len(context_volumes)} volumes have context data"
-            )
-            context_volumes = np.array(
-                context_volumes, dtype=object
-            )  # Allow None values
+    # Determine whether any context data was captured
+    if context_volumes is None:
+        has_context = False
     else:
-        context_volumes = None
+        # Check if at least one context entry is not None
+        has_context = any(cv is not None for cv in context_volumes)
+        if has_context:
+            # If all entries are non-None, convert to a regular numpy array
+            if all(cv is not None for cv in context_volumes):
+                context_volumes = np.stack(context_volumes, axis=0)
+            else:
+                # Mixed None/non-None -> keep as object array for caller to handle
+                valid_count = sum(1 for cv in context_volumes if cv is not None)
+                if valid_count < len(context_volumes):
+                    print(
+                        f"Warning: Only {valid_count}/{len(context_volumes)} volumes have context data"
+                    )
+                # keep as object array
+        else:
+            # No context data found
+            context_volumes = None
 
     print(f"Final dataset summary:")
     print(f"  Raw volumes shape: {raw_volumes.shape}")
     print(f"  GT volumes shape: {gt_volumes.shape}")
-    print(f"  GT masks shape: {gt_masks.shape}")
+    if gt_masks is not None:
+        print(f"  GT masks shape: {gt_masks.shape}")
     if has_context and context_volumes is not None:
         if context_volumes.dtype == object:
             print(f"  Context volumes: Mixed (some None)")
@@ -1926,6 +1944,9 @@ def load_random_3d_training_data(
         print(f"  GT extension enabled - masks indicate valid GT regions")
         valid_mask_fraction = np.mean(gt_masks)
         print(f"  Average valid GT fraction: {valid_mask_fraction:.3f}")
+
+    # Convert dataset_sources to a Python list trimmed to collected volumes for API compatibility
+    dataset_sources = list(dataset_sources[:volumes_collected])
 
     if allow_gt_extension:
         if has_context:

@@ -636,12 +636,35 @@ class DINOv3UNet3DInference:
             output_type = self.model_config.get("output_type", "labels")
 
             if output_type in ("affinities", "affinities_lsds"):
-                # For affinities: apply sigmoid to get probabilities [0, 1]
-                # Output shape: (batch, num_offsets, D, H, W)
-                probabilities = torch.sigmoid(logits)
-                predictions = (
-                    probabilities  # For affinities, return probabilities as predictions
-                )
+                # For pure affinities: apply sigmoid to all channels and return
+                # probabilities in [0,1]. For combined affinities+LSDS
+                # (output_type == 'affinities_lsds') we want to keep the LSDS
+                # channels as raw logits (first N channels) and only apply
+                # sigmoid to the affinity channels (remaining channels).
+                if output_type == "affinities":
+                    # Output shape: (batch, num_offsets, D, H, W)
+                    probabilities = torch.sigmoid(logits)
+                    predictions = probabilities
+                else:  # output_type == 'affinities_lsds'
+                    # Number of LSDS channels (default 10)
+                    num_lsds = int(self.model_config.get("num_lsds", 10))
+
+                    # Safety: if model produced fewer channels than expected, fall back to full-sigmoid
+                    # if logits.shape[1] <= num_lsds:
+                    probabilities = torch.sigmoid(logits)
+                    predictions = probabilities
+                    # else:
+                    #     lsds_logits = logits[:, :num_lsds, ...]
+                    #     aff_logits = logits[:, num_lsds:, ...]
+
+                    #     # Apply sigmoid only to affinity logits
+                    #     aff_probs = torch.sigmoid(aff_logits)
+
+                    #     # Compose predictions: LSDS raw logits first, then affinity probabilities
+                    #     predictions = torch.cat([lsds_logits, aff_probs], dim=1)
+
+                    #     # Keep a matching 'probabilities' variable for downstream return
+                    #     probabilities = predictions
             else:
                 # For classification: apply softmax and argmax
                 probabilities = torch.softmax(logits, dim=1)

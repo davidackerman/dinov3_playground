@@ -778,8 +778,58 @@ class AffinityLSDSLoss(torch.nn.Module):
         target_affs = targets[:, self.num_lsds :, ...]  # (batch, num_offsets, D, H, W)
 
         # Compute LSDS loss (MSE on sigmoid(predictions) vs targets)
-        lsds_loss_per_pixel = self.mse_loss(pred_lsds, target_lsds)
+        lsds_loss_per_pixel = self.mse_loss(torch.sigmoid(pred_lsds), target_lsds)
 
+        # print distribution of values for torch.sigmoid(pred_lsds) and target_lsds
+        def _stats(tensor):
+            try:
+                arr = tensor.detach().cpu().numpy().ravel()
+                if arr.size == 0:
+                    return {
+                        "mean": np.nan,
+                        "median": np.nan,
+                        "mode": np.nan,
+                        "min": np.nan,
+                        "max": np.nan,
+                    }
+                mean = float(np.mean(arr))
+                median = float(np.median(arr))
+                mn = float(np.min(arr))
+                mx = float(np.max(arr))
+                counts, edges = np.histogram(arr, bins=100)
+                centers = (edges[:-1] + edges[1:]) / 2.0
+                mode = float(centers[np.argmax(counts)])
+                return {
+                    "mean": mean,
+                    "median": median,
+                    "mode": mode,
+                    "min": mn,
+                    "max": mx,
+                }
+            except Exception as e:
+                print(f"Error computing stats: {e}")
+                return {
+                    "mean": np.nan,
+                    "median": np.nan,
+                    "mode": np.nan,
+                    "min": np.nan,
+                    "max": np.nan,
+                }
+
+        pred_lsds_sig = torch.sigmoid(pred_lsds)
+        pred_affs_prob = torch.sigmoid(pred_affs)
+
+        for name, tensor in [
+            ("pred_lsds (sigmoid)", pred_lsds_sig),
+            ("target_lsds", target_lsds),
+            ("pred_affs (prob)", pred_affs_prob),
+            ("target_affs", target_affs),
+        ]:
+            s = _stats(tensor)
+            print(
+                f"{name}: mean={s['mean']:.6f}, median={s['median']:.6f}, "
+                f"mode≈{s['mode']:.6f}, min={s['min']:.6f}, max={s['max']:.6f}"
+            )
         if mask is not None:
             # Expand mask to match LSDS channels
             mask_expanded = mask.unsqueeze(1).expand_as(lsds_loss_per_pixel)
@@ -828,7 +878,9 @@ class AffinityLSDSLoss(torch.nn.Module):
             criterion = torch.nn.BCEWithLogitsLoss(reduction="none")
 
         # Compute affinity loss
-        affinity_loss_per_pixel = criterion(pred_affs, target_affs)
+        affinity_loss_per_pixel = criterion(
+            pred_affs, target_affs * 0.96 + 0.02
+        )  # smooth toward 0.5 a bit
 
         # Apply mask if provided
         if mask is not None:
@@ -849,34 +901,34 @@ class AffinityLSDSLoss(torch.nn.Module):
         return total_loss
 
 
-# Example usage and testing
-if __name__ == "__main__":
-    print("Testing affinity computation...")
+# # Example usage and testing
+# if __name__ == "__main__":
+#     print("Testing affinity computation...")
 
-    # Create a simple test instance segmentation
-    instances = np.zeros((10, 10, 10), dtype=np.int32)
-    instances[2:5, 2:5, 2:5] = 1  # First instance
-    instances[6:9, 6:9, 6:9] = 2  # Second instance
+#     # Create a simple test instance segmentation
+#     instances = np.zeros((10, 10, 10), dtype=np.int32)
+#     instances[2:5, 2:5, 2:5] = 1  # First instance
+#     instances[6:9, 6:9, 6:9] = 2  # Second instance
 
-    print(f"Instance segmentation shape: {instances.shape}")
-    print(f"Number of instances: {len(np.unique(instances)) - 1}")  # -1 for background
+#     print(f"Instance segmentation shape: {instances.shape}")
+#     print(f"Number of instances: {len(np.unique(instances)) - 1}")  # -1 for background
 
-    # Compute affinities
-    affinities = compute_affinities_3d(instances)
-    print(f"Affinities shape: {affinities.shape}")
-    print(f"Affinity ranges: [{affinities.min()}, {affinities.max()}]")
+#     # Compute affinities
+#     affinities = compute_affinities_3d(instances)
+#     print(f"Affinities shape: {affinities.shape}")
+#     print(f"Affinity ranges: [{affinities.min()}, {affinities.max()}]")
 
-    # Test with PyTorch
-    instances_torch = torch.from_numpy(instances)
-    affinities_torch = compute_affinities_3d(instances_torch)
-    print(f"PyTorch affinities shape: {affinities_torch.shape}")
+#     # Test with PyTorch
+#     instances_torch = torch.from_numpy(instances)
+#     affinities_torch = compute_affinities_3d(instances_torch)
+#     print(f"PyTorch affinities shape: {affinities_torch.shape}")
 
-    # Test loss
-    predictions = torch.randn(2, 3, 10, 10, 10)  # batch=2, offsets=3
-    targets = affinities_torch.unsqueeze(0).repeat(2, 1, 1, 1, 1)
+#     # Test loss
+#     predictions = torch.randn(2, 3, 10, 10, 10)  # batch=2, offsets=3
+#     targets = affinities_torch.unsqueeze(0).repeat(2, 1, 1, 1, 1)
 
-    loss_fn = AffinityLoss()
-    loss = loss_fn(predictions, targets)
-    print(f"Test loss: {loss.item():.4f}")
+#     loss_fn = AffinityLoss()
+#     loss = loss_fn(predictions, targets)
+#     print(f"Test loss: {loss.item():.4f}")
 
-    print("\n✓ All tests passed!")
+#     print("\n✓ All tests passed!")

@@ -282,6 +282,7 @@ def get_lsds_torch(
 
 
 # # %%
+#if name=="__main__":
 
 # import numpy as np
 # import matplotlib.pyplot as plt
@@ -447,37 +448,37 @@ def get_lsds_torch(
 # plt.show()
 # # %%
 # Plot per-channel histograms of the PyTorch (lsds_torch) output, excluding zeros.
-lsds_torch = get_lsds_torch(gt[8], sigma=5)
-C = lsds_torch.shape[0]
-names = channel_names if "channel_names" in globals() else [f"Ch {i}" for i in range(C)]
+# lsds_torch = get_lsds_torch(gt[8], sigma=5)
+# C = lsds_torch.shape[0]
+# names = channel_names if "channel_names" in globals() else [f"Ch {i}" for i in range(C)]
 
-ncols = 5
-nrows = ceil(C / ncols)
-for current_lsd in [lsds_original, lsds_torch]:
-    fig, axes = plt.subplots(
-        nrows, ncols, figsize=(4 * ncols, 3 * nrows), squeeze=False
-    )
-    bins = 100
-    for i in range(C):
-        ax = axes[i // ncols][i % ncols]
-        vals = current_lsd[i].ravel().astype(np.float32)
-        vals_nz = vals[vals != 0]
-        if vals_nz.size == 0:
-            ax.text(0.5, 0.5, "no non-zero values", ha="center", va="center")
-            ax.set_title(names[i])
-            ax.set_xlabel("value")
-            ax.set_ylabel("count")
-            continue
-        ax.hist(vals_nz, bins=bins, range=(0.0, 1.0), color="C0", alpha=0.8)
-        ax.set_title(f"{names[i]} (n={vals_nz.size:,})")
-        ax.set_xlabel("value")
-        ax.set_ylabel("count")
+# ncols = 5
+# nrows = ceil(C / ncols)
+# for current_lsd in [lsds_original, lsds_torch]:
+#     fig, axes = plt.subplots(
+#         nrows, ncols, figsize=(4 * ncols, 3 * nrows), squeeze=False
+#     )
+#     bins = 100
+#     for i in range(C):
+#         ax = axes[i // ncols][i % ncols]
+#         vals = current_lsd[i].ravel().astype(np.float32)
+#         vals_nz = vals[vals != 0]
+#         if vals_nz.size == 0:
+#             ax.text(0.5, 0.5, "no non-zero values", ha="center", va="center")
+#             ax.set_title(names[i])
+#             ax.set_xlabel("value")
+#             ax.set_ylabel("count")
+#             continue
+#         ax.hist(vals_nz, bins=bins, range=(0.0, 1.0), color="C0", alpha=0.8)
+#         ax.set_title(f"{names[i]} (n={vals_nz.size:,})")
+#         ax.set_xlabel("value")
+#         ax.set_ylabel("count")
 
-    # hide any empty subplots
-    for j in range(C, nrows * ncols):
-        axes[j // ncols][j % ncols].axis("off")
+#     # hide any empty subplots
+#     for j in range(C, nrows * ncols):
+#         axes[j // ncols][j % ncols].axis("off")
 
-    plt.tight_layout()
-    plt.show()
+#     plt.tight_layout()
+#     plt.show()
 
 # %%
