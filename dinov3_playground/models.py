@@ -24,6 +24,133 @@ from .dinov3_core import (
 )  # Assuming output_channels is defined there
 
 
+# ---------------------------
+# Simple BatchRenorm implementation (1d/2d/3d)
+# ---------------------------
+class _BatchRenormNd(nn.Module):
+    def __init__(
+        self,
+        num_features,
+        eps=1e-5,
+        momentum=0.1,
+        rmax=3.0,
+        dmax=5.0,
+        affine=True,
+        track_running_stats=True,
+        dims=2,
+    ):
+        super().__init__()
+        self.num_features = num_features
+        self.eps = eps
+        self.momentum = momentum
+        self.rmax = rmax
+        self.dmax = dmax
+        self.affine = affine
+        self.track_running_stats = track_running_stats
+        self.dims = dims  # 1,2,3 for BatchNorm1d/2d/3d
+
+        if self.affine:
+            self.weight = nn.Parameter(torch.ones(num_features))
+            self.bias = nn.Parameter(torch.zeros(num_features))
+        else:
+            self.register_parameter("weight", None)
+            self.register_parameter("bias", None)
+
+        if self.track_running_stats:
+            self.register_buffer("running_mean", torch.zeros(num_features))
+            self.register_buffer("running_var", torch.ones(num_features))
+            self.register_buffer(
+                "num_batches_tracked", torch.tensor(0, dtype=torch.long)
+            )
+        else:
+            self.register_buffer("running_mean", None)
+            self.register_buffer("running_var", None)
+            self.register_buffer("num_batches_tracked", None)
+
+    def forward(self, x):
+        # x shape: (N, C, *spatial)
+        if x.dim() < 2:
+            raise ValueError("Input for BatchRenorm must have >=2 dims")
+        dims = [0] + list(range(2, x.dim()))
+        if self.training:
+            # compute batch mean/var over N and spatial dims
+            batch_mean = x.mean(dim=dims, keepdim=False)
+            batch_var = x.var(dim=dims, unbiased=False, keepdim=False)
+            batch_std = torch.sqrt(batch_var + self.eps)
+
+            if self.track_running_stats:
+                # update running stats
+                self.running_mean = (
+                    1 - self.momentum
+                ) * self.running_mean + self.momentum * batch_mean.detach()
+                self.running_var = (
+                    1 - self.momentum
+                ) * self.running_var + self.momentum * batch_var.detach()
+                self.num_batches_tracked += 1
+
+                running_std = torch.sqrt(self.running_var + self.eps)
+                # compute renorm params
+                r = (batch_std / running_std).clamp(1.0 / self.rmax, self.rmax)
+                d = ((batch_mean - self.running_mean) / running_std).clamp(
+                    -self.dmax, self.dmax
+                )
+            else:
+                r = torch.ones_like(batch_std)
+                d = torch.zeros_like(batch_mean)
+
+            # reshape for broadcasting
+            shape = [1, -1] + [1] * (x.dim() - 2)
+            batch_mean_b = batch_mean.view(shape)
+            batch_std_b = batch_std.view(shape)
+            r_b = r.view(shape)
+            d_b = d.view(shape)
+
+            x_hat = (x - batch_mean_b) / batch_std_b
+            x_renorm = r_b * x_hat + d_b
+            if self.affine:
+                w = self.weight.view(1, -1, *([1] * (x.dim() - 2)))
+                b = self.bias.view(1, -1, *([1] * (x.dim() - 2)))
+                return w * x_renorm + b
+            else:
+                return x_renorm
+        else:
+            # inference uses running stats
+            if self.track_running_stats:
+                running_std = torch.sqrt(self.running_var + self.eps)
+                rm = self.running_mean.view([1, -1] + [1] * (x.dim() - 2))
+                rs = running_std.view([1, -1] + [1] * (x.dim() - 2))
+                x_hat = (x - rm) / rs
+                if self.affine:
+                    w = self.weight.view(1, -1, *([1] * (x.dim() - 2)))
+                    b = self.bias.view(1, -1, *([1] * (x.dim() - 2)))
+                    return w * x_hat + b
+                else:
+                    return x_hat
+            else:
+                # fallback to identity if no running stats
+                return x
+
+
+class BatchRenorm1d(_BatchRenormNd):
+    def __init__(self, num_features, **kwargs):
+        super().__init__(num_features, dims=1, **kwargs)
+
+
+class BatchRenorm2d(_BatchRenormNd):
+    def __init__(self, num_features, **kwargs):
+        super().__init__(num_features, dims=2, **kwargs)
+
+
+class BatchRenorm3d(_BatchRenormNd):
+    def __init__(self, num_features, **kwargs):
+        super().__init__(num_features, dims=3, **kwargs)
+
+
+# ---------------------------
+# End BatchRenorm
+# ---------------------------
+
+
 class ImprovedClassifier(nn.Module):
     """
     Enhanced neural network classifier with batch normalization and dropout.
@@ -43,6 +170,7 @@ class ImprovedClassifier(nn.Module):
         num_classes=2,
         dropout_rate=0.3,
         use_batch_norm=True,
+        use_batch_renorm=False,
         activation="relu",
     ):
         """
@@ -66,6 +194,7 @@ class ImprovedClassifier(nn.Module):
         super(ImprovedClassifier, self).__init__()
 
         self.use_batch_norm = use_batch_norm
+        self.use_batch_renorm = use_batch_renorm
         self.activation = activation
 
         # Build layers dynamically
@@ -73,12 +202,13 @@ class ImprovedClassifier(nn.Module):
         dims = [input_dim] + hidden_dims
 
         for i in range(len(dims) - 1):
-            # Linear layer
             layers.append(nn.Linear(dims[i], dims[i + 1]))
 
-            # Batch normalization
             if use_batch_norm:
-                layers.append(nn.BatchNorm1d(dims[i + 1]))
+                if use_batch_renorm:
+                    layers.append(BatchRenorm1d(dims[i + 1]))
+                else:
+                    layers.append(nn.BatchNorm1d(dims[i + 1]))
 
             # Activation
             if activation == "leaky_relu":
@@ -86,7 +216,6 @@ class ImprovedClassifier(nn.Module):
             else:
                 layers.append(nn.ReLU())
 
-            # Dropout
             layers.append(nn.Dropout(dropout_rate))
 
         # Final output layer
@@ -221,7 +350,9 @@ class DINOv3UNet(nn.Module):
     - Output: Segmentation map (H, W, num_classes)
     """
 
-    def __init__(self, input_channels=384, num_classes=2, base_channels=64):
+    def __init__(
+        self, input_channels=384, num_classes=2, base_channels=64, use_batchrenorm=False
+    ):
         """
         Initialize DINOv3 UNet.
 
@@ -235,37 +366,42 @@ class DINOv3UNet(nn.Module):
             Base number of channels in the UNet
         """
         super(DINOv3UNet, self).__init__()
+        self.use_batchrenorm = use_batchrenorm
 
-        self.input_channels = input_channels
-        self.num_classes = num_classes
+        # choose normalization layer
+        Norm2d = BatchRenorm2d if self.use_batchrenorm else nn.BatchNorm2d
 
         # Input projection to reduce channels
         self.input_conv = nn.Conv2d(input_channels, base_channels, kernel_size=1)
 
         # Encoder (downsampling path)
-        self.enc1 = self._make_encoder_block(base_channels, base_channels)
-        self.enc2 = self._make_encoder_block(base_channels, base_channels * 2)
-        self.enc3 = self._make_encoder_block(base_channels * 2, base_channels * 4)
-        self.enc4 = self._make_encoder_block(base_channels * 4, base_channels * 8)
+        self.enc1 = self._make_encoder_block(base_channels, base_channels, Norm2d)
+        self.enc2 = self._make_encoder_block(base_channels, base_channels * 2, Norm2d)
+        self.enc3 = self._make_encoder_block(
+            base_channels * 2, base_channels * 4, Norm2d
+        )
+        self.enc4 = self._make_encoder_block(
+            base_channels * 4, base_channels * 8, Norm2d
+        )
 
         # Bottleneck
         self.bottleneck = self._make_encoder_block(
-            base_channels * 8, base_channels * 16
+            base_channels * 8, base_channels * 16, Norm2d
         )
 
         # Decoder (upsampling path) - Fixed channel calculations
         # After concatenation: upsampled + skip connection
         self.dec4 = self._make_decoder_block(
-            base_channels * 16 + base_channels * 8, base_channels * 8
+            base_channels * 16 + base_channels * 8, base_channels * 8, Norm2d
         )
         self.dec3 = self._make_decoder_block(
-            base_channels * 8 + base_channels * 4, base_channels * 4
+            base_channels * 8 + base_channels * 4, base_channels * 4, Norm2d
         )
         self.dec2 = self._make_decoder_block(
-            base_channels * 4 + base_channels * 2, base_channels * 2
+            base_channels * 4 + base_channels * 2, base_channels * 2, Norm2d
         )
         self.dec1 = self._make_decoder_block(
-            base_channels * 2 + base_channels, base_channels
+            base_channels * 2 + base_channels, base_channels, Norm2d
         )
 
         # Final output layer
@@ -274,25 +410,25 @@ class DINOv3UNet(nn.Module):
         # Pooling
         self.pool = nn.MaxPool2d(2)
 
-    def _make_encoder_block(self, in_channels, out_channels):
+    def _make_encoder_block(self, in_channels, out_channels, Norm):
         """Create an encoder block with two convolutions."""
         return nn.Sequential(
             nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_channels),
+            Norm(out_channels),
             nn.ReLU(inplace=True),
             nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_channels),
+            Norm(out_channels),
             nn.ReLU(inplace=True),
         )
 
-    def _make_decoder_block(self, in_channels, out_channels):
+    def _make_decoder_block(self, in_channels, out_channels, Norm):
         """Create a decoder block with two convolutions."""
         return nn.Sequential(
             nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_channels),
+            Norm(out_channels),
             nn.ReLU(inplace=True),
             nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_channels),
+            Norm(out_channels),
             nn.ReLU(inplace=True),
         )
 
@@ -539,20 +675,17 @@ class ContextAttentionFusion(nn.Module):
     raw feature dominance.
     """
 
-    def __init__(self, channels):
+    def __init__(self, channels, use_batchrenorm=False):
         super().__init__()
+        Norm3d = BatchRenorm3d if use_batchrenorm else nn.BatchNorm3d
         self.channels = channels
-
-        # Context projection to match raw feature dimensions
         self.context_proj = nn.Sequential(
             nn.Conv3d(channels, channels // 4, 1),
-            nn.BatchNorm3d(channels // 4),
+            Norm3d(channels // 4),
             nn.ReLU(inplace=True),
             nn.Conv3d(channels // 4, channels, 1),
-            nn.Sigmoid(),  # Attention weights between 0 and 1
+            nn.Sigmoid(),
         )
-
-        # Optional residual connection for raw features
         self.raw_proj = nn.Conv3d(channels, channels, 1)
 
     def forward(self, raw_features, context_features):
@@ -601,41 +734,16 @@ class DINOv3UNet3D(nn.Module):
         base_channels=32,
         input_size=(112, 112, 112),
         use_half_precision=False,
-        learn_upsampling=False,  # NEW PARAMETER
-        dinov3_feature_size=None,  # NEW PARAMETER
-        use_gradient_checkpointing=True,  # NEW PARAMETER for memory efficiency
-        use_context_fusion=False,  # NEW PARAMETER for context fusion
-        context_channels=384,  # NEW PARAMETER for context feature dimension
+        learn_upsampling=False,
+        dinov3_feature_size=None,
+        use_gradient_checkpointing=True,
+        use_context_fusion=False,
+        context_channels=384,
+        use_batchrenorm=False,
     ):
-        """
-        Initialize DINOv3 3D UNet.
-
-        Parameters:
-        -----------
-        input_channels : int, default=384
-            Number of input channels (DINOv3 feature dimension)
-        num_classes : int, default=2
-            Number of output classes
-        base_channels : int, default=32
-            Base number of channels in the UNet (lower than 2D due to memory)
-        input_size : tuple, default=(112, 112, 112)
-            Expected output spatial dimensions (D, H, W)
-        use_half_precision : bool, default=False
-            Whether to use half precision (float16)
-        learn_upsampling : bool, default=False
-            If True, UNet learns upsampling from lower-res DINOv3 features
-            If False, DINOv3 features are pre-interpolated to full resolution
-        dinov3_feature_size : tuple, optional
-            Spatial size of DINOv3 features (D, H, W) when learn_upsampling=True
-            If None, assumes same as input_size
-        use_gradient_checkpointing : bool, default=True
-            Whether to use gradient checkpointing for memory efficiency
-        use_context_fusion : bool, default=False
-            Whether to use context features for multi-scale fusion
-        context_channels : int, default=384
-            Number of context feature channels (should match input_channels)
-        """
         super(DINOv3UNet3D, self).__init__()
+        self.use_batchrenorm = use_batchrenorm
+        Norm3d = BatchRenorm3d if self.use_batchrenorm else nn.BatchNorm3d
 
         self.input_channels = input_channels
         self.num_classes = num_classes
@@ -664,32 +772,42 @@ class DINOv3UNet3D(nn.Module):
             self.learned_upsample = None
 
         # Encoder (downsampling path)
-        self.enc1 = self._make_encoder_block(self.base_channels, self.base_channels)
-        self.enc2 = self._make_encoder_block(self.base_channels, self.base_channels * 2)
+        self.enc1 = self._make_encoder_block(
+            self.base_channels, self.base_channels, Norm3d
+        )
+        self.enc2 = self._make_encoder_block(
+            self.base_channels, self.base_channels * 2, Norm3d
+        )
         self.enc3 = self._make_encoder_block(
-            self.base_channels * 2, self.base_channels * 4
+            self.base_channels * 2, self.base_channels * 4, Norm3d
         )
         self.enc4 = self._make_encoder_block(
-            self.base_channels * 4, self.base_channels * 8
+            self.base_channels * 4, self.base_channels * 8, Norm3d
         )
 
         # Bottleneck
         self.bottleneck = self._make_encoder_block(
-            self.base_channels * 8, self.base_channels * 16
+            self.base_channels * 8, self.base_channels * 16, Norm3d
         )
 
         # Decoder (upsampling path)
         self.dec4 = self._make_decoder_block(
-            self.base_channels * 16 + self.base_channels * 8, self.base_channels * 8
+            self.base_channels * 16 + self.base_channels * 8,
+            self.base_channels * 8,
+            Norm3d,
         )
         self.dec3 = self._make_decoder_block(
-            self.base_channels * 8 + self.base_channels * 4, self.base_channels * 4
+            self.base_channels * 8 + self.base_channels * 4,
+            self.base_channels * 4,
+            Norm3d,
         )
         self.dec2 = self._make_decoder_block(
-            self.base_channels * 4 + self.base_channels * 2, self.base_channels * 2
+            self.base_channels * 4 + self.base_channels * 2,
+            self.base_channels * 2,
+            Norm3d,
         )
         self.dec1 = self._make_decoder_block(
-            self.base_channels * 2 + self.base_channels, self.base_channels
+            self.base_channels * 2 + self.base_channels, self.base_channels, Norm3d
         )
 
         # Final output layer
@@ -724,45 +842,45 @@ class DINOv3UNet3D(nn.Module):
 
             # Context fusion modules for each skip connection level
             self.context_fusion1 = ContextAttentionFusion(
-                self.base_channels
-            )  # Full resolution
+                self.base_channels, use_batchrenorm=self.use_batchrenorm
+            )
             self.context_fusion2 = ContextAttentionFusion(
-                self.base_channels * 2
-            )  # 1/2 resolution
+                self.base_channels * 2, use_batchrenorm=self.use_batchrenorm
+            )
             self.context_fusion3 = ContextAttentionFusion(
-                self.base_channels * 4
-            )  # 1/4 resolution
+                self.base_channels * 4, use_batchrenorm=self.use_batchrenorm
+            )
             self.context_fusion4 = ContextAttentionFusion(
-                self.base_channels * 8
-            )  # 1/8 resolution
+                self.base_channels * 8, use_batchrenorm=self.use_batchrenorm
+            )
 
         # Convert to half precision if requested
         if use_half_precision:
             self.half()
             print("Model converted to half precision (float16)")
 
-    def _make_encoder_block(self, in_channels, out_channels):
+    def _make_encoder_block(self, in_channels, out_channels, Norm):
         """Create a 3D encoder block with two convolutions."""
         return nn.Sequential(
             nn.Conv3d(in_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm3d(out_channels),
+            Norm(out_channels),
             nn.ReLU(inplace=True),
             nn.Conv3d(out_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm3d(out_channels),
+            Norm(out_channels),
             nn.ReLU(inplace=True),
-            nn.Dropout3d(0.1),  # Light dropout in encoder
+            nn.Dropout3d(0.1),
         )
 
-    def _make_decoder_block(self, in_channels, out_channels):
+    def _make_decoder_block(self, in_channels, out_channels, Norm):
         """Create a 3D decoder block with two convolutions."""
         return nn.Sequential(
             nn.Conv3d(in_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm3d(out_channels),
+            Norm(out_channels),
             nn.ReLU(inplace=True),
             nn.Conv3d(out_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm3d(out_channels),
+            Norm(out_channels),
             nn.ReLU(inplace=True),
-            nn.Dropout3d(0.1),  # Light dropout in decoder
+            nn.Dropout3d(0.1),
         )
 
     def _make_upsampling_layers(self):
@@ -1649,6 +1767,781 @@ class DINOv3UNet3DPipeline(nn.Module):
             return batch_features, detailed_timing
         else:
             return batch_features
+
+    def extract_dinov3_features_3d(
+        self,
+        volume,
+        use_orthogonal_planes=None,
+        enable_timing=False,
+        target_output_size=None,
+    ):
+        """
+        Extract DINOv3 features from a 3D volume by processing slices in orthogonal planes.
+
+        Parameters:
+        -----------
+        volume : numpy.ndarray or torch.Tensor
+            Volume of shape (batch_size, D, H, W) or (D, H, W)
+        use_orthogonal_planes : bool, optional
+            If True, processes slices in all 3 orthogonal planes (XY, XZ, YZ) and averages them.
+            If False, uses only XY planes (original behavior).
+            If None (default), uses the instance's use_orthogonal_planes setting.
+        target_output_size : tuple, optional
+            Target size (D, H, W) for the output features. If provided, features will be
+            processed at the input volume's native resolution but downsampled to this size.
+            If None, uses self.input_size.
+
+        Returns:
+        --------
+        torch.Tensor: DINOv3 features (batch_size, output_channels, D, H, W)
+        """
+        if isinstance(volume, torch.Tensor):
+            volume = volume.cpu().numpy()
+
+        # Handle single volume vs batch
+        if volume.ndim == 3:
+            volume = volume[np.newaxis, ...]  # Add batch dimension
+
+        batch_size, depth, height, width = volume.shape
+
+        # Determine processing size (native resolution) and output size
+        processing_d, processing_h, processing_w = depth, height, width
+
+        if target_output_size is not None:
+            output_d, output_h, output_w = target_output_size
+        else:
+            output_d, output_h, output_w = self.input_size
+
+        # Initialize detailed timing and debugging
+        import time
+
+        detailed_timing = {}
+        start_time = time.time()
+
+        if enable_timing:
+            print(f"\n=== DINOv3 Multi-Resolution Processing Debug ===")
+            print(f"Input volume: {(depth, height, width)} (batch_size={batch_size})")
+            print(
+                f"Processing at: {(processing_d, processing_h, processing_w)} (native resolution)"
+            )
+            print(f"Output target: {(output_d, output_h, output_w)}")
+            print(f"Input dtype: {volume.dtype}")
+            print(f"Input memory: {volume.nbytes / 1e6:.2f} MB")
+        else:
+            if self.verbose:
+                print(f"Multi-resolution DINOv3 processing:")
+                print(f"  Input volume: {(depth, height, width)}")
+                print(
+                    f"  Processing at: {(processing_d, processing_h, processing_w)} (native resolution)"
+                )
+                print(f"  Output target: {(output_d, output_h, output_w)}")
+
+        # Use volume at native resolution - selective downsampling will happen per plane
+        processing_volume = volume
+
+        if enable_timing:
+            print(f"\n--- Plane-Specific Selective Downsampling Strategy ---")
+            print(
+                "Each orthogonal plane will selectively downsample its non-spatial dimension:"
+            )
+            print(
+                f"  XY plane: downsample Z {processing_d}→{output_d}, keep XY {processing_h}×{processing_w}"
+            )
+            print(
+                f"  XZ plane: downsample Y {processing_h}→{output_h}, keep XZ {processing_d}×{processing_w}"
+            )
+            print(
+                f"  YZ plane: downsample X {processing_w}→{output_w}, keep YZ {processing_d}×{processing_h}"
+            )
+            print(
+                "Reason: Preserve high spatial resolution for DINOv3 while reducing slice count"
+            )
+
+        if enable_timing:
+            detailed_timing["setup_time"] = time.time() - start_time
+
+        # Use instance variable if parameter not provided
+        if use_orthogonal_planes is None:
+            use_orthogonal_planes = self.use_orthogonal_planes
+
+        # Clear previous timing info if enabling timing
+        if enable_timing:
+            self._plane_timing_info = {}
+
+        if use_orthogonal_planes:
+            # Process all 3 orthogonal planes and average them
+            plane_features = []
+            plane_timings = {}
+
+            if enable_timing:
+                print(f"\n--- Processing 3 Orthogonal Planes ---")
+
+            # XY planes (slice along Z-axis) - original implementation
+            plane_start = time.time()
+            xy_features = self._extract_features_plane(
+                processing_volume,
+                "xy",
+                processing_d,
+                processing_h,
+                processing_w,
+                slice_batch_size=512,
+                enable_timing=enable_timing,
+                output_d=output_d,
+                output_h=output_h,
+                output_w=output_w,
+            )
+            plane_timings["xy_extraction"] = time.time() - plane_start
+
+            if enable_timing:
+                print(
+                    f"XY features extracted and downsampled: {tuple(xy_features.shape)} in {plane_timings['xy_extraction']:.3f}s"
+                )
+
+            plane_features.append(xy_features)
+
+            # XZ planes (slice along Y-axis)
+            plane_start = time.time()
+            xz_features = self._extract_features_plane(
+                processing_volume,
+                "xz",
+                processing_d,
+                processing_h,
+                processing_w,
+                slice_batch_size=512,
+                enable_timing=enable_timing,
+                output_d=output_d,
+                output_h=output_h,
+                output_w=output_w,
+            )
+            plane_timings["xz_extraction"] = time.time() - plane_start
+
+            if enable_timing:
+                print(
+                    f"XZ features extracted and downsampled: {tuple(xz_features.shape)} in {plane_timings['xz_extraction']:.3f}s"
+                )
+
+            plane_features.append(xz_features)
+
+            # YZ planes (slice along X-axis)
+            plane_start = time.time()
+            yz_features = self._extract_features_plane(
+                processing_volume,
+                "yz",
+                processing_d,
+                processing_h,
+                processing_w,
+                slice_batch_size=512,
+                enable_timing=enable_timing,
+                output_d=output_d,
+                output_h=output_h,
+                output_w=output_w,
+            )
+            plane_timings["yz_extraction"] = time.time() - plane_start
+
+            if enable_timing:
+                print(
+                    f"YZ features extracted and downsampled: {tuple(yz_features.shape)} in {plane_timings['yz_extraction']:.3f}s"
+                )
+
+            plane_features.append(yz_features)
+
+            # Enhanced debugging for orthogonal processing
+            if enable_timing:
+                print(f"\n--- Averaging Orthogonal Planes ---")
+                print(f"XY features after downsampling: {tuple(xy_features.shape)}")
+                print(f"XZ features after downsampling: {tuple(xz_features.shape)}")
+                print(f"YZ features after downsampling: {tuple(yz_features.shape)}")
+            else:
+                if self.verbose:
+                    print(f"Orthogonal plane feature shapes after downsampling:")
+                    print(f"  XY features: {xy_features.shape}")
+                    print(f"  XZ features: {xz_features.shape}")
+                    print(f"  YZ features: {yz_features.shape}")
+
+            # Ensure all plane features are on the same device before averaging
+            if enable_timing:
+                print("  Checking device consistency...")
+                for i, feat in enumerate(["XY", "XZ", "YZ"]):
+                    print(f"    {feat} features device: {plane_features[i].device}")
+
+            # Move all features to the same device (preferably GPU if available)
+            target_device = plane_features[0].device
+            for i in range(len(plane_features)):
+                if plane_features[i].device != target_device:
+                    plane_features[i] = plane_features[i].to(target_device)
+                    if enable_timing:
+                        print(f"    Moved plane {i} to {target_device}")
+
+            # Now we can safely average the features from all three planes
+            averaging_start = time.time()
+            batch_features = torch.stack(plane_features, dim=0).mean(dim=0)
+            plane_timings["averaging"] = time.time() - averaging_start
+
+            # Immediately free memory from individual plane features
+            del plane_features, xy_features, xz_features, yz_features
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+            if enable_timing:
+                print(
+                    f"Averaged features: {tuple(batch_features.shape)} in {plane_timings['averaging']:.3f}s"
+                )
+                print("  Individual plane features freed to save memory")
+                # Store plane timings in detailed timing
+                detailed_timing.update(plane_timings)
+            else:
+                if self.verbose:
+                    print(f"  Averaged features: {batch_features.shape}")
+                    print("  Individual plane features freed to save memory")
+
+        else:
+            # Original behavior - only XY planes
+            if enable_timing:
+                print(f"\n--- Processing Single XY Plane ---")
+
+            single_plane_start = time.time()
+            batch_features = self._extract_features_plane(
+                processing_volume,
+                "xy",
+                processing_d,
+                processing_h,
+                processing_w,
+                slice_batch_size=512,
+                enable_timing=enable_timing,
+            )
+            detailed_timing["xy_extraction"] = time.time() - single_plane_start
+
+            if enable_timing:
+                print(
+                    f"XY features extracted: {tuple(batch_features.shape)} in {detailed_timing['xy_extraction']:.3f}s"
+                )
+
+            # Downsample features to target output size if different from processing size
+            downsample_start = time.time()
+            if (processing_d, processing_h, processing_w) != (
+                output_d,
+                output_h,
+                output_w,
+            ):
+                if enable_timing:
+                    print(
+                        f"  Downsampling XY: {tuple(batch_features.shape)} → target {(batch_features.shape[0], batch_features.shape[1], output_d, output_h, output_w)}"
+                    )
+                else:
+                    print(
+                        f"Downsampling XY features from {(processing_d, processing_h, processing_w)} to {(output_d, output_h, output_w)}"
+                    )
+
+                batch_features = torch.nn.functional.interpolate(
+                    batch_features,
+                    size=(output_d, output_h, output_w),
+                    mode="trilinear",
+                    align_corners=False,
+                )
+
+                if enable_timing:
+                    print(f"  XY downsampled to: {tuple(batch_features.shape)}")
+            detailed_timing["single_plane_downsample"] = time.time() - downsample_start
+
+        # Final device transfer and timing summary
+        device_transfer_start = time.time()
+        result = batch_features.to(self.device)
+        detailed_timing["device_transfer"] = time.time() - device_transfer_start
+        detailed_timing["total_time"] = time.time() - start_time
+
+        if enable_timing:
+            print(f"\n=== DINOv3 Processing Summary ===")
+            print(f"Total time: {detailed_timing['total_time']:.3f}s")
+            print(f"Final output shape: {tuple(result.shape)}")
+            print(
+                f"Output memory: {result.element_size() * result.nelement() / 1e6:.2f} MB"
+            )
+            print(f"Device: {result.device}")
+
+            # Add detailed timing to the aggregated timing info
+            if hasattr(self, "_get_aggregated_timing_info"):
+                aggregated_timing = self._get_aggregated_timing_info()
+                aggregated_timing.update(detailed_timing)
+                return result, aggregated_timing
+            else:
+                return result, detailed_timing
+        else:
+            return result
+
+    def extract_dinov3_features_3d_batch(
+        self,
+        volume_batch,
+        use_orthogonal_planes=None,
+        enable_timing=False,
+        target_output_size=None,
+    ):
+        """
+        GPU-optimized batch processing of multiple 3D volumes simultaneously.
+        This method processes all volumes in the batch together for maximum efficiency.
+
+        Parameters:
+        -----------
+        volume_batch : numpy.ndarray
+            Batch of volumes of shape (batch_size, D, H, W)
+        use_orthogonal_planes : bool, optional
+            If True, processes slices in all 3 orthogonal planes (XY, XZ, YZ) and averages them.
+        target_output_size : tuple, optional
+            Target size (D, H, W) for the output features.
+
+        Returns:
+        --------
+        torch.Tensor: DINOv3 features (batch_size, output_channels, D, H, W)
+        """
+        if isinstance(volume_batch, torch.Tensor):
+            volume_batch = volume_batch.cpu().numpy()
+
+        batch_size, depth, height, width = volume_batch.shape
+
+        # Determine processing size and output size
+        if target_output_size is not None:
+            output_d, output_h, output_w = target_output_size
+        else:
+            output_d, output_h, output_w = self.input_size
+
+        import time
+
+        detailed_timing = {}
+        start_time = time.time()
+
+        if enable_timing:
+            print(f"\n=== GPU-Optimized Batch DINOv3 Processing ===")
+            print(f"Batch size: {batch_size}")
+            print(f"Input volume per batch: {(depth, height, width)}")
+            print(f"Output target: {(output_d, output_h, output_w)}")
+
+        # Use instance variable if parameter not provided
+        if use_orthogonal_planes is None:
+            use_orthogonal_planes = self.use_orthogonal_planes
+
+        # Pre-allocate output tensor on GPU for maximum efficiency
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        from .dinov3_core import get_current_model_info
+
+        model_info = get_current_model_info()
+        output_channels = model_info["output_channels"]
+
+        batch_output_shape = (batch_size, output_channels, output_d, output_h, output_w)
+        batch_features = torch.zeros(
+            batch_output_shape, device=device, dtype=torch.float32
+        )
+
+        if use_orthogonal_planes:
+            # GPU-optimized batch processing for all 3 planes
+            plane_features = []
+            plane_timings = {}
+
+            if enable_timing:
+                print(f"Processing {batch_size} volumes across 3 orthogonal planes...")
+
+            # Process all volumes for each plane type
+            for plane_name in ["xy", "xz", "yz"]:
+                plane_start = time.time()
+
+                # Process all volumes in batch for this plane
+                plane_batch_features = torch.zeros(
+                    batch_output_shape, device=device, dtype=torch.float32
+                )
+
+                for b in range(batch_size):
+                    single_volume_features = self._extract_features_plane(
+                        volume_batch[b : b + 1],
+                        plane_name,
+                        depth,
+                        height,
+                        width,
+                        slice_batch_size=512,
+                        enable_timing=False,
+                        output_d=output_d,
+                        output_h=output_h,
+                        output_w=output_w,
+                    )
+
+                    # Direct GPU assignment
+                    if (
+                        single_volume_features.dim() == 5
+                        and single_volume_features.shape[0] == 1
+                    ):
+                        plane_batch_features[b] = single_volume_features.squeeze(0).to(
+                            device
+                        )
+                    else:
+                        plane_batch_features[b] = single_volume_features.to(device)
+
+                plane_features.append(plane_batch_features)
+                plane_timings[f"{plane_name}_extraction"] = time.time() - plane_start
+
+                if enable_timing:
+                    print(
+                        f"  {plane_name.upper()} plane batch: {tuple(plane_batch_features.shape)} in {plane_timings[f'{plane_name}_extraction']:.3f}s"
+                    )
+
+            # GPU-accelerated averaging across all planes
+            averaging_start = time.time()
+            # Stack all plane features: (3, batch_size, channels, D, H, W)
+            all_planes_stacked = torch.stack(plane_features, dim=0)
+            # Average across planes: (batch_size, channels, D, H, W)
+            batch_features = all_planes_stacked.mean(dim=0)
+            plane_timings["averaging"] = time.time() - averaging_start
+
+            # Free memory
+            del plane_features, all_planes_stacked
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+            if enable_timing:
+                print(
+                    f"  Averaged all planes: {tuple(batch_features.shape)} in {plane_timings['averaging']:.3f}s"
+                )
+                detailed_timing.update(plane_timings)
+
+        else:
+            # Single XY plane batch processing
+            if enable_timing:
+                print(f"Processing {batch_size} volumes for XY plane only...")
+
+            xy_start = time.time()
+            for b in range(batch_size):
+                single_features = self._extract_features_plane(
+                    volume_batch[b : b + 1],
+                    "xy",
+                    depth,
+                    height,
+                    width,
+                    slice_batch_size=512,
+                    enable_timing=False,
+                    output_d=output_d,
+                    output_h=output_h,
+                    output_w=output_w,
+                )
+
+                if single_features.dim() == 5 and single_features.shape[0] == 1:
+                    batch_features[b] = single_features.squeeze(0).to(device)
+                else:
+                    batch_features[b] = single_features.to(device)
+
+            detailed_timing["xy_batch_extraction"] = time.time() - xy_start
+
+        # Final timing
+        detailed_timing["total_batch_time"] = time.time() - start_time
+        detailed_timing["batch_size"] = batch_size
+        detailed_timing["processing_method"] = "gpu_batch_optimized"
+
+        if enable_timing:
+            print(f"\n=== Batch Processing Summary ===")
+            print(f"Total batch time: {detailed_timing['total_batch_time']:.3f}s")
+            print(
+                f"Average time per volume: {detailed_timing['total_batch_time']/batch_size:.3f}s"
+            )
+            print(f"Final batch shape: {tuple(batch_features.shape)}")
+            print(
+                f"GPU memory used: {batch_features.element_size() * batch_features.nelement() / 1e6:.2f} MB"
+            )
+
+            return batch_features, detailed_timing
+        else:
+            return batch_features
+
+    def extract_dinov3_features_3d(
+        self,
+        volume,
+        use_orthogonal_planes=None,
+        enable_timing=False,
+        target_output_size=None,
+    ):
+        """
+        Extract DINOv3 features from a 3D volume by processing slices in orthogonal planes.
+
+        Parameters:
+        -----------
+        volume : numpy.ndarray or torch.Tensor
+            Volume of shape (batch_size, D, H, W) or (D, H, W)
+        use_orthogonal_planes : bool, optional
+            If True, processes slices in all 3 orthogonal planes (XY, XZ, YZ) and averages them.
+            If False, uses only XY planes (original behavior).
+            If None (default), uses the instance's use_orthogonal_planes setting.
+        target_output_size : tuple, optional
+            Target size (D, H, W) for the output features. If provided, features will be
+            processed at the input volume's native resolution but downsampled to this size.
+            If None, uses self.input_size.
+
+        Returns:
+        --------
+        torch.Tensor: DINOv3 features (batch_size, output_channels, D, H, W)
+        """
+        if isinstance(volume, torch.Tensor):
+            volume = volume.cpu().numpy()
+
+        # Handle single volume vs batch
+        if volume.ndim == 3:
+            volume = volume[np.newaxis, ...]  # Add batch dimension
+
+        batch_size, depth, height, width = volume.shape
+
+        # Determine processing size (native resolution) and output size
+        processing_d, processing_h, processing_w = depth, height, width
+
+        if target_output_size is not None:
+            output_d, output_h, output_w = target_output_size
+        else:
+            output_d, output_h, output_w = self.input_size
+
+        # Initialize detailed timing and debugging
+        import time
+
+        detailed_timing = {}
+        start_time = time.time()
+
+        if enable_timing:
+            print(f"\n=== DINOv3 Multi-Resolution Processing Debug ===")
+            print(f"Input volume: {(depth, height, width)} (batch_size={batch_size})")
+            print(
+                f"Processing at: {(processing_d, processing_h, processing_w)} (native resolution)"
+            )
+            print(f"Output target: {(output_d, output_h, output_w)}")
+            print(f"Input dtype: {volume.dtype}")
+            print(f"Input memory: {volume.nbytes / 1e6:.2f} MB")
+        else:
+            if self.verbose:
+                print(f"Multi-resolution DINOv3 processing:")
+                print(f"  Input volume: {(depth, height, width)}")
+                print(
+                    f"  Processing at: {(processing_d, processing_h, processing_w)} (native resolution)"
+                )
+                print(f"  Output target: {(output_d, output_h, output_w)}")
+
+        # Use volume at native resolution - selective downsampling will happen per plane
+        processing_volume = volume
+
+        if enable_timing:
+            print(f"\n--- Plane-Specific Selective Downsampling Strategy ---")
+            print(
+                "Each orthogonal plane will selectively downsample its non-spatial dimension:"
+            )
+            print(
+                f"  XY plane: downsample Z {processing_d}→{output_d}, keep XY {processing_h}×{processing_w}"
+            )
+            print(
+                f"  XZ plane: downsample Y {processing_h}→{output_h}, keep XZ {processing_d}×{processing_w}"
+            )
+            print(
+                f"  YZ plane: downsample X {processing_w}→{output_w}, keep YZ {processing_d}×{processing_h}"
+            )
+            print(
+                "Reason: Preserve high spatial resolution for DINOv3 while reducing slice count"
+            )
+
+        if enable_timing:
+            detailed_timing["setup_time"] = time.time() - start_time
+
+        # Use instance variable if parameter not provided
+        if use_orthogonal_planes is None:
+            use_orthogonal_planes = self.use_orthogonal_planes
+
+        # Clear previous timing info if enabling timing
+        if enable_timing:
+            self._plane_timing_info = {}
+
+        if use_orthogonal_planes:
+            # Process all 3 orthogonal planes and average them
+            plane_features = []
+            plane_timings = {}
+
+            if enable_timing:
+                print(f"\n--- Processing 3 Orthogonal Planes ---")
+
+            # XY planes (slice along Z-axis) - original implementation
+            plane_start = time.time()
+            xy_features = self._extract_features_plane(
+                processing_volume,
+                "xy",
+                processing_d,
+                processing_h,
+                processing_w,
+                slice_batch_size=512,
+                enable_timing=enable_timing,
+                output_d=output_d,
+                output_h=output_h,
+                output_w=output_w,
+            )
+            plane_timings["xy_extraction"] = time.time() - plane_start
+
+            if enable_timing:
+                print(
+                    f"XY features extracted and downsampled: {tuple(xy_features.shape)} in {plane_timings['xy_extraction']:.3f}s"
+                )
+
+            plane_features.append(xy_features)
+
+            # XZ planes (slice along Y-axis)
+            plane_start = time.time()
+            xz_features = self._extract_features_plane(
+                processing_volume,
+                "xz",
+                processing_d,
+                processing_h,
+                processing_w,
+                slice_batch_size=512,
+                enable_timing=enable_timing,
+                output_d=output_d,
+                output_h=output_h,
+                output_w=output_w,
+            )
+            plane_timings["xz_extraction"] = time.time() - plane_start
+
+            if enable_timing:
+                print(
+                    f"XZ features extracted and downsampled: {tuple(xz_features.shape)} in {plane_timings['xz_extraction']:.3f}s"
+                )
+
+            plane_features.append(xz_features)
+
+            # YZ planes (slice along X-axis)
+            plane_start = time.time()
+            yz_features = self._extract_features_plane(
+                processing_volume,
+                "yz",
+                processing_d,
+                processing_h,
+                processing_w,
+                slice_batch_size=512,
+                enable_timing=enable_timing,
+                output_d=output_d,
+                output_h=output_h,
+                output_w=output_w,
+            )
+            plane_timings["yz_extraction"] = time.time() - plane_start
+
+            if enable_timing:
+                print(
+                    f"YZ features extracted and downsampled: {tuple(yz_features.shape)} in {plane_timings['yz_extraction']:.3f}s"
+                )
+
+            plane_features.append(yz_features)
+
+            # Enhanced debugging for orthogonal processing
+            if enable_timing:
+                print(f"\n--- Averaging Orthogonal Planes ---")
+                print(f"XY features after downsampling: {tuple(xy_features.shape)}")
+                print(f"XZ features after downsampling: {tuple(xz_features.shape)}")
+                print(f"YZ features after downsampling: {tuple(yz_features.shape)}")
+            else:
+                if self.verbose:
+                    print(f"Orthogonal plane feature shapes after downsampling:")
+                    print(f"  XY features: {xy_features.shape}")
+                    print(f"  XZ features: {xz_features.shape}")
+                    print(f"  YZ features: {yz_features.shape}")
+
+            # Ensure all plane features are on the same device before averaging
+            if enable_timing:
+                print("  Checking device consistency...")
+                for i, feat in enumerate(["XY", "XZ", "YZ"]):
+                    print(f"    {feat} features device: {plane_features[i].device}")
+
+            # Move all features to the same device (preferably GPU if available)
+            target_device = plane_features[0].device
+            for i in range(len(plane_features)):
+                if plane_features[i].device != target_device:
+                    plane_features[i] = plane_features[i].to(target_device)
+                    if enable_timing:
+                        print(f"    Moved plane {i} to {target_device}")
+
+            # Now we can safely average the features from all three planes
+            averaging_start = time.time()
+            batch_features = torch.stack(plane_features, dim=0).mean(dim=0)
+            plane_timings["averaging"] = time.time() - averaging_start
+
+            # Immediately free memory from individual plane features
+            del plane_features, xy_features, xz_features, yz_features
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+            if enable_timing:
+                print(
+                    f"Averaged features: {tuple(batch_features.shape)} in {plane_timings['averaging']:.3f}s"
+                )
+                print("  Individual plane features freed to save memory")
+                # Store plane timings in detailed timing
+                detailed_timing.update(plane_timings)
+            else:
+                if self.verbose:
+                    print(f"  Averaged features: {batch_features.shape}")
+                    print("  Individual plane features freed to save memory")
+
+        else:
+            # Original behavior - only XY planes
+            if enable_timing:
+                print(f"\n--- Processing Single XY Plane ---")
+
+            single_plane_start = time.time()
+            batch_features = self._extract_features_plane(
+                processing_volume,
+                "xy",
+                processing_d,
+                processing_h,
+                processing_w,
+                slice_batch_size=512,
+                enable_timing=enable_timing,
+            )
+            detailed_timing["xy_extraction"] = time.time() - single_plane_start
+
+            if enable_timing:
+                print(
+                    f"XY features extracted: {tuple(batch_features.shape)} in {detailed_timing['xy_extraction']:.3f}s"
+                )
+
+            # Downsample features to target output size if different from processing size
+            downsample_start = time.time()
+            if (processing_d, processing_h, processing_w) != (
+                output_d,
+                output_h,
+                output_w,
+            ):
+                if enable_timing:
+                    print(
+                        f"  Downsampling XY: {tuple(batch_features.shape)} → target {(batch_features.shape[0], batch_features.shape[1], output_d, output_h, output_w)}"
+                    )
+                else:
+                    print(
+                        f"Downsampling XY features from {(processing_d, processing_h, processing_w)} to {(output_d, output_h, output_w)}"
+                    )
+
+                batch_features = torch.nn.functional.interpolate(
+                    batch_features,
+                    size=(output_d, output_h, output_w),
+                    mode="trilinear",
+                    align_corners=False,
+                )
+
+                if enable_timing:
+                    print(f"  XY downsampled to: {tuple(batch_features.shape)}")
+            detailed_timing["single_plane_downsample"] = time.time() - downsample_start
+
+        # Final device transfer and timing summary
+        device_transfer_start = time.time()
+        result = batch_features.to(self.device)
+        detailed_timing["device_transfer"] = time.time() - device_transfer_start
+        detailed_timing["total_time"] = time.time() - start_time
+
+        if enable_timing:
+            print(f"\n=== DINOv3 Processing Summary ===")
+            print(f"Total time: {detailed_timing['total_time']:.3f}s")
+            print(f"Final output shape: {tuple(result.shape)}")
+            print(
+                f"Output memory: {result.element_size() * result.nelement() / 1e6:.2f} MB"
+            )
+            print(f"Device: {result.device}")
+
+            # Add detailed timing to the aggregated timing info
+            if hasattr(self, "_get_aggregated_timing_info"):
+                aggregated_timing = self._get_aggregated_timing_info()
+                aggregated_timing.update(detailed_timing)
+                return result, aggregated_timing
+            else:
+                return result, detailed_timing
+        else:
+            return result
 
     def _extract_features_plane(
         self,
