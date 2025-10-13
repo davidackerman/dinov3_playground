@@ -56,13 +56,40 @@ def mutex_watershed(affinities, neighborhood, adjacent_edge_bias, lr_bias, filte
         segmentation = np.zeros(affinities.shape[1:], dtype=np.uint64)
         return segmentation
 
+    # If affinities tensor contains extra channels (for example, LSDS
+    # concatenated before affinities), try to select the last
+    # `neighborhood.shape[0]` channels as the actual affinities. This handles
+    # the convention where LSDS (10 channels) are prepended.
+    expected_affs = neighborhood.shape[0]
+    if affinities.ndim >= 1 and affinities.shape[0] > expected_affs:
+        extra = affinities.shape[0] - expected_affs
+        if extra == 10:
+            # common case: 10 LSDS channels were prepended
+            affinities = affinities[10:]
+        else:
+            # fallback: take the last `expected_affs` channels
+            affinities = affinities[-expected_affs:]
+
+    # Add tiny random noise to break ties
     random_noise = np.random.randn(*affinities.shape) * 0.0001
-    smoothed_affs = (
-        ndimage.gaussian_filter(
-            affinities, sigma=(0, *(np.amax(neighborhood, axis=0) / 3))
-        )
-        - 0.5
-    ) * 0.001
+
+    # Compute gaussian blur sigma matching the spatial rank of affinities.
+    # affinities usually has shape (C, Z, Y, X) or (C, Y, X). We want a sigma
+    # tuple whose length equals affinities.ndim. For channel-first data we
+    # include a zero sigma for the channel axis.
+    dim = neighborhood.shape[1] if neighborhood.ndim > 1 else affinities.ndim - 1
+    spatial_ndim = affinities.ndim - 1 if affinities.ndim > 1 else affinities.ndim
+    max_offset = np.amax(neighborhood, axis=0)
+    # Use the last `spatial_ndim` components of max_offset in case neighborhood
+    # is 3D but affinities are 2D (e.g., (C,Y,X)).
+    spatial_offsets = max_offset[-spatial_ndim:]
+    spatial_sigmas = tuple((spatial_offsets / 3.0).tolist())
+    if affinities.ndim == spatial_ndim:
+        sigma = spatial_sigmas
+    else:
+        sigma = (0.0,) + spatial_sigmas
+
+    smoothed_affs = (ndimage.gaussian_filter(affinities, sigma=sigma) - 0.5) * 0.001
     shift = []
     bias_idx = -1
     previous_offset = np.linalg.norm(neighborhood[0])
@@ -154,11 +181,9 @@ def process_mutex_watershed(
 # for i, uid in enumerate(unique_ids):
 #     normalized_mask[segs == uid] = i
 
-# for slice in [0,63,127]:
+# for slice in [0, 63, 127]:
 #     plt.figure(figsize=(6, 6))
 #     plt.imshow(normalized_mask[slice], cmap=cmap)
 #     plt.title("Instance Segmentation (Random Colors)")
 #     plt.axis("off")
 #     plt.show()
-
-# %%

@@ -1055,6 +1055,9 @@ def load_random_3d_training_data(
     context_scale=None,  # NEW: Load context data at this resolution
     min_unique_ids=None,  # NEW: Minimum number of unique instance IDs required
     allow_smaller_overlap=True,  # NEW: Allow overlap smaller than requested volume size
+    augment=False,  # If True, apply random augmentations to raw (and context) data
+    augment_prob=0.5,  # Per-volume probability to apply augmentation
+    augment_params=None,  # Optional dict to control augmentation distributions
 ):
     """
     Load random 3D volumes from multiple datasets for 3D UNet training.
@@ -1706,6 +1709,9 @@ def load_random_3d_training_data(
                     np.uint8
                 )  # Convert back to uint8 for raw data
 
+            # Ensure gt_mask exists (may be created later if allow_gt_extension is True)
+            gt_mask = gt_mask if "gt_mask" in locals() else None
+
             # Create GT mask if GT extension is allowed
             if allow_gt_extension:
                 # ROBUST APPROACH: Create mask based on actual presence of GT data
@@ -1851,10 +1857,28 @@ def load_random_3d_training_data(
                 f"  Dataset {dataset_idx}: label fraction {total_label_fraction:.3f} within valid GT regions, roi {gt_roi}"
             )
 
-            # Store the volumes and mask (only after all checks pass)
-            gt_masks[volumes_collected] = gt_mask
+            # Use the centralized augmentation helpers (keeps code modular)
+            if augment and (np.random.rand() < augment_prob):
+                try:
+                    from dinov3_playground.augmentations import apply_3d_augmentations
+                except Exception:
+                    # Fallback to relative import when running as package
+                    from .augmentations import apply_3d_augmentations
+
+                raw_volume, context_volume, gt_volume, gt_mask = apply_3d_augmentations(
+                    raw_volume,
+                    context_volume,
+                    gt_volume,
+                    gt_mask,
+                    augment=augment,
+                    augment_prob=augment_prob,
+                    augment_params=augment_params,
+                )
             raw_volumes[volumes_collected] = raw_volume
             gt_volumes[volumes_collected] = gt_volume
+            # Store the volumes and mask (only after all checks pass)
+            if gt_masks is not None and gt_mask is not None:
+                gt_masks[volumes_collected] = gt_mask
             # Store into preallocated arrays/lists by index
             if context_volumes is not None:
                 context_volumes[volumes_collected] = context_volume  # May be None

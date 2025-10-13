@@ -505,7 +505,7 @@ class DINOv3UNet3DInference:
         else:
             self.unet3d.load_state_dict(checkpoint)
 
-        self.unet3d.eval()
+        self.unet3d.train()
 
         # Get orthogonal planes setting from training config
         # Default to False for backward compatibility with models trained before orthogonal planes were added
