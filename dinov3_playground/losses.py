@@ -476,7 +476,7 @@ def get_loss_function(loss_type, class_weights=None, **kwargs):
         num_lsds = kwargs.get("num_lsds", 10)
         use_class_weights = kwargs.get("use_class_weights", True)
         pos_weight = kwargs.get("pos_weight", None)
-        lsds_weight = kwargs.get("lsds_weight", 1.0)
+        lsds_weight = kwargs.get("lsds_weight", 0.25)
         affinity_weight = kwargs.get("affinity_weight", 1.0)
         return AffinityLSDSLoss(
             num_lsds=num_lsds,
