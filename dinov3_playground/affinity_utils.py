@@ -405,7 +405,7 @@ class AffinityLoss(torch.nn.Module):
             criterion = torch.nn.BCEWithLogitsLoss(reduction="none")
 
         # Compute loss
-        loss = criterion(predictions, targets)
+        loss = criterion(predictions, targets * 0.96 + 0.02)
 
         # Apply mask if provided
         if mask is not None:
@@ -735,7 +735,7 @@ class AffinityLSDSLoss(torch.nn.Module):
         num_lsds=10,
         use_class_weights=True,
         pos_weight=None,
-        lsds_weight=1.0,
+        lsds_weight=0.25,
         affinity_weight=1.0,
     ):
         super(AffinityLSDSLoss, self).__init__()
