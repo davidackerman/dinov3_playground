@@ -25,8 +25,12 @@ from .dinov3_core import (
 
 
 # ---------------------------
-# Simple BatchRenorm implementation (1d/2d/3d)
+# Correct BatchRenorm implementation (1d/2d/3d)
 # ---------------------------
+import torch
+import torch.nn as nn
+
+
 class _BatchRenormNd(nn.Module):
     def __init__(
         self,
@@ -71,29 +75,35 @@ class _BatchRenormNd(nn.Module):
         # x shape: (N, C, *spatial)
         if x.dim() < 2:
             raise ValueError("Input for BatchRenorm must have >=2 dims")
-        dims = [0] + list(range(2, x.dim()))
+
+        reduce_dims = [0] + list(range(2, x.dim()))
         if self.training:
-            # compute batch mean/var over N and spatial dims
-            batch_mean = x.mean(dim=dims, keepdim=False)
-            batch_var = x.var(dim=dims, unbiased=False, keepdim=False)
+            # compute batch mean/var
+            batch_mean = x.mean(dim=reduce_dims, keepdim=False)
+            batch_var = x.var(dim=reduce_dims, unbiased=False, keepdim=False)
             batch_std = torch.sqrt(batch_var + self.eps)
-
+            # print("\n\n*********asdfasdfasdfasdfasdafdadfadfadfsfsadsfdsfd")
+            # print("batch_mean:", batch_mean)
+            # print("batch_var:", batch_var)
+            # print("batch_std:", batch_std)
+            # print("running_mean:", self.running_mean)
             if self.track_running_stats:
-                # update running stats
-                self.running_mean = (
-                    1 - self.momentum
-                ) * self.running_mean + self.momentum * batch_mean.detach()
-                self.running_var = (
-                    1 - self.momentum
-                ) * self.running_var + self.momentum * batch_var.detach()
-                self.num_batches_tracked += 1
+                # compute renorm parameters (no gradients through running stats)
+                running_std = torch.sqrt(self.running_var.to(x.dtype) + self.eps)
+                r = (batch_std.detach() / running_std).clamp(1.0 / self.rmax, self.rmax)
+                d = (
+                    (batch_mean.detach() - self.running_mean.to(x.dtype)) / running_std
+                ).clamp(-self.dmax, self.dmax)
 
-                running_std = torch.sqrt(self.running_var + self.eps)
-                # compute renorm params
-                r = (batch_std / running_std).clamp(1.0 / self.rmax, self.rmax)
-                d = ((batch_mean - self.running_mean) / running_std).clamp(
-                    -self.dmax, self.dmax
-                )
+                # update running stats in-place under no_grad
+                with torch.no_grad():
+                    self.running_mean.mul_(1 - self.momentum).add_(
+                        self.momentum * batch_mean
+                    )
+                    self.running_var.mul_(1 - self.momentum).add_(
+                        self.momentum * batch_var
+                    )
+                    self.num_batches_tracked.add_(1)
             else:
                 r = torch.ones_like(batch_std)
                 d = torch.zeros_like(batch_mean)
@@ -107,28 +117,26 @@ class _BatchRenormNd(nn.Module):
 
             x_hat = (x - batch_mean_b) / batch_std_b
             x_renorm = r_b * x_hat + d_b
+
             if self.affine:
                 w = self.weight.view(1, -1, *([1] * (x.dim() - 2)))
                 b = self.bias.view(1, -1, *([1] * (x.dim() - 2)))
                 return w * x_renorm + b
-            else:
-                return x_renorm
+            return x_renorm
+
         else:
             # inference uses running stats
             if self.track_running_stats:
-                running_std = torch.sqrt(self.running_var + self.eps)
-                rm = self.running_mean.view([1, -1] + [1] * (x.dim() - 2))
+                running_std = torch.sqrt(self.running_var.to(x.dtype) + self.eps)
+                rm = self.running_mean.to(x.dtype).view([1, -1] + [1] * (x.dim() - 2))
                 rs = running_std.view([1, -1] + [1] * (x.dim() - 2))
                 x_hat = (x - rm) / rs
                 if self.affine:
                     w = self.weight.view(1, -1, *([1] * (x.dim() - 2)))
                     b = self.bias.view(1, -1, *([1] * (x.dim() - 2)))
                     return w * x_hat + b
-                else:
-                    return x_hat
-            else:
-                # fallback to identity if no running stats
-                return x
+                return x_hat
+            return x
 
 
 class BatchRenorm1d(_BatchRenormNd):
@@ -146,9 +154,9 @@ class BatchRenorm3d(_BatchRenormNd):
         super().__init__(num_features, dims=3, **kwargs)
 
 
-# ---------------------------
-# End BatchRenorm
-# ---------------------------
+### ---------------------------
+### End batchrenorm
+### ---------------------------
 
 
 class ImprovedClassifier(nn.Module):
@@ -741,6 +749,9 @@ class DINOv3UNet3D(nn.Module):
         context_channels=384,
         use_batchrenorm=False,
     ):
+        print(
+            "******************************Using batchrenorm in UNET:", use_batchrenorm
+        )
         super(DINOv3UNet3D, self).__init__()
         self.use_batchrenorm = use_batchrenorm
         Norm3d = BatchRenorm3d if self.use_batchrenorm else nn.BatchNorm3d
@@ -1239,6 +1250,7 @@ class DINOv3UNet3DPipeline(nn.Module):
         use_orthogonal_planes=True,  # Process all 3 orthogonal planes
         device=None,
         verbose=True,  # Control verbose output
+        use_batchrenorm=False,
     ):
         """
         Initialize the complete 3D DINOv3-UNet pipeline.
@@ -1284,13 +1296,14 @@ class DINOv3UNet3DPipeline(nn.Module):
             model_info = get_current_model_info()
             input_channels = model_info["output_channels"]
 
-        # 3D UNet for processing DINOv3 features
-        self.unet3d = DINOv3UNet3D(
-            input_channels=input_channels,
-            num_classes=num_classes,
-            base_channels=base_channels,
-            input_size=input_size,
-        )
+        # # 3D UNet for processing DINOv3 features
+        # self.unet3d = DINOv3UNet3D(
+        #     input_channels=input_channels,
+        #     num_classes=num_classes,
+        #     base_channels=base_channels,
+        #     input_size=input_size,
+        #     use_batchrenorm=use_batchrenorm,
+        # )
 
     def extract_dinov3_features_3d(
         self,
