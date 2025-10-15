@@ -2423,6 +2423,13 @@ def train_3d_unet_memory_efficient_v2(
             )
             if train_or_eval == "train":
                 unet3d.train()
+
+                def freeze_batch_layers(m):
+                    if hasattr(m, "track_running_stats") and hasattr(m, "running_mean"):
+                        m.eval()  # switch BN/BRN to eval behavior
+                        m.track_running_stats = False  # prevent updates
+
+                unet3d.apply(freeze_batch_layers)
             else:
                 unet3d.eval()
             with torch.no_grad():
@@ -2912,7 +2919,9 @@ def train_3d_unet_memory_efficient_v2(
                     current_metric = -val_loss
                 else:
                     if current_metric > best_metric + min_delta:
-                        best_metric = current_metric  # Store best metric (IoU or accuracy)
+                        best_metric = (
+                            current_metric  # Store best metric (IoU or accuracy)
+                        )
                         epochs_without_improvement = 0
                         is_best_model = True
                     else:
