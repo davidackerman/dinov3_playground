@@ -2417,7 +2417,7 @@ def train_3d_unet_memory_efficient_v2(
         # Validation phase with timing - VOLUME-BY-VOLUME for memory efficiency
         # This approach processes each validation volume independently to avoid GPU memory spikes
         val_start_time = time.time()
-        for train_or_eval in ["train", "eval"]:
+        for train_or_eval in ["eval"]:
             print(
                 f"\n****************Validation phase: {train_or_eval.upper()}****************"
             )
