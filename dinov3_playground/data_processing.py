@@ -666,7 +666,8 @@ def _sample_single_orientation(
             # Don't skip - continue with sampling, allowing padding
 
         # Calculate valid offset range (use data bounds even if smaller than crop)
-        # Allow offsets that may extend beyond data - ImageDataInterface will handle padding
+        # Allow offsets that may extend beyond the data
+
         data_begin = overlap_begin
         data_end = overlap_end
 
@@ -1259,12 +1260,23 @@ def load_random_3d_training_data(
             ]
             class_idis = {}
             for class_key in class_keys:
-                class_idis[class_key] = ImageDataInterface(
+                class_idi = ImageDataInterface(
                     dataset_dict[class_key],
                     output_voxel_size=3 * [base_resolution],
                     force_pseudo_isotropic=True,
                     is_segmentation=True,
                 )
+                if allow_gt_extension:
+                    dtype = class_idi._ds.dtype
+                    custom_fill_value = np.iinfo(dtype).max
+                    del class_idi
+                    class_idis[class_key] = ImageDataInterface(
+                        dataset_dict[class_key],
+                        output_voxel_size=3 * [base_resolution],
+                        force_pseudo_isotropic=True,
+                        is_segmentation=True,
+                        custom_fill_value=custom_fill_value,
+                    )
 
             # Get bounds from raw data
             raw_begin = np.array(raw_idi.roi.begin)
@@ -1568,14 +1580,25 @@ def load_random_3d_training_data(
                     # Preserve original instance IDs for affinity training
                     # Just copy the instance IDs directly (background=0 is preserved)
                     gt_volume = class_vol.copy()
-                    class_mask = class_vol > 0  # For label fraction calculation
+                    if allow_gt_extension:
+                        # Create GT mask where instance IDs are valid (not equal to custom fill value)
+                        custom_fill_value = np.iinfo(gt_volume.dtype).max
+                        gt_volume[gt_volume == custom_fill_value] = 0
+
+                    class_mask = gt_volume > 0  # For label fraction calculation
                 else:
+                    current_class_vol = class_vol.copy()
+                    if allow_gt_extension:
+                        # Create GT mask where instance IDs are valid (not equal to custom fill value)
+                        custom_fill_value = np.iinfo(current_class_vol.dtype).max
+                        current_class_vol[current_class_vol == custom_fill_value] = 0
+
                     # Multi-class segmentation: convert to class labels
                     # Convert to boolean mask
-                    if class_vol.dtype != bool:
-                        class_mask = class_vol > 0
+                    if current_class_vol.dtype != bool:
+                        class_mask = current_class_vol > 0
                     else:
-                        class_mask = class_vol
+                        class_mask = current_class_vol
 
                     # Assign class label where mask is True
                     # Later classes override earlier ones in overlapping regions
@@ -1650,7 +1673,6 @@ def load_random_3d_training_data(
                         # )
                         # context_volume = zoom(
                         #     context_volume.astype(float), zoom_factors, order=1
-                        # )
                         # context_volume = context_volume.astype(raw_volume.dtype)
 
                 except (ValueError, RuntimeError, OSError, IndexError) as e:
@@ -1713,104 +1735,42 @@ def load_random_3d_training_data(
             gt_mask = gt_mask if "gt_mask" in locals() else None
 
             # Create GT mask if GT extension is allowed
+
             if allow_gt_extension:
-                # ROBUST APPROACH: Create mask based on actual presence of GT data
-                # This accounts for any resizing that occurred and ensures perfect alignment
-                gt_mask = np.zeros(volume_shape, dtype=np.uint8)
+                # Create GT-valid mask using the explicit custom fill value:
+                # For each class volume, any voxel != fill_value is considered part of the GT coverage.
+                gt_mask = np.ones(volume_shape, dtype=np.uint8)
 
-                # Method 1: Use the final GT volume to determine valid regions
-                # Any non-background voxel indicates a valid GT region
-                valid_gt_regions = gt_volume > 0  # Any foreground class
-
-                if np.sum(valid_gt_regions) > 0:
-                    # We have some valid GT data - create mask around it
-                    # Find bounding box of all valid GT data
-                    nonzero_coords = np.where(valid_gt_regions)
-
-                    if len(nonzero_coords[0]) > 0:
-                        min_coords = [np.min(coords) for coords in nonzero_coords]
-                        max_coords = [np.max(coords) for coords in nonzero_coords]
-
-                        # Create a slightly expanded bounding box to be conservative
-                        padding = 2
-                        min_coords = [max(0, c - padding) for c in min_coords]
-                        max_coords = [
-                            min(s - 1, c + padding)
-                            for c, s in zip(max_coords, volume_shape)
-                        ]
-
-                        # Set mask to 1 in regions where we have actual GT data
-                        gt_mask[
-                            min_coords[0] : max_coords[0] + 1,
-                            min_coords[1] : max_coords[1] + 1,
-                            min_coords[2] : max_coords[2] + 1,
-                        ] = 1
-
-                        print(
-                            f"    GT mask created from actual data: {np.sum(gt_mask)} / {gt_mask.size} voxels valid"
+                for class_key, vol in class_volumes.items():
+                    if np.issubdtype(vol.dtype, np.integer):
+                        fill_val = np.iinfo(vol.dtype).max
+                        valid = vol != fill_val
+                        vol[vol == fill_val] = 0  # Set fill values to background
+                    elif np.issubdtype(vol.dtype, np.floating):
+                        fill_val = np.finfo(vol.dtype).max
+                        valid = vol != fill_val
+                        vol[np.isclose(vol, fill_val)] = (
+                            0  # Set fill values to background
                         )
+                    elif vol.dtype == bool:
+                        valid = vol.astype(bool)
                     else:
-                        # Fallback: no valid data found, use full mask
-                        print(
-                            "    ⚠️  Warning: No valid GT data found - using full mask"
-                        )
-                        gt_mask = np.ones(volume_shape, dtype=np.uint8)
-                else:
-                    # No foreground labels at all - this might be a background-only region
-                    # In GT extension mode, we should still have a mask
-                    # Method 2: Try to determine valid regions from original coordinate bounds
-                    if dataset_gt_bounds is not None:
-                        # Calculate intersection of GT ROI with the sampled volume ROI
-                        gt_begin, gt_end = dataset_gt_bounds
-                        gt_roi_full = Roi(gt_begin, gt_end - gt_begin)
-                        sampled_gt_roi = Roi(gt_offset, volume_shape_nm)
+                        # Fallback: treat non-zero as valid if dtype unknown
+                        valid = vol != 0
 
-                        # Find intersection
-                        intersection_roi = gt_roi_full.intersect(sampled_gt_roi)
+                    gt_mask &= valid.astype(np.uint8)
 
-                        if intersection_roi is not None and not intersection_roi.empty:
-                            # Convert intersection back to volume coordinates
-                            gt_offset_coord = Coordinate(gt_offset)
-                            intersection_offset = (
-                                intersection_roi.begin - gt_offset_coord
-                            )
-                            intersection_shape = intersection_roi.shape
-
-                            # Convert from nm to voxels
-                            mask_start = intersection_offset // base_resolution
-                            mask_end = mask_start + (
-                                intersection_shape // base_resolution
-                            )
-
-                            # Ensure indices are within bounds and integers
-                            mask_start = np.maximum(0, mask_start).astype(int)
-                            mask_end = np.minimum(volume_shape, mask_end).astype(int)
-
-                            # Set mask to 1 in valid GT region
-                            gt_mask[
-                                mask_start[0] : mask_end[0],
-                                mask_start[1] : mask_end[1],
-                                mask_start[2] : mask_end[2],
-                            ] = 1
-
-                            print(
-                                f"    GT mask created from coordinate bounds: {np.sum(gt_mask)} / {gt_mask.size} voxels valid"
-                            )
-
-                    # Final fallback
-                    if np.sum(gt_mask) == 0:
-                        print(
-                            "    ⚠️  Warning: Could not determine valid GT regions - using full mask"
-                        )
-                        gt_mask = np.ones(volume_shape, dtype=np.uint8)
+                if gt_mask.sum() == 0:
+                    # Fallback to full mask if nothing flagged as valid (warn user)
+                    print(
+                        "    ⚠️  Warning: No valid GT voxels found via custom_fill_value; using full mask"
+                    )
+                    gt_mask = np.ones(volume_shape, dtype=np.uint8)
 
                 # Don't append mask yet - wait until after label fraction check
                 pass
             else:
-                # For compatibility, add full mask when not using GT extension
                 gt_mask = np.ones(volume_shape, dtype=np.uint8)
-                # Don't append mask yet - wait until after label fraction check
-
             # Now calculate label fraction within valid GT regions only
             total_label_fraction = 0.0
             valid_gt_voxels = np.sum(gt_mask)  # Number of valid GT voxels
@@ -1839,8 +1799,7 @@ def load_random_3d_training_data(
                     gt_volume[gt_mask == 1] if np.any(gt_mask == 1) else gt_volume
                 )
                 unique_ids = np.unique(valid_gt_volume)
-                # Exclude background (0) from count
-                num_unique_ids = len(unique_ids[unique_ids > 0])
+                num_unique_ids = len(unique_ids)  # [unique_ids > 0])
 
                 if num_unique_ids < min_unique_ids:
                     print(
