@@ -408,29 +408,29 @@ class MemoryEfficientDataLoader3D:
             from .affinity_utils import compute_affinities_3d
 
             # Convert each volume's instance segmentation to affinities
-            batch_affinities = []
+            batch_targets = []
             for gt_volume in batch_gt:
                 affinities = compute_affinities_3d(
                     gt_volume, offsets=self.affinity_offsets
                 )
-                batch_affinities.append(affinities)
+                batch_targets.append(affinities)
 
             # Stack into batch: (batch_size, num_offsets, D, H, W)
-            batch_gt = np.stack(batch_affinities, axis=0)
+            batch_targets = np.stack(batch_targets, axis=0)
 
         elif self.output_type == "affinities_lsds":
             from .affinity_utils import compute_affinities_and_lsds_3d
 
             # Convert each volume's instance segmentation to affinities and LSDs
-            batch_combined = []
+            batch_targets = []
             for gt_volume in batch_gt:
                 combined = compute_affinities_and_lsds_3d(
                     gt_volume, offsets=self.affinity_offsets, lsds_sigma=self.lsds_sigma
                 )
-                batch_combined.append(combined)
+                batch_targets.append(combined)
 
             # Stack into batch: (batch_size, 10 + num_offsets, D, H, W)
-            batch_gt = np.stack(batch_combined, axis=0)
+            batch_targets = np.stack(batch_targets, axis=0)
 
         # Add context data if available
         if self.has_context:
@@ -438,7 +438,7 @@ class MemoryEfficientDataLoader3D:
         else:
             batch_context = None
 
-        return batch_volumes, batch_gt, batch_masks, batch_context
+        return batch_volumes, batch_gt, batch_targets, batch_masks, batch_context
 
     def get_validation_data(self):
         """
@@ -463,29 +463,29 @@ class MemoryEfficientDataLoader3D:
             from .affinity_utils import compute_affinities_3d
 
             # Convert each volume's instance segmentation to affinities
-            val_affinities = []
+            val_targets = []
             for gt_volume in val_gt:
                 affinities = compute_affinities_3d(
                     gt_volume, offsets=self.affinity_offsets
                 )
-                val_affinities.append(affinities)
+                val_targets.append(affinities)
 
             # Stack into batch: (val_pool_size, num_offsets, D, H, W)
-            val_gt = np.stack(val_affinities, axis=0)
+            val_targets = np.stack(val_targets, axis=0)
 
         elif self.output_type == "affinities_lsds":
             from .affinity_utils import compute_affinities_and_lsds_3d
 
             # Convert each volume's instance segmentation to affinities and LSDs
-            val_combined = []
+            val_targets = []
             for gt_volume in val_gt:
                 combined = compute_affinities_and_lsds_3d(
                     gt_volume, offsets=self.affinity_offsets, lsds_sigma=self.lsds_sigma
                 )
-                val_combined.append(combined)
+                val_targets.append(combined)
 
             # Stack into batch: (val_pool_size, 10 + num_offsets, D, H, W)
-            val_gt = np.stack(val_combined, axis=0)
+            val_targets = np.stack(val_targets, axis=0)
 
         # Add context data if available
         if self.has_context:
@@ -493,7 +493,7 @@ class MemoryEfficientDataLoader3D:
         else:
             val_context = None
 
-        return val_volumes, val_gt, val_masks, val_context
+        return val_volumes, val_gt, val_targets, val_masks, val_context
 
     def extract_dinov3_features_3d(
         self, volumes, epoch=None, batch=None, enable_detailed_timing=False
@@ -1722,9 +1722,10 @@ def train_3d_unet_memory_efficient_v2(
     base_resolution=None,
     class_names=None,  # NEW PARAMETER for class names
     # Boundary weighting parameters (for boundary_affinity loss)
-    boundary_weight=10.0,  # Maximum weight at instance boundaries
+    boundary_weight=5.0,  # Maximum weight at instance boundaries
     boundary_sigma=5.0,  # Distance decay for boundary weights
     boundary_anisotropy=None,  # Voxel anisotropy (z,y,x) for EDT
+    mask_clip_distance=None,
     use_batchrenorm=False,  # Whether to use BatchRenorm instead of BatchNorm
 ):
     """
@@ -1765,13 +1766,13 @@ def train_3d_unet_memory_efficient_v2(
         print(f"  - Checkpoints will be saved to: {checkpoint_dir}")
 
     # Get validation data (keep on CPU for memory efficiency)
-    val_volumes, val_gt_volumes, val_masks, val_context = (
+    val_volumes, val_segmentations, val_targets, val_masks, val_context = (
         data_loader_3d.get_validation_data()
     )
 
     print(f"Validation set: {len(val_volumes)} volumes prepared")
     print(f"Validation labels will be processed volume-by-volume for memory efficiency")
-    print(f"Expected validation shape per volume: {val_gt_volumes[0].shape}")
+    print(f"Expected validation shape per volume: {val_segmentations[0].shape}")
     print(
         "Note: Validation features and labels will be computed volume-by-volume on-demand"
     )
@@ -1794,20 +1795,20 @@ def train_3d_unet_memory_efficient_v2(
         total_masked_voxels = 0
 
         for idx in sample_indices:
-            train_gt = data_loader_3d.gt_data[idx]
+            train_segmentations = data_loader_3d.gt_data[idx]
             train_mask = data_loader_3d.gt_masks[idx]
 
             # Check if mask is actually restricting regions (not all 1s)
             if not np.all(train_mask == 1):
                 # Only consider masked regions for class distribution
                 mask_bool = train_mask.astype(bool)
-                masked_labels = train_gt[mask_bool]
+                masked_labels = train_segmentations[mask_bool]
                 all_train_labels.append(masked_labels.flatten())
                 total_masked_voxels += np.sum(mask_bool)
             else:
                 # If mask is all 1s, use all voxels
-                all_train_labels.append(train_gt.flatten())
-                total_masked_voxels += train_gt.size
+                all_train_labels.append(train_segmentations.flatten())
+                total_masked_voxels += train_segmentations.size
 
         train_labels_flat = np.concatenate(all_train_labels)
 
@@ -1942,6 +1943,7 @@ def train_3d_unet_memory_efficient_v2(
         boundary_weight=boundary_weight,
         sigma=boundary_sigma,
         anisotropy=boundary_anisotropy,
+        mask_clip_distance=mask_clip_distance,
     )
 
     # Print loss configuration
@@ -2011,11 +2013,17 @@ def train_3d_unet_memory_efficient_v2(
         """
         if loss_type in ["dice", "focal_dice", "tversky"]:
             return criterion(logits, targets, num_classes)
-        elif loss_type in ["affinity", "boundary_affinity", "affinity_lsds"]:
+        elif loss_type in [
+            "affinity",
+            "boundary_affinity",
+            "affinity_lsds",
+            "boundary_affinity_focal_lsds",
+        ]:
             # Affinity losses expect different signature
-            if loss_type == "boundary_affinity":
+            if loss_type in ["boundary_affinity", "boundary_affinity_focal_lsds"]:
                 # Boundary-weighted loss needs instance segmentation
                 return criterion(logits, targets, instance_seg=instance_seg, mask=masks)
+
             else:
                 # Standard affinity loss or affinity_lsds loss
                 return criterion(logits, targets, mask=masks)
@@ -2047,10 +2055,14 @@ def train_3d_unet_memory_efficient_v2(
 
         for batch_idx in batch_pbar:
             # Sample new training volumes for this batch
-            train_volumes, train_gt_volumes, train_masks, train_context = (
-                data_loader_3d.sample_training_batch(volumes_per_batch)
-            )
 
+            (
+                train_volumes,
+                train_segmentations,
+                train_targets,
+                train_masks,
+                train_context,
+            ) = data_loader_3d.sample_training_batch(volumes_per_batch)
             # TIMING: Start DINOv3 feature extraction
             dinov3_start = time.time()
 
@@ -2084,14 +2096,12 @@ def train_3d_unet_memory_efficient_v2(
             # Handle both label and affinity formats
             if data_loader_3d.output_type in ["affinities", "affinities_lsds"]:
                 # Affinities/LSDs are float32: (batch, num_offsets, D, H, W) or (batch, 10+num_offsets, D, H, W)
-                train_labels = torch.tensor(train_gt_volumes, dtype=torch.float32).to(
+                train_labels = torch.tensor(train_targets, dtype=torch.float32).to(
                     device
                 )
             else:
                 # Class labels are long: (batch, D, H, W)
-                train_labels = torch.tensor(train_gt_volumes, dtype=torch.long).to(
-                    device
-                )
+                train_labels = torch.tensor(train_targets, dtype=torch.long).to(device)
 
             train_masks_tensor = torch.tensor(train_masks, dtype=torch.float32).to(
                 device
@@ -2171,7 +2181,11 @@ def train_3d_unet_memory_efficient_v2(
 
                             masked_loss = per_pixel_loss * train_masks_tensor
                             loss = masked_loss.sum() / train_masks_tensor.sum()
-                        elif loss_type in ["affinity", "boundary_affinity"]:
+                        elif loss_type in [
+                            "affinity",
+                            "boundary_affinity",
+                            "boundary_affinity_focal_lsds",
+                        ]:
                             # Affinity losses handle masking internally
                             # For boundary_affinity, pass the instance segmentation (train_gt_volumes)
                             loss = compute_loss(
@@ -2179,7 +2193,7 @@ def train_3d_unet_memory_efficient_v2(
                                 logits,
                                 train_labels,
                                 masks=train_masks_tensor,
-                                instance_seg=train_gt_volumes,  # Original instance seg before affinity conversion
+                                instance_seg=train_segmentations,  # Original instance seg before affinity conversion
                             )
                         else:
                             # For Dice-based losses, compute on full volume and weight the loss
@@ -2190,8 +2204,12 @@ def train_3d_unet_memory_efficient_v2(
                                 train_labels,
                                 masks=train_masks_tensor,
                                 instance_seg=(
-                                    train_gt_volumes
-                                    if loss_type == "boundary_affinity"
+                                    train_segmentations
+                                    if loss_type
+                                    in [
+                                        "boundary_affinity",
+                                        "boundary_affinity_focal_lsds",
+                                    ]
                                     else None
                                 ),
                             )
@@ -2209,8 +2227,9 @@ def train_3d_unet_memory_efficient_v2(
                             train_labels,
                             masks=None,
                             instance_seg=(
-                                train_gt_volumes
-                                if loss_type == "boundary_affinity"
+                                train_segmentations
+                                if loss_type
+                                in ["boundary_affinity", "boundary_affinity_focal_lsds"]
                                 else None
                             ),
                         )
@@ -2224,34 +2243,34 @@ def train_3d_unet_memory_efficient_v2(
                 torch.nn.utils.clip_grad_norm_(unet3d.parameters(), max_norm=1.0)
                 scaler.step(optimizer)
                 scaler.update()
-            else:
-                # Pass raw and context features separately for proper fusion
-                logits = unet3d(train_features, context_features=train_context_features)
-                if use_masks:
-                    # Apply masks to loss calculation
-                    if loss_type in ["ce", "weighted_ce", "focal"]:
-                        per_pixel_loss = F.cross_entropy(
-                            logits,
-                            train_labels,
-                            reduction="none",
-                            weight=loss_class_weights,
-                        )
-                        if loss_type == "focal":
-                            p_t = torch.exp(-per_pixel_loss)
-                            focal_weight = (1 - p_t) ** focal_gamma
-                            per_pixel_loss = focal_weight * per_pixel_loss
+            # else:
+            #     # Pass raw and context features separately for proper fusion
+            #     logits = unet3d(train_features, context_features=train_context_features)
+            #     if use_masks:
+            #         # Apply masks to loss calculation
+            #         if loss_type in ["ce", "weighted_ce", "focal"]:
+            #             per_pixel_loss = F.cross_entropy(
+            #                 logits,
+            #                 train_labels,
+            #                 reduction="none",
+            #                 weight=loss_class_weights,
+            #             )
+            #             if loss_type == "focal":
+            #                 p_t = torch.exp(-per_pixel_loss)
+            #                 focal_weight = (1 - p_t) ** focal_gamma
+            #                 per_pixel_loss = focal_weight * per_pixel_loss
 
-                        masked_loss = per_pixel_loss * train_masks_tensor
-                        loss = masked_loss.sum() / train_masks_tensor.sum()
-                    else:
-                        loss_full = compute_loss(criterion, logits, train_labels)
-                        loss = loss_full
-                else:
-                    # Use standard loss when no masking needed
-                    loss = compute_loss(criterion, logits, train_labels)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(unet3d.parameters(), max_norm=1.0)
-                optimizer.step()
+            #             masked_loss = per_pixel_loss * train_masks_tensor
+            #             loss = masked_loss.sum() / train_masks_tensor.sum()
+            #         else:
+            #             loss_full = compute_loss(criterion, logits, train_labels)
+            #             loss = loss_full
+            #     else:
+            #         # Use standard loss when no masking needed
+            #         loss = compute_loss(criterion, logits, train_labels)
+            #     loss.backward()
+            #     torch.nn.utils.clip_grad_norm_(unet3d.parameters(), max_norm=1.0)
+            #     optimizer.step()
 
             # Clear GPU cache to prevent memory accumulation
             if device.type == "cuda":
@@ -2385,7 +2404,7 @@ def train_3d_unet_memory_efficient_v2(
             if train_context_features is not None:
                 del train_context_features
             if "train_volumes" in locals():
-                del train_volumes, train_gt_volumes, train_masks
+                del train_volumes, train_targets, train_masks
             if "train_context" in locals() and train_context is not None:
                 del train_context
             if device.type == "cuda":
@@ -2498,27 +2517,27 @@ def train_3d_unet_memory_efficient_v2(
                     # Handle both label and affinity formats
                     if data_loader_3d.output_type in ["affinities", "affinities_lsds"]:
                         # Affinities/LSDs are float32: (1, num_channels, D, H, W)
-                        vol_gt = (
-                            torch.tensor(val_gt_volumes[vol_idx], dtype=torch.float32)
+                        current_val_targets = (
+                            torch.tensor(val_targets[vol_idx], dtype=torch.float32)
                             .unsqueeze(0)
                             .to(device)
                         )
                     else:
                         # Class labels are long: (1, D, H, W)
-                        vol_gt = (
-                            torch.tensor(val_gt_volumes[vol_idx], dtype=torch.long)
+                        current_val_targets = (
+                            torch.tensor(val_targets[vol_idx], dtype=torch.long)
                             .unsqueeze(0)
                             .to(device)
                         )
 
-                    vol_mask = (
+                    current_val_mask = (
                         torch.tensor(val_masks[vol_idx], dtype=torch.float32)
                         .unsqueeze(0)
                         .to(device)
                     )
 
                     # Check if masks are actually being used (not all 1s)
-                    use_vol_masks = not torch.all(vol_mask == 1.0)
+                    use_vol_masks = not torch.all(current_val_mask == 1.0)
 
                     # TIMING: Start validation inference
                     val_inference_start = time.time()
@@ -2538,7 +2557,7 @@ def train_3d_unet_memory_efficient_v2(
                                 if loss_type in ["ce", "weighted_ce", "focal"]:
                                     vol_per_pixel_loss = F.cross_entropy(
                                         vol_logits,
-                                        vol_gt,
+                                        current_val_targets,
                                         reduction="none",
                                         weight=loss_class_weights,
                                     )
@@ -2549,18 +2568,24 @@ def train_3d_unet_memory_efficient_v2(
                                             focal_weight * vol_per_pixel_loss
                                         )
 
-                                    vol_masked_loss = vol_per_pixel_loss * vol_mask
+                                    vol_masked_loss = (
+                                        vol_per_pixel_loss * current_val_mask
+                                    )
                                     vol_loss = (
-                                        vol_masked_loss.sum() / vol_mask.sum()
+                                        vol_masked_loss.sum() / current_val_mask.sum()
                                     ).item()
-                                elif loss_type in ["affinity", "boundary_affinity"]:
+                                elif loss_type in [
+                                    "affinity",
+                                    "boundary_affinity",
+                                    "boundary_affinity_focal_lsds",
+                                ]:
                                     # Affinity losses handle masking internally
                                     vol_loss = compute_loss(
                                         criterion,
                                         vol_logits,
-                                        vol_gt,
-                                        masks=vol_mask,
-                                        instance_seg=val_gt_volumes[
+                                        current_val_targets,
+                                        masks=current_val_mask,
+                                        instance_seg=val_segmentations[
                                             vol_idx
                                         ],  # Original instance seg
                                     ).item()
@@ -2568,11 +2593,15 @@ def train_3d_unet_memory_efficient_v2(
                                     vol_loss = compute_loss(
                                         criterion,
                                         vol_logits,
-                                        vol_gt,
-                                        masks=vol_mask,
+                                        current_val_targets,
+                                        masks=current_val_mask,
                                         instance_seg=(
-                                            val_gt_volumes[vol_idx]
-                                            if loss_type == "boundary_affinity"
+                                            val_segmentations[vol_idx]
+                                            if loss_type
+                                            in [
+                                                "boundary_affinity",
+                                                "boundary_affinity_focal_lsds",
+                                            ]
                                             else None
                                         ),
                                     ).item()
@@ -2581,73 +2610,77 @@ def train_3d_unet_memory_efficient_v2(
                                 vol_loss = compute_loss(
                                     criterion,
                                     vol_logits,
-                                    vol_gt,
+                                    current_val_targets,
                                     masks=None,
                                     instance_seg=(
-                                        val_gt_volume
-                                        if loss_type == "boundary_affinity"
+                                        train_segmentations
+                                        if loss_type
+                                        in [
+                                            "boundary_affinity",
+                                            "boundary_affinity_focal_lsds",
+                                        ]
                                         else None
                                     ),
                                 ).item()
-                    else:
-                        # Pass raw and context features separately for proper fusion
-                        vol_logits = unet3d(
-                            vol_features, context_features=vol_context_features
-                        )
-                        if use_vol_masks:
-                            # Apply masks to validation loss calculation
-                            if loss_type in ["ce", "weighted_ce", "focal"]:
-                                vol_per_pixel_loss = F.cross_entropy(
-                                    vol_logits,
-                                    vol_gt,
-                                    reduction="none",
-                                    weight=loss_class_weights,
-                                )
-                                if loss_type == "focal":
-                                    p_t = torch.exp(-vol_per_pixel_loss)
-                                    focal_weight = (1 - p_t) ** focal_gamma
-                                    vol_per_pixel_loss = (
-                                        focal_weight * vol_per_pixel_loss
-                                    )
+                    # else:
+                    #     # Pass raw and context features separately for proper fusion
+                    #     vol_logits = unet3d(
+                    #         vol_features, context_features=vol_context_features
+                    #     )
+                    #     if use_vol_masks:
+                    #         # Apply masks to validation loss calculation
+                    #         if loss_type in ["ce", "weighted_ce", "focal"]:
+                    #             vol_per_pixel_loss = F.cross_entropy(
+                    #                 vol_logits,
+                    #                 vol_gt,
+                    #                 reduction="none",
+                    #                 weight=loss_class_weights,
+                    #             )
+                    #             if loss_type == "focal":
+                    #                 p_t = torch.exp(-vol_per_pixel_loss)
+                    #                 focal_weight = (1 - p_t) ** focal_gamma
+                    #                 vol_per_pixel_loss = (
+                    #                     focal_weight * vol_per_pixel_loss
+                    #                 )
 
-                                vol_masked_loss = vol_per_pixel_loss * vol_mask
-                                vol_loss = (
-                                    vol_masked_loss.sum() / vol_mask.sum()
-                                ).item()
-                            elif loss_type in ["affinity", "boundary_affinity"]:
-                                # Affinity losses handle masking internally
-                                vol_loss = compute_loss(
-                                    criterion,
-                                    vol_logits,
-                                    vol_gt,
-                                    masks=vol_mask,
-                                    instance_seg=val_gt_volume,  # Original instance seg
-                                ).item()
-                            else:
-                                vol_loss = compute_loss(
-                                    criterion,
-                                    vol_logits,
-                                    vol_gt,
-                                    masks=vol_mask,
-                                    instance_seg=(
-                                        val_gt_volume
-                                        if loss_type == "boundary_affinity"
-                                        else None
-                                    ),
-                                ).item()
-                        else:
-                            # Use standard loss when no masking needed
-                            vol_loss = compute_loss(
-                                criterion,
-                                vol_logits,
-                                vol_gt,
-                                masks=None,
-                                instance_seg=(
-                                    val_gt_volume
-                                    if loss_type == "boundary_affinity"
-                                    else None
-                                ),
-                            ).item()
+                    #             vol_masked_loss = vol_per_pixel_loss * vol_mask
+                    #             vol_loss = (
+                    #                 vol_masked_loss.sum() / vol_mask.sum()
+                    #             ).item()
+                    #         elif loss_type in ["affinity", "boundary_affinity"]:
+                    #             # Affinity losses handle masking internally
+                    #             vol_loss = compute_loss(
+                    #                 criterion,
+                    #                 vol_logits,
+                    #                 vol_gt,
+                    #                 masks=vol_mask,
+                    #                 instance_seg=val_gt_volume,  # Original instance seg
+                    #             ).item()
+                    #         else:
+                    #             vol_loss = compute_loss(
+                    #                 criterion,
+                    #                 vol_logits,
+                    #                 vol_gt,
+                    #                 masks=vol_mask,
+                    #                 instance_seg=(
+                    #                     val_gt_volume
+                    #                     if loss_type == "boundary_affinity"
+                    #                     else None
+                    #                 ),
+                    #             ).item()
+                    #     else:
+                    #         # Use standard loss when no masking needed
+                    #         vol_loss = compute_loss(
+                    #             criterion,
+                    #             vol_logits,
+                    #             vol_gt,
+                    #             masks=None,
+                    #             instance_seg=(
+                    #                 val_gt_volume
+                    #                 if loss_type == "boundary_affinity"
+                    #                 else None
+                    #             ),
+                    #         ).item()
 
                     # TIMING: End validation inference
                     val_inference_end = time.time()
@@ -2675,7 +2708,9 @@ def train_3d_unet_memory_efficient_v2(
                         # For affinities, expand mask to match affinity dimensions
                         if use_vol_masks:
                             vol_mask_expanded = (
-                                vol_mask.unsqueeze(1).expand_as(vol_predictions).bool()
+                                current_val_mask.unsqueeze(1)
+                                .expand_as(vol_predictions)
+                                .bool()
                             )
                             vol_correct = (
                                 ((vol_predictions == vol_gt) & vol_mask_expanded)
@@ -2694,13 +2729,13 @@ def train_3d_unet_memory_efficient_v2(
                         # For class labels
                         if use_vol_masks:
                             # Only for masked regions
-                            vol_mask_bool = vol_mask.bool()
+                            vol_mask_bool = current_val_mask.bool()
                             vol_correct = (
                                 ((vol_predictions == vol_gt) & vol_mask_bool)
                                 .sum()
                                 .item()
                             )
-                            vol_valid_voxels = vol_mask.sum().item()
+                            vol_valid_voxels = current_val_mask.sum().item()
                         else:
                             # All regions when no masking
                             vol_correct = (vol_predictions == vol_gt).sum().item()
@@ -2720,7 +2755,7 @@ def train_3d_unet_memory_efficient_v2(
                         vol_pred_cpu = vol_predictions.cpu().numpy()
 
                         if use_vol_masks:
-                            vol_mask_cpu = vol_mask.cpu().numpy().astype(bool)
+                            vol_mask_cpu = current_val_mask.cpu().numpy().astype(bool)
                         else:
                             # Create a full mask when no masking is needed
                             vol_mask_cpu = np.ones_like(vol_gt_cpu, dtype=bool)
@@ -2746,7 +2781,7 @@ def train_3d_unet_memory_efficient_v2(
                             val_class_total_pred[class_id] += np.sum(valid_pred_mask)
 
                     # Immediately free GPU memory for this volume
-                    del vol_features, vol_logits, vol_gt, vol_mask
+                    del vol_features, vol_logits, current_val_mask
                     if "vol_predictions" in locals():
                         del vol_predictions
                     if vol_context_features is not None:
@@ -3483,6 +3518,7 @@ def train_3d_unet_with_memory_efficient_loader(
     affinity_offsets=None,  # List of (z,y,x) tuples for affinity computation
     lsds_sigma=20.0,  # Sigma parameter for LSDS computation (only used when output_type='affinities_lsds')
     use_batchrenorm=False,  # Whether to use BatchRenorm instead of BatchNorm (more stable for small batches
+    mask_clip_distance=None,
 ):
     """
     Memory-efficient 3D UNet training with multiple precision and memory optimization options.
@@ -3718,6 +3754,7 @@ def train_3d_unet_with_memory_efficient_loader(
         boundary_sigma=boundary_sigma,
         boundary_anisotropy=boundary_anisotropy,
         use_batchrenorm=use_batchrenorm,  # Pass through BatchRenorm option
+        mask_clip_distance=mask_clip_distance,
     )
 
     print(f"\n3D UNet training completed!")
