@@ -28,6 +28,7 @@ from .dinov3_core import (
     apply_normalization_stats,
     output_channels,
 )
+from .tensorboard_helpers import create_and_log_validation_video_fast
 
 # Handle both relative and absolute imports
 try:
@@ -46,6 +47,13 @@ import pickle
 import glob
 import os
 from datetime import datetime
+
+
+# NEW IMPORTS FOR TENSORBOARD + GIF CREATION
+from torch.utils.tensorboard import SummaryWriter
+import matplotlib.pyplot as plt
+import imageio
+import io
 
 
 def print_class_metrics_table(
@@ -1752,7 +1760,6 @@ def train_3d_unet_memory_efficient_v2(
     print(f"  - Mixed precision: {use_mixed_precision}")
     print(f"  - Learn upsampling: {learn_upsampling}")  # NEW
     print(f"  - GT extension masks: Conditional masking (auto-detected per batch)")
-
     # Initialize mixed precision scaler
     scaler = GradScaler() if use_mixed_precision else None
 
@@ -1765,12 +1772,22 @@ def train_3d_unet_memory_efficient_v2(
         print(f"  - Export base: {export_base_dir}")
         print(f"  - Checkpoints will be saved to: {checkpoint_dir}")
 
+    # NEW: Initialize TensorBoard writer (logs go under checkpoint_dir/tensorboard when available)
+    if save_checkpoints and checkpoint_dir is not None:
+        tb_log_dir = os.path.join(checkpoint_dir, "tensorboard")
+    else:
+        tb_log_dir = os.path.join(
+            "/tmp", "dinov3_tensorboard", datetime.now().strftime("%Y%m%d_%H%M%S")
+        )
+    writer = SummaryWriter(log_dir=tb_log_dir)
+    print(f"TensorBoard logs will be written to: {tb_log_dir}")
+
     # Get validation data (keep on CPU for memory efficiency)
-    val_volumes, val_segmentations, val_targets, val_masks, val_context = (
+    val_raws, val_segmentations, val_targets, val_masks, val_context = (
         data_loader_3d.get_validation_data()
     )
 
-    print(f"Validation set: {len(val_volumes)} volumes prepared")
+    print(f"Validation set: {len(val_raws)} volumes prepared")
     print(f"Validation labels will be processed volume-by-volume for memory efficiency")
     print(f"Expected validation shape per volume: {val_segmentations[0].shape}")
     print(
@@ -2057,7 +2074,7 @@ def train_3d_unet_memory_efficient_v2(
             # Sample new training volumes for this batch
 
             (
-                train_volumes,
+                train_raws,
                 train_segmentations,
                 train_targets,
                 train_masks,
@@ -2070,7 +2087,7 @@ def train_3d_unet_memory_efficient_v2(
             if enable_detailed_timing:
                 train_features, train_context_features, detailed_timing = (
                     data_loader_3d.extract_multi_scale_dinov3_features_3d(
-                        train_volumes,
+                        train_raws,
                         train_context,
                         epoch,
                         batch_idx,
@@ -2080,7 +2097,7 @@ def train_3d_unet_memory_efficient_v2(
             else:
                 train_features, train_context_features = (
                     data_loader_3d.extract_multi_scale_dinov3_features_3d(
-                        train_volumes,
+                        train_raws,
                         train_context,
                         epoch,
                         batch_idx,
@@ -2404,7 +2421,7 @@ def train_3d_unet_memory_efficient_v2(
             if train_context_features is not None:
                 del train_context_features
             if "train_volumes" in locals():
-                del train_volumes, train_targets, train_masks
+                del train_raws, train_targets, train_masks
             if "train_context" in locals() and train_context is not None:
                 del train_context
             if device.type == "cuda":
@@ -2471,13 +2488,13 @@ def train_3d_unet_memory_efficient_v2(
                 total_val_inference_time = 0.0
 
                 # Process each validation volume independently
-                for vol_idx in range(len(val_volumes)):
+                for vol_idx in range(len(val_raws)):
                     # TIMING: Start DINOv3 validation feature extraction
                     val_dinov3_start = time.time()
 
                     # Extract features for single volume (keeps GPU memory minimal)
                     single_vol = np.array(
-                        [val_volumes[vol_idx]]
+                        [val_raws[vol_idx]]
                     )  # Convert to numpy array with batch dimension
 
                     # Get context volume if available
@@ -2780,6 +2797,69 @@ def train_3d_unet_memory_efficient_v2(
                             val_class_total_gt[class_id] += np.sum(valid_gt_mask)
                             val_class_total_pred[class_id] += np.sum(valid_pred_mask)
 
+                    try:
+                        # Convert CPU arrays for inputs
+                        vol_raw_np = val_raws[vol_idx] if val_raws is not None else None
+                        vol_seg_np = (
+                            val_segmentations[vol_idx]
+                            if val_segmentations is not None
+                            else None
+                        )
+                        vol_mask_np = (
+                            val_masks[vol_idx] if val_masks is not None else None
+                        )
+
+                        # current_val_targets is a tensor on device; convert to numpy on CPU
+                        if isinstance(current_val_targets, torch.Tensor):
+                            try:
+                                tgt_np = current_val_targets.squeeze(0).cpu().numpy()
+                            except Exception:
+                                tgt_np = None
+                        else:
+                            tgt_np = current_val_targets
+
+                        if data_loader_3d.output_type in [
+                            "affinities",
+                            "affinities_lsds",
+                        ]:
+                            vol_predictions = torch.sigmoid(vol_logits)
+                        # vol_predictions may be tensor; convert to numpy
+                        if (
+                            "vol_predictions" in locals()
+                            and vol_predictions is not None
+                        ):
+                            try:
+                                pred_np = vol_predictions.squeeze(0).cpu().numpy()
+                            except Exception:
+                                pred_np = None
+                        else:
+                            pred_np = None
+
+                        # Call helper to build gif and log it
+                        t0 = time.time()
+                        create_and_log_validation_video_fast(
+                            writer=writer,
+                            vol_idx=vol_idx,
+                            vol_raw=vol_raw_np,
+                            vol_seg=vol_seg_np,
+                            vol_mask=vol_mask_np,
+                            vol_targets=tgt_np,
+                            vol_predictions=pred_np,
+                            epoch_step=epoch,
+                            tag_prefix="validation",
+                            fps=4,
+                        )
+                        # Also log per-volume loss to tensorboard
+                        writer.add_scalar(
+                            f"validation/volume_{vol_idx}_loss", vol_loss, epoch
+                        )
+                        print(time.time() - t0)
+                    except Exception as e:
+                        print(
+                            f"Warning: failed to create/log validation gif for vol {vol_idx}: {e}"
+                        )
+                    # --- END NEW GIF LOGGING ---
+
                     # Immediately free GPU memory for this volume
                     del vol_features, vol_logits, current_val_mask
                     if "vol_predictions" in locals():
@@ -2812,17 +2892,13 @@ def train_3d_unet_memory_efficient_v2(
                     else 0
                 )
                 avg_val_dinov3_time = (
-                    total_val_dinov3_time / len(val_volumes)
-                    if len(val_volumes) > 0
-                    else 0
+                    total_val_dinov3_time / len(val_raws) if len(val_raws) > 0 else 0
                 )
                 avg_val_inference_time = (
-                    total_val_inference_time / len(val_volumes)
-                    if len(val_volumes) > 0
-                    else 0
+                    total_val_inference_time / len(val_raws) if len(val_raws) > 0 else 0
                 )
 
-                print(f"\n  Validation Timing Summary ({len(val_volumes)} volumes):")
+                print(f"\n  Validation Timing Summary ({len(val_raws)} volumes):")
                 print(
                     f"    Total DINOv3 extraction: {total_val_dinov3_time:.3f}s ({val_dinov3_pct:.1f}%) - Avg: {avg_val_dinov3_time:.3f}s/vol"
                 )
