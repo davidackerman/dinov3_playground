@@ -452,6 +452,14 @@ def get_loss_function(loss_type, class_weights=None, **kwargs):
         pos_weight = kwargs.get("pos_weight", None)
         return AffinityLoss(use_class_weights=use_class_weights, pos_weight=pos_weight)
 
+    elif loss_type == "affinity_focal":
+        # Import here to avoid circular imports
+        from .affinity_utils import AffinityFocalLoss
+
+        alpha = kwargs.get("alpha", 0.25)
+        gamma = kwargs.get("gamma", 2.0)
+        return AffinityFocalLoss(alpha=alpha, gamma=gamma)
+
     elif loss_type == "boundary_affinity":
         # Import here to avoid circular imports
         from .affinity_utils import BoundaryWeightedAffinityLoss
@@ -469,21 +477,40 @@ def get_loss_function(loss_type, class_weights=None, **kwargs):
             pos_weight=pos_weight,
         )
 
-    elif loss_type == "affinity_lsds":
+    elif loss_type == "boundary_affinity_focal":
         # Import here to avoid circular imports
-        from .affinity_utils import AffinityLSDSLoss
+        from .affinity_utils import BoundaryWeightedAffinityFocalLoss
 
-        num_lsds = kwargs.get("num_lsds", 10)
-        use_class_weights = kwargs.get("use_class_weights", True)
-        pos_weight = kwargs.get("pos_weight", None)
-        lsds_weight = kwargs.get("lsds_weight", 0.25)
-        affinity_weight = kwargs.get("affinity_weight", 1.0)
-        return AffinityLSDSLoss(
-            num_lsds=num_lsds,
-            use_class_weights=use_class_weights,
-            pos_weight=pos_weight,
-            lsds_weight=lsds_weight,
-            affinity_weight=affinity_weight,
+        boundary_weight = kwargs.get("boundary_weight", 5.0)
+        sigma = kwargs.get("sigma", 5.0)
+        anisotropy = kwargs.get("anisotropy", (1.0, 1.0, 1.0))
+        alpha = kwargs.get("alpha", 0.25)
+        gamma = kwargs.get("gamma", 2.0)
+        return BoundaryWeightedAffinityFocalLoss(
+            boundary_weight=boundary_weight,
+            sigma=sigma,
+            anisotropy=anisotropy,
+            alpha=alpha,
+            gamma=gamma,
+        )
+
+    elif loss_type == "boundary_affinity_focal_lsds":
+        # Import here to avoid circular imports
+        from .affinity_utils import BoundaryWeightedAffinityFocalLSDSLoss
+
+        boundary_weight = kwargs.get("boundary_weight", 5.0)
+        sigma = kwargs.get("sigma", 5.0)
+        anisotropy = kwargs.get("anisotropy", (1.0, 1.0, 1.0))
+        alpha = kwargs.get("alpha", 0.25)
+        gamma = kwargs.get("gamma", 2.0)
+        print(kwargs.get("mask_clip_distance", 9))
+        return BoundaryWeightedAffinityFocalLSDSLoss(
+            boundary_weight=boundary_weight,
+            sigma=sigma,
+            anisotropy=anisotropy,
+            alpha=alpha,
+            gamma=gamma,
+            mask_clip_distance=kwargs.get("mask_clip_distance", 9),
         )
 
     else:
