@@ -1771,6 +1771,7 @@ def load_random_3d_training_data(
                 pass
             else:
                 gt_mask = np.ones(volume_shape, dtype=np.uint8)
+
             # Now calculate label fraction within valid GT regions only
             total_label_fraction = 0.0
             valid_gt_voxels = np.sum(gt_mask)  # Number of valid GT voxels
@@ -1838,6 +1839,7 @@ def load_random_3d_training_data(
             # Store the volumes and mask (only after all checks pass)
             if gt_masks is not None and gt_mask is not None:
                 gt_masks[volumes_collected] = gt_mask
+
             # Store into preallocated arrays/lists by index
             if context_volumes is not None:
                 context_volumes[volumes_collected] = context_volume  # May be None
