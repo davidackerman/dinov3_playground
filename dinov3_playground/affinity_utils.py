@@ -8,9 +8,11 @@ Author: GitHub Copilot
 Date: 2025-10-06
 """
 
+# %%
 import numpy as np
 import torch
 import torch.nn.functional as F
+import fastmorph
 
 try:
     import edt
@@ -197,130 +199,95 @@ def compute_affinities_2d(instance_segmentation, offsets=None):
 
 
 def compute_boundary_weights(
-    instance_segmentation,
-    boundary_weight=10.0,
-    sigma=5.0,
+    instance_segmentation: np.ndarray,
+    boundary_weight: float = 5.0,
+    sigma: float = 5.0,
     anisotropy=(1.0, 1.0, 1.0),
-    black_border=True,
+    mask: np.ndarray | None = None,
+    black_border: bool = False,
 ):
     """
-    Compute per-pixel weights emphasizing instance boundaries.
-
-    Uses Euclidean Distance Transform (EDT) per instance to compute distance
-    to nearest boundary. Weights decay exponentially from boundaries.
-
-    Parameters:
-    -----------
-    instance_segmentation : numpy.ndarray
-        Instance segmentation of shape (D, H, W) or (H, W) where each unique
-        non-zero value represents a different instance
-    boundary_weight : float, default=10.0
-        Maximum weight at boundaries. Interior pixels have weight 1.0.
-        Final weight = 1 + (boundary_weight - 1) * exp(-dist^2 / (2*sigma^2))
-    sigma : float, default=5.0
-        Distance decay parameter in pixels. Controls how quickly weight
-        decreases away from boundaries.
-        - Small sigma (e.g., 2.0): Sharp falloff, only immediate boundary pixels weighted
-        - Large sigma (e.g., 10.0): Smooth falloff, broader boundary region weighted
-    anisotropy : tuple of float, default=(1.0, 1.0, 1.0)
-        Anisotropy of the voxels for EDT computation (z, y, x) for 3D or (y, x) for 2D.
-        Use physical voxel sizes for proper distance computation.
-    black_border : bool, default=True
-        Whether to treat volume borders as boundaries (penalize predictions at edges)
-
-    Returns:
-    --------
-    numpy.ndarray
-        Weight map of same shape as input. Values in range [1.0, boundary_weight].
-
-    Notes:
-    ------
-    This implements per-instance distance transforms as recommended in:
-    - Funke et al. "Large Scale Image Segmentation with Structured Loss" (2018)
-    - Lee et al. "Superhuman Accuracy on the SNEMI3D Connectomics Challenge" (2017)
-
-    The key insight: boundaries between instances are critical for instance
-    segmentation, so we weight them more heavily in the loss to force the
-    network to learn precise instance separation.
+    Emphasize boundaries between:
+      1) two different non-zero instances
+      2) instance (>0) and background (0)
+    ...but ONLY when both sides lie within `mask` (so mask edges are ignored).
     """
-    if not HAS_EDT:
-        raise ImportError(
-            "edt package required for boundary weighting. "
-            "Install with: pip install edt"
+    seg = np.asarray(instance_segmentation)
+    assert seg.ndim in (2, 3), "seg must be 2D or 3D"
+    ndim = seg.ndim
+
+    # Valid region; outside stays weight=1
+    allow = np.ones_like(seg, dtype=bool) if mask is None else mask.astype(bool)
+
+    if np.count_nonzero(seg) == 0:
+        w = np.ones_like(seg, dtype=np.float32)
+        w[~allow] = 1.0
+        return w
+
+    # Build boundary map inside the mask:
+    # - instance≠instance
+    # - instance vs background
+    boundary = np.zeros_like(seg, dtype=bool)
+    inside = allow  # alias
+
+    for ax in range(ndim):
+        # roll forward
+        fwd = np.roll(seg, -1, axis=ax)
+        in_fwd = np.roll(inside, -1, axis=ax)
+        # avoid wrap-around at far edge
+        slicer = [slice(None)] * ndim
+        slicer[ax] = -1
+        in_fwd[tuple(slicer)] = False
+
+        # roll backward
+        bwd = np.roll(seg, 1, axis=ax)
+        in_bwd = np.roll(inside, 1, axis=ax)
+        slicer[ax] = 0
+        in_bwd[tuple(slicer)] = False
+
+        # instance↔instance (different ids), both sides inside mask
+        meet_inst_fwd = (seg > 0) & (fwd > 0) & (seg != fwd) & inside & in_fwd
+        meet_inst_bwd = (seg > 0) & (bwd > 0) & (seg != bwd) & inside & in_bwd
+
+        # instance↔background, both sides inside mask
+        meet_bg_fwd = ((seg > 0) & (fwd == 0) & inside & in_fwd) | (
+            (seg == 0) & (fwd > 0) & inside & in_fwd
+        )
+        meet_bg_bwd = ((seg > 0) & (bwd == 0) & inside & in_bwd) | (
+            (seg == 0) & (bwd > 0) & inside & in_bwd
         )
 
-    is_3d = instance_segmentation.ndim == 3
+        boundary |= meet_inst_fwd | meet_inst_bwd | meet_bg_fwd | meet_bg_bwd
 
-    # Initialize weight map (all 1.0 initially)
-    weights = np.ones_like(instance_segmentation, dtype=np.float32)
+    # Optional: treat image border as boundary, but only where inside==True
+    if black_border:
+        for ax in range(ndim):
+            slicer0 = [slice(None)] * ndim
+            slicerN = [slice(None)] * ndim
+            slicer0[ax] = 0
+            slicerN[ax] = -1
+            boundary[tuple(slicer0)] |= inside[tuple(slicer0)]
+            boundary[tuple(slicerN)] |= inside[tuple(slicerN)]
 
-    # Get unique instances (excluding background=0)
-    instance_ids = np.unique(instance_segmentation)
-    instance_ids = instance_ids[instance_ids > 0]
+    # If nothing marked, return uniform weights
+    if not boundary.any():
+        w = np.ones_like(seg, dtype=np.float32)
+        w[~allow] = 1.0
+        return w
 
-    if len(instance_ids) == 0:
-        # No instances, return uniform weights
-        return weights
+    # Distance to the nearest *true* boundary (edt on ~boundary)
+    dist = edt.edt(~boundary, anisotropy=anisotropy, black_border=False).astype(
+        np.float32
+    )
 
-    # Compute distance transform for each instance separately
-    for instance_id in instance_ids:
-        # Create binary mask for this instance
-        instance_mask = (instance_segmentation == instance_id).astype(np.uint8)
+    # Outside mask: make infinitely far so weight becomes 1.0
+    dist[~allow] = np.inf
 
-        # Compute EDT (distance to nearest boundary)
-        # edt returns distance in physical units based on anisotropy
-        if is_3d:
-            dist = edt.edt(
-                instance_mask,
-                anisotropy=anisotropy,
-                black_border=black_border,
-            )
-        else:
-            dist = edt.edt(
-                instance_mask,
-                anisotropy=anisotropy[:2] if len(anisotropy) == 3 else anisotropy,
-                black_border=black_border,
-            )
-
-        # Compute Gaussian falloff from boundaries
-        # weight = 1 + (boundary_weight - 1) * exp(-dist^2 / (2*sigma^2))
-        # At boundary (dist=0): weight = boundary_weight
-        # Far from boundary (dist >> sigma): weight → 1.0
-        gaussian_falloff = np.exp(-(dist**2) / (2 * sigma**2))
-        instance_weights = 1.0 + (boundary_weight - 1.0) * gaussian_falloff
-
-        # Update weight map where this instance exists
-        weights[instance_mask > 0] = np.maximum(
-            weights[instance_mask > 0], instance_weights[instance_mask > 0]
-        )
-
-    # Also weight background boundaries if black_border=True
-    # This ensures boundaries at volume edges are also emphasized
-    if black_border and len(instance_ids) > 0:
-        # Create background mask
-        background_mask = (instance_segmentation == 0).astype(np.uint8)
-        if background_mask.sum() > 0:
-            if is_3d:
-                bg_dist = edt.edt(
-                    background_mask,
-                    anisotropy=anisotropy,
-                    black_border=black_border,
-                )
-            else:
-                bg_dist = edt.edt(
-                    background_mask,
-                    anisotropy=anisotropy[:2] if len(anisotropy) == 3 else anisotropy,
-                    black_border=black_border,
-                )
-
-            # Only weight background pixels near instance boundaries
-            bg_gaussian = np.exp(-(bg_dist**2) / (2 * sigma**2))
-            bg_weights = 1.0 + (boundary_weight - 1.0) * bg_gaussian
-            weights[background_mask > 0] = np.maximum(
-                weights[background_mask > 0], bg_weights[background_mask > 0]
-            )
-
-    return weights
+    # Gaussian falloff
+    gaussian = np.exp(-(dist**2) / (2.0 * (sigma**2)))
+    w = 1.0 + (boundary_weight - 1.0) * gaussian
+    w[~allow] = 1.0
+    return w
 
 
 class AffinityLoss(torch.nn.Module):
@@ -442,7 +409,7 @@ class BoundaryWeightedAffinityLoss(torch.nn.Module):
 
     def __init__(
         self,
-        boundary_weight=10.0,
+        boundary_weight=5.0,
         sigma=5.0,
         anisotropy=(1.0, 1.0, 1.0),
         use_class_weights=True,
@@ -540,7 +507,7 @@ class BoundaryWeightedAffinityLoss(torch.nn.Module):
                 boundary_weight=self.boundary_weight,
                 sigma=self.sigma,
                 anisotropy=self.anisotropy,
-                black_border=True,
+                black_border=False,
             )
             boundary_weights_list.append(weights)
 
@@ -605,6 +572,149 @@ class BoundaryWeightedAffinityLoss(torch.nn.Module):
                 loss = loss.sum()
         else:
             # Normalize by sum of weights
+            loss = loss.sum() / boundary_weights.sum()
+
+        return loss
+
+
+class AffinityFocalLoss(torch.nn.Module):
+    """
+    Focal loss for affinity prediction (binary per-pixel affinities).
+
+    Parameters:
+    -----------
+    alpha : float
+        Weighting factor for the positive class in focal loss (0-1). Default 0.25.
+    gamma : float
+        Focusing parameter. Default 2.0.
+    use_class_weights : bool
+        Unused for focal but kept for API compatibility.
+    """
+
+    def __init__(self, alpha=0.25, gamma=2.0, use_class_weights=True, pos_weight=None):
+        super(AffinityFocalLoss, self).__init__()
+        self.alpha = float(alpha)
+        self.gamma = float(gamma)
+        self.use_class_weights = use_class_weights
+        self.pos_weight = pos_weight
+
+    def forward(self, predictions, targets, mask=None):
+        """
+        predictions: logits (batch, num_offsets, D, H, W)
+        targets: binary {0,1} same shape
+        mask: optional valid-region mask (batch, D, H, W)
+        """
+        # per-pixel BCE (numerically stable)
+        bce = F.binary_cross_entropy_with_logits(predictions, targets, reduction="none")
+        # p_t = exp(-bce) since bce = -log(p_t)
+        p_t = torch.exp(-bce)
+        focal_weight = (1.0 - p_t) ** self.gamma
+
+        # alpha factor: alpha for positives, (1-alpha) for negatives
+        alpha_factor = targets * self.alpha + (1.0 - targets) * (1.0 - self.alpha)
+
+        loss = alpha_factor * focal_weight * bce
+
+        # apply mask if provided
+        if mask is not None:
+            mask_expanded = mask.unsqueeze(1).expand_as(loss)
+            loss = loss * mask_expanded
+            num_valid = mask_expanded.sum()
+            if num_valid > 0:
+                loss = loss.sum() / num_valid
+            else:
+                loss = loss.sum()
+        else:
+            loss = loss.mean()
+
+        return loss
+
+
+class BoundaryWeightedAffinityFocalLoss(torch.nn.Module):
+    """
+    Boundary-weighted focal loss variant (applies focal loss per-pixel then weights by boundary map)
+    """
+
+    def __init__(
+        self,
+        boundary_weight=5.0,
+        sigma=5.0,
+        anisotropy=(1.0, 1.0, 1.0),
+        alpha=0.25,
+        gamma=2.0,
+        use_class_weights=True,
+        pos_weight=None,
+    ):
+        super(BoundaryWeightedAffinityFocalLoss, self).__init__()
+        self.boundary_weight = boundary_weight
+        self.sigma = sigma
+        self.anisotropy = anisotropy
+        self.alpha = float(alpha)
+        self.gamma = float(gamma)
+        self.use_class_weights = use_class_weights
+        self.pos_weight = pos_weight
+
+        if not HAS_EDT:
+            raise ImportError(
+                "edt package required for boundary-weighted loss. "
+                "Install with: pip install edt"
+            )
+
+    def forward(self, predictions, targets, instance_seg=None, mask=None):
+        batch_size = predictions.shape[0]
+
+        if instance_seg is None:
+            # fallback to focal affinity without boundary weighting
+            fallback = AffinityFocalLoss(alpha=self.alpha, gamma=self.gamma)
+            return fallback(predictions, targets, mask)
+
+        # Convert instance_seg to numpy if needed
+        if isinstance(instance_seg, torch.Tensor):
+            instance_seg_np = instance_seg.cpu().numpy()
+        else:
+            instance_seg_np = instance_seg
+
+        if instance_seg_np.ndim == 3:
+            instance_seg_np = instance_seg_np[np.newaxis, ...]
+
+        boundary_weights_list = []
+        for b in range(batch_size):
+            weights = compute_boundary_weights(
+                instance_seg_np[b],
+                boundary_weight=self.boundary_weight,
+                sigma=self.sigma,
+                anisotropy=self.anisotropy,
+                black_border=False,
+            )
+            boundary_weights_list.append(weights)
+
+        boundary_weights = np.stack(boundary_weights_list, axis=0)
+        boundary_weights = torch.from_numpy(boundary_weights).to(
+            predictions.device, dtype=predictions.dtype
+        )
+
+        boundary_weights = boundary_weights.unsqueeze(1).expand_as(predictions)
+
+        # compute focal per-pixel (without mask/weighting)
+        bce = F.binary_cross_entropy_with_logits(predictions, targets, reduction="none")
+        p_t = torch.exp(-bce)
+        focal_weight = (1.0 - p_t) ** self.gamma
+        alpha_factor = targets * self.alpha + (1.0 - targets) * (1.0 - self.alpha)
+        loss = alpha_factor * focal_weight * bce
+
+        # apply boundary weights
+        loss = loss * boundary_weights
+
+        # apply mask if provided
+        if mask is not None:
+            mask_expanded = mask.unsqueeze(1).expand_as(loss)
+            loss = loss * mask_expanded
+            weighted_valid = (boundary_weights * mask_expanded).sum()
+            if weighted_valid > 0:
+                loss = loss.sum() / weighted_valid
+            else:
+                loss = loss.sum()
+        else:
             loss = loss.sum() / boundary_weights.sum()
 
         return loss
@@ -901,34 +1011,269 @@ class AffinityLSDSLoss(torch.nn.Module):
         return total_loss
 
 
-# # Example usage and testing
-# if __name__ == "__main__":
-#     print("Testing affinity computation...")
+# --- Added: Boundary-weighted focal variant for combined LSDS + affinity loss ---
+class BoundaryWeightedAffinityFocalLSDSLoss(torch.nn.Module):
+    """
+    Combined LSDS MSE + boundary-weighted focal affinity loss.
 
-#     # Create a simple test instance segmentation
-#     instances = np.zeros((10, 10, 10), dtype=np.int32)
-#     instances[2:5, 2:5, 2:5] = 1  # First instance
-#     instances[6:9, 6:9, 6:9] = 2  # Second instance
+    This class mirrors AffinityLSDSLoss but replaces the affinity BCE term
+    with a boundary-weighted focal loss on affinity channels. Accepts an
+    additional `instance_seg` argument to compute boundary weights.
 
-#     print(f"Instance segmentation shape: {instances.shape}")
-#     print(f"Number of instances: {len(np.unique(instances)) - 1}")  # -1 for background
+    Parameters:
+    -----------
+    num_lsds : int
+        Number of LSDS channels (default 10)
+    boundary_weight, sigma, anisotropy : for boundary weighting (see compute_boundary_weights)
+    alpha, gamma : focal parameters
+    use_class_weights, pos_weight : class balancing (kept for API consistency)
+    lsds_weight, affinity_weight : component weights
+    """
 
-#     # Compute affinities
-#     affinities = compute_affinities_3d(instances)
-#     print(f"Affinities shape: {affinities.shape}")
-#     print(f"Affinity ranges: [{affinities.min()}, {affinities.max()}]")
+    def __init__(
+        self,
+        num_lsds=10,
+        boundary_weight=5.0,
+        sigma=5.0,
+        anisotropy=(1.0, 1.0, 1.0),
+        alpha=0.25,
+        gamma=2.0,
+        pos_weight=None,
+        lsds_weight=0.25,
+        affinity_weight=1.0,
+        mask_clip_distance=None,
+    ):
+        super(BoundaryWeightedAffinityFocalLSDSLoss, self).__init__()
+        self.num_lsds = num_lsds
+        self.boundary_weight = boundary_weight
+        self.sigma = sigma
+        self.anisotropy = anisotropy
+        self.alpha = float(alpha)
+        self.gamma = float(gamma)
+        self.pos_weight = pos_weight
+        self.lsds_weight = lsds_weight
+        self.affinity_weight = affinity_weight
+        self.mask_clip_distance = mask_clip_distance
 
-#     # Test with PyTorch
-#     instances_torch = torch.from_numpy(instances)
-#     affinities_torch = compute_affinities_3d(instances_torch)
-#     print(f"PyTorch affinities shape: {affinities_torch.shape}")
+        # MSE loss for LSDS
+        self.mse_loss = torch.nn.MSELoss(reduction="none")
 
-#     # Test loss
-#     predictions = torch.randn(2, 3, 10, 10, 10)  # batch=2, offsets=3
-#     targets = affinities_torch.unsqueeze(0).repeat(2, 1, 1, 1, 1)
+        if not HAS_EDT:
+            raise ImportError(
+                "edt package required for boundary-weighted loss. "
+                "Install with: pip install edt"
+            )
 
-#     loss_fn = AffinityLoss()
-#     loss = loss_fn(predictions, targets)
-#     print(f"Test loss: {loss.item():.4f}")
+    def erode_mask(self, mask: torch.Tensor, voxels: int) -> torch.Tensor:
+        """
+        Erode a 3D binary mask by `voxels` in all directions.
+        mask: (B, D, H, W) bool/0-1 tensor (on any device)
+        returns: (B, D, H, W) same dtype/device
+        """
+        if voxels is None or voxels <= 0:
+            return mask
+        # avg_pool3d equals fraction of ones in neighborhood; ==1 means all ones
+        k = 2 * voxels + 1
+        m = mask.float().unsqueeze(1)  # (B,1,D,H,W)
+        pooled = F.avg_pool3d(m, kernel_size=k, stride=1, padding=voxels)
+        eroded = (pooled == 1).squeeze(1)  # (B,D,H,W) bool
+        return eroded.to(mask.dtype)
 
-#     print("\n✓ All tests passed!")
+    def forward(self, predictions, targets, instance_seg=None, mask=None):
+        """
+        predictions : (batch, 10 + num_offsets, D, H, W)
+        targets     : same shape
+        instance_seg: (batch, D, H, W) or (D, H, W) numpy/torch for boundary weights
+        mask        : (batch, D, H, W) optional valid-region mask
+        """
+        # Split LSDS and affinities
+        pred_lsds = predictions[:, : self.num_lsds, ...]
+        pred_affs = predictions[:, self.num_lsds :, ...]
+        target_lsds = targets[:, : self.num_lsds, ...]
+        target_affs = targets[:, self.num_lsds :, ...]
+        if mask is None:
+            mask = torch.ones(
+                predictions.shape[0],
+                predictions.shape[2],
+                predictions.shape[3],
+                predictions.shape[4],
+                device=predictions.device,
+                dtype=predictions.dtype,
+            )
+        unclipped_mask = mask.clone().cpu().numpy()
+        if self.mask_clip_distance > 0 and mask is not None:
+            assert mask.ndim == 4, "mask must be (B,D,H,W)"
+            mask = self.erode_mask(mask, self.mask_clip_distance)
+        # LSDS MSE (same as AffinityLSDSLoss)
+        lsds_loss_per_pixel = self.mse_loss(torch.sigmoid(pred_lsds), target_lsds)
+        if mask is not None:
+            mask_expanded = mask.unsqueeze(1).expand_as(lsds_loss_per_pixel)
+            lsds_loss_per_pixel = lsds_loss_per_pixel * mask_expanded
+            num_valid = mask_expanded.sum()
+
+            if num_valid > 0:
+                lsds_loss = lsds_loss_per_pixel.sum() / num_valid
+            else:
+                lsds_loss = lsds_loss_per_pixel.sum()
+        else:
+            lsds_loss = lsds_loss_per_pixel.mean()
+
+        # Convert instance_seg to numpy if needed and ensure batch dim
+        if isinstance(instance_seg, torch.Tensor):
+            instance_seg_np = instance_seg.cpu().numpy()
+        else:
+            instance_seg_np = instance_seg
+
+        if instance_seg_np.ndim == 3:
+            instance_seg_np = instance_seg_np[np.newaxis, ...]
+
+        batch_size = pred_affs.shape[0]
+
+        # Compute boundary weights per volume
+        boundary_weights_list = []
+        for b in range(batch_size):
+            seg_b = instance_seg_np[b]
+            weights = compute_boundary_weights(
+                seg_b,
+                boundary_weight=self.boundary_weight,
+                sigma=self.sigma,
+                anisotropy=self.anisotropy,
+                mask=unclipped_mask[b],
+                black_border=False,
+            )
+            boundary_weights_list.append(weights)
+
+        boundary_weights = np.stack(boundary_weights_list, axis=0)  # (batch, D, H, W)
+        boundary_weights = torch.from_numpy(boundary_weights).to(
+            pred_affs.device, dtype=pred_affs.dtype
+        )
+        boundary_weights = boundary_weights.unsqueeze(1).expand_as(pred_affs)
+
+        # Compute focal BCE per-pixel (use same small smoothing for stability as AffinityLSDSLoss)
+        target_affs_smooth = target_affs * 0.96 + 0.02
+        logpt = -F.binary_cross_entropy_with_logits(
+            pred_affs, target_affs_smooth, reduction="none"
+        )
+        pt = torch.exp(logpt)  # = sigmoid(logits) mixed by targets
+        focal_weight = (1 - pt) ** self.gamma
+        alpha_factor = target_affs_smooth * self.alpha + (1 - target_affs_smooth) * (
+            1 - self.alpha
+        )
+        affinity_loss_per_pixel = (
+            -alpha_factor * focal_weight * logpt
+        )  # negative to make it positive
+
+        # Apply boundary weights
+        affinity_loss_per_pixel = affinity_loss_per_pixel * boundary_weights
+
+        # Apply mask if provided and normalize by weighted sum
+        if mask is not None:
+            mask_expanded_aff = mask.unsqueeze(1).expand_as(affinity_loss_per_pixel)
+            affinity_loss_per_pixel = affinity_loss_per_pixel * mask_expanded_aff
+            weighted_valid = (boundary_weights * mask_expanded_aff).sum()
+            if weighted_valid > 0:
+                affinity_loss = affinity_loss_per_pixel.sum() / weighted_valid
+            else:
+                affinity_loss = affinity_loss_per_pixel.sum()
+        else:
+            denom = boundary_weights.sum()
+            if denom > 0:
+                affinity_loss = affinity_loss_per_pixel.sum() / denom
+            else:
+                affinity_loss = affinity_loss_per_pixel.mean()
+        # save boundary_weights, masks, train_gt_volumes, pred_affs, target_affs, pred_lsds, target_lsds,mask,og_mask  to disk
+        # save_dir = "."
+        # import os
+
+        # np.savez_compressed(
+        #     os.path.join(save_dir, "training_data.npz"),
+        #     instance_seg=instance_seg_np,
+        #     boundary_weights=boundary_weights.cpu().numpy(),
+        #     masks=mask.cpu().numpy(),
+        #     pred_affs=pred_affs.detach().cpu().numpy(),
+        #     target_affs=target_affs.cpu().numpy(),
+        #     pred_lsds=pred_lsds.detach().cpu().numpy(),
+        #     target_lsds=target_lsds.cpu().numpy(),
+        #     og_mask=unclipped_mask,
+        # )
+        total_loss = self.lsds_weight * lsds_loss + self.affinity_weight * affinity_loss
+        # raise Exception("Stopping after saving training data for inspection.")
+        return total_loss
+
+
+# %%
+if __name__ == "__main__":
+    import numpy as np
+
+    training_data = np.load(
+        "/groups/cellmap/cellmap/ackermand/Programming/dinov3_playground/examples/training_data.npz"
+    )
+    instance_seg = training_data["instance_seg"]
+    boundary_weights = training_data["boundary_weights"]
+    masks = training_data["masks"]
+    pred_affs = training_data["pred_affs"]
+    target_affs = training_data["target_affs"]
+    pred_lsds = training_data["pred_lsds"]
+    target_lsds = training_data["target_lsds"]
+    og_mask = training_data["instance_seg"]
+
+    import matplotlib.pyplot as plt
+
+    # Visualize a slice of every type above
+    for batch in range(boundary_weights.shape[0]):
+        for slice_idx in range(0, boundary_weights.shape[2], 8):
+            fig, axes = plt.subplots(3, 3, figsize=(15, 15))
+            axes[0, 0].imshow(
+                boundary_weights[batch, 0, slice_idx], cmap="hot", interpolation="none"
+            )
+            axes[0, 0].set_title("Boundary Weights")
+            axes[0, 1].imshow(
+                masks[batch, slice_idx], cmap="gray", interpolation="none"
+            )
+            axes[0, 1].set_title("Mask")
+            axes[0, 2].imshow(
+                og_mask[batch, slice_idx], cmap="gray", interpolation="none"
+            )
+            axes[0, 2].set_title("Original Mask")
+            axes[1, 0].imshow(
+                pred_affs[batch, 0, slice_idx],
+                cmap="viridis",
+                vmin=0,
+                vmax=1,
+                interpolation="none",
+            )
+            axes[1, 0].set_title("Predicted Affinities")
+            axes[1, 1].imshow(
+                target_affs[batch, 1, slice_idx],
+                cmap="viridis",
+                vmin=0,
+                vmax=1,
+                interpolation="none",
+            )
+            axes[1, 1].set_title("Target Affinities")
+            axes[1, 2].imshow(
+                pred_lsds[batch, 0, slice_idx],
+                cmap="viridis",
+                vmin=0,
+                vmax=1,
+                interpolation="none",
+            )
+            axes[1, 2].set_title("Predicted LSDs")
+            axes[2, 0].imshow(
+                target_lsds[batch, 1, slice_idx],
+                cmap="viridis",
+                vmin=0,
+                vmax=1,
+                interpolation="none",
+            )
+            axes[2, 0].set_title("Target LSDs")
+            axes[2, 1].imshow(
+                instance_seg[batch, slice_idx], cmap="tab20", interpolation="none"
+            )
+            axes[2, 1].set_title("Instance Segmentation")
+            axes[2, 2].axis("off")
+            for ax in axes.flatten():
+                ax.axis("off")
+            plt.tight_layout()
+
+# %%
