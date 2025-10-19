@@ -1059,6 +1059,7 @@ def load_random_3d_training_data(
     augment=False,  # If True, apply random augmentations to raw (and context) data
     augment_prob=0.5,  # Per-volume probability to apply augmentation
     augment_params=None,  # Optional dict to control augmentation distributions
+    min_ground_truth_fraction=0.0,  # NEW: Minimum fraction of GT out of total volume size
 ):
     """
     Load random 3D volumes from multiple datasets for 3D UNet training.
@@ -1790,6 +1791,14 @@ def load_random_3d_training_data(
             if total_label_fraction < min_label_fraction:
                 print(
                     f"  Dataset {dataset_idx}: label fraction {total_label_fraction:.3f} too low within valid GT regions"
+                )
+                continue
+
+            # NEW: Check minimum ground truth fraction out of total volume size
+            gt_fraction_of_total = valid_gt_voxels / np.prod(volume_shape)
+            if gt_fraction_of_total < min_ground_truth_fraction:
+                print(
+                    f"  Dataset {dataset_idx}: ground truth fraction {gt_fraction_of_total:.3f} below min_ground_truth_fraction {min_ground_truth_fraction} - skipping"
                 )
                 continue
 
