@@ -28,7 +28,10 @@ from .dinov3_core import (
     apply_normalization_stats,
     output_channels,
 )
-from .tensorboard_helpers import create_and_log_validation_video_fast
+from .tensorboard_helpers import (
+    log_multi_volume_grid_to_tensorboard,
+    log_validation_losses_to_tensorboard,
+)
 
 # Handle both relative and absolute imports
 try:
@@ -2487,25 +2490,23 @@ def train_3d_unet_memory_efficient_v2(
                 total_val_dinov3_time = 0.0
                 total_val_inference_time = 0.0
 
+                # Initialize collection lists before validation loop
+                all_vol_data = []
+                val_loss_per_crop = []
+
                 # Process each validation volume independently
                 for vol_idx in range(len(val_raws)):
                     # TIMING: Start DINOv3 validation feature extraction
                     val_dinov3_start = time.time()
 
-                    # Extract features for single volume (keeps GPU memory minimal)
-                    single_vol = np.array(
-                        [val_raws[vol_idx]]
-                    )  # Convert to numpy array with batch dimension
-
-                    # Get context volume if available
+                    # Extract features for single volume
+                    single_vol = np.array([val_raws[vol_idx]])
                     single_context = None
                     if val_context is not None:
                         single_context = np.array([val_context[vol_idx]])
 
-                    # Extract features with detailed timing for first validation volume
-                    if (
-                        vol_idx == 0
-                    ):  # Only get detailed timing for first volume to avoid spam
+                    # Extract features
+                    if vol_idx == 0:
                         result = data_loader_3d.extract_multi_scale_dinov3_features_3d(
                             single_vol,
                             single_context,
@@ -2526,21 +2527,17 @@ def train_3d_unet_memory_efficient_v2(
                             )
                         )
 
-                    # TIMING: End DINOv3 validation feature extraction
                     val_dinov3_end = time.time()
                     val_dinov3_time = val_dinov3_end - val_dinov3_start
 
-                    # Get ground truth and mask for this volume and move to GPU
-                    # Handle both label and affinity formats
+                    # Get ground truth and mask for this volume
                     if data_loader_3d.output_type in ["affinities", "affinities_lsds"]:
-                        # Affinities/LSDs are float32: (1, num_channels, D, H, W)
                         current_val_targets = (
                             torch.tensor(val_targets[vol_idx], dtype=torch.float32)
                             .unsqueeze(0)
                             .to(device)
                         )
                     else:
-                        # Class labels are long: (1, D, H, W)
                         current_val_targets = (
                             torch.tensor(val_targets[vol_idx], dtype=torch.long)
                             .unsqueeze(0)
@@ -2553,7 +2550,6 @@ def train_3d_unet_memory_efficient_v2(
                         .to(device)
                     )
 
-                    # Check if masks are actually being used (not all 1s)
                     use_vol_masks = not torch.all(current_val_mask == 1.0)
 
                     # TIMING: Start validation inference
@@ -2565,15 +2561,13 @@ def train_3d_unet_memory_efficient_v2(
                             device_type="cuda" if device.type == "cuda" else "cpu",
                             enabled=False,
                         ):
-                            # Pass raw and context features separately for proper fusion
-                            vol_logits = unet3d(
+                            current_val_logits = unet3d(
                                 vol_features, context_features=vol_context_features
                             )
                             if use_vol_masks:
-                                # Apply masks to validation loss calculation
                                 if loss_type in ["ce", "weighted_ce", "focal"]:
                                     vol_per_pixel_loss = F.cross_entropy(
-                                        vol_logits,
+                                        current_val_logits,
                                         current_val_targets,
                                         reduction="none",
                                         weight=loss_class_weights,
@@ -2588,7 +2582,7 @@ def train_3d_unet_memory_efficient_v2(
                                     vol_masked_loss = (
                                         vol_per_pixel_loss * current_val_mask
                                     )
-                                    vol_loss = (
+                                    current_val_loss = (
                                         vol_masked_loss.sum() / current_val_mask.sum()
                                     ).item()
                                 elif loss_type in [
@@ -2596,20 +2590,17 @@ def train_3d_unet_memory_efficient_v2(
                                     "boundary_affinity",
                                     "boundary_affinity_focal_lsds",
                                 ]:
-                                    # Affinity losses handle masking internally
-                                    vol_loss = compute_loss(
+                                    current_val_loss = compute_loss(
                                         criterion,
-                                        vol_logits,
+                                        current_val_logits,
                                         current_val_targets,
                                         masks=current_val_mask,
-                                        instance_seg=val_segmentations[
-                                            vol_idx
-                                        ],  # Original instance seg
+                                        instance_seg=val_segmentations[vol_idx],
                                     ).item()
                                 else:
-                                    vol_loss = compute_loss(
+                                    current_val_loss = compute_loss(
                                         criterion,
-                                        vol_logits,
+                                        current_val_logits,
                                         current_val_targets,
                                         masks=current_val_mask,
                                         instance_seg=(
@@ -2623,14 +2614,13 @@ def train_3d_unet_memory_efficient_v2(
                                         ),
                                     ).item()
                             else:
-                                # Use standard loss when no masking needed
-                                vol_loss = compute_loss(
+                                current_val_loss = compute_loss(
                                     criterion,
-                                    vol_logits,
+                                    current_val_logits,
                                     current_val_targets,
                                     masks=None,
                                     instance_seg=(
-                                        train_segmentations
+                                        val_segmentations[vol_idx]
                                         if loss_type
                                         in [
                                             "boundary_affinity",
@@ -2639,231 +2629,132 @@ def train_3d_unet_memory_efficient_v2(
                                         else None
                                     ),
                                 ).item()
-                    # else:
-                    #     # Pass raw and context features separately for proper fusion
-                    #     vol_logits = unet3d(
-                    #         vol_features, context_features=vol_context_features
-                    #     )
-                    #     if use_vol_masks:
-                    #         # Apply masks to validation loss calculation
-                    #         if loss_type in ["ce", "weighted_ce", "focal"]:
-                    #             vol_per_pixel_loss = F.cross_entropy(
-                    #                 vol_logits,
-                    #                 vol_gt,
-                    #                 reduction="none",
-                    #                 weight=loss_class_weights,
-                    #             )
-                    #             if loss_type == "focal":
-                    #                 p_t = torch.exp(-vol_per_pixel_loss)
-                    #                 focal_weight = (1 - p_t) ** focal_gamma
-                    #                 vol_per_pixel_loss = (
-                    #                     focal_weight * vol_per_pixel_loss
-                    #                 )
 
-                    #             vol_masked_loss = vol_per_pixel_loss * vol_mask
-                    #             vol_loss = (
-                    #                 vol_masked_loss.sum() / vol_mask.sum()
-                    #             ).item()
-                    #         elif loss_type in ["affinity", "boundary_affinity"]:
-                    #             # Affinity losses handle masking internally
-                    #             vol_loss = compute_loss(
-                    #                 criterion,
-                    #                 vol_logits,
-                    #                 vol_gt,
-                    #                 masks=vol_mask,
-                    #                 instance_seg=val_gt_volume,  # Original instance seg
-                    #             ).item()
-                    #         else:
-                    #             vol_loss = compute_loss(
-                    #                 criterion,
-                    #                 vol_logits,
-                    #                 vol_gt,
-                    #                 masks=vol_mask,
-                    #                 instance_seg=(
-                    #                     val_gt_volume
-                    #                     if loss_type == "boundary_affinity"
-                    #                     else None
-                    #                 ),
-                    #             ).item()
-                    #     else:
-                    #         # Use standard loss when no masking needed
-                    #         vol_loss = compute_loss(
-                    #             criterion,
-                    #             vol_logits,
-                    #             vol_gt,
-                    #             masks=None,
-                    #             instance_seg=(
-                    #                 val_gt_volume
-                    #                 if loss_type == "boundary_affinity"
-                    #                 else None
-                    #             ),
-                    #         ).item()
-
-                    # TIMING: End validation inference
                     val_inference_end = time.time()
                     val_inference_time = val_inference_end - val_inference_start
 
-                    # Accumulate validation timing
+                    # Accumulate timing
                     total_val_dinov3_time += val_dinov3_time
                     total_val_inference_time += val_inference_time
 
                     # Convert to predictions
                     if data_loader_3d.output_type == "affinities":
-                        # For affinities: apply sigmoid and threshold at 0.5
-                        vol_predictions = (
-                            torch.sigmoid(vol_logits.float()) > 0.5
+                        current_val_predictions = (
+                            torch.sigmoid(current_val_logits.float()) > 0.5
                         ).float()
+                        vol_gt = current_val_targets
                     elif data_loader_3d.output_type == "affinities_lsds":
-                        # For affinities+LSDs: don't compute predictions (use loss as metric)
-                        vol_predictions = None
+                        current_val_predictions = torch.sigmoid(
+                            current_val_logits.float()
+                        )  # Keep as probabilities
+                        vol_gt = current_val_targets
                     else:
-                        # For class labels: use argmax
-                        vol_predictions = torch.argmax(vol_logits.float(), dim=1)
+                        current_val_predictions = torch.argmax(
+                            current_val_logits.float(), dim=1
+                        )
+                        vol_gt = current_val_targets.squeeze(0)
+
+                    # Store volume data for combined visualization
+                    all_vol_data.append(
+                        {
+                            "vol_idx": vol_idx,
+                            "vol_raw": val_raws[vol_idx],
+                            "vol_seg": (
+                                val_segmentations[vol_idx]
+                                if val_segmentations is not None
+                                else None
+                            ),
+                            "vol_mask": val_masks[vol_idx],
+                            "vol_targets": current_val_targets.cpu(),
+                            "vol_predictions": current_val_predictions.cpu(),
+                            "vol_loss": current_val_loss,
+                        }
+                    )
+                    val_loss_per_crop.append(current_val_loss)
 
                     # Accumulate basic metrics (conditional on mask usage)
                     if data_loader_3d.output_type == "affinities":
-                        # For affinities, expand mask to match affinity dimensions
                         if use_vol_masks:
                             vol_mask_expanded = (
                                 current_val_mask.unsqueeze(1)
-                                .expand_as(vol_predictions)
+                                .expand_as(current_val_predictions)
                                 .bool()
                             )
                             vol_correct = (
-                                ((vol_predictions == vol_gt) & vol_mask_expanded)
+                                (
+                                    (current_val_predictions == vol_gt)
+                                    & vol_mask_expanded
+                                )
                                 .sum()
                                 .item()
                             )
                             vol_valid_voxels = vol_mask_expanded.sum().item()
                         else:
-                            vol_correct = (vol_predictions == vol_gt).sum().item()
+                            vol_correct = (
+                                (current_val_predictions == vol_gt).sum().item()
+                            )
                             vol_valid_voxels = vol_gt.numel()
                     elif data_loader_3d.output_type == "affinities_lsds":
-                        # For affinities+LSDs: don't compute accuracy (use loss only)
                         vol_correct = 0
-                        vol_valid_voxels = 1  # Avoid division by zero
+                        vol_valid_voxels = 1
                     else:
-                        # For class labels
                         if use_vol_masks:
-                            # Only for masked regions
                             vol_mask_bool = current_val_mask.bool()
                             vol_correct = (
-                                ((vol_predictions == vol_gt) & vol_mask_bool)
+                                ((current_val_predictions == vol_gt) & vol_mask_bool)
                                 .sum()
                                 .item()
                             )
                             vol_valid_voxels = current_val_mask.sum().item()
                         else:
-                            # All regions when no masking
-                            vol_correct = (vol_predictions == vol_gt).sum().item()
+                            vol_correct = (
+                                (current_val_predictions == vol_gt).sum().item()
+                            )
                             vol_valid_voxels = vol_gt.numel()
 
-                    val_total_loss += vol_loss * vol_valid_voxels
+                    val_total_loss += current_val_loss * vol_valid_voxels
                     val_total_correct += vol_correct
                     val_total_voxels += vol_valid_voxels
 
-                    # Accumulate per-class metrics (convert to CPU for efficiency, conditional on mask usage)
-                    # Skip per-class metrics for affinity and affinity_lsds outputs
+                    # Accumulate per-class metrics
                     if data_loader_3d.output_type not in [
                         "affinities",
                         "affinities_lsds",
                     ]:
                         vol_gt_cpu = vol_gt.cpu().numpy()
-                        vol_pred_cpu = vol_predictions.cpu().numpy()
+                        vol_pred_cpu = current_val_predictions.cpu().numpy()
 
                         if use_vol_masks:
                             vol_mask_cpu = current_val_mask.cpu().numpy().astype(bool)
                         else:
-                            # Create a full mask when no masking is needed
                             vol_mask_cpu = np.ones_like(vol_gt_cpu, dtype=bool)
 
                         for class_id in range(num_classes):
-                            # For confusion matrix, we need to consider the valid region
                             valid_gt_mask = (vol_gt_cpu == class_id) & vol_mask_cpu
                             valid_not_gt_mask = (vol_gt_cpu != class_id) & vol_mask_cpu
                             valid_pred_mask = (vol_pred_cpu == class_id) & vol_mask_cpu
 
-                            # Confusion matrix components (only in valid regions)
                             true_positives = np.sum(valid_gt_mask & valid_pred_mask)
                             false_positives = np.sum(
                                 valid_not_gt_mask & valid_pred_mask
                             )
                             false_negatives = np.sum(valid_gt_mask & ~valid_pred_mask)
 
-                            # Accumulate
                             val_class_true_positives[class_id] += true_positives
                             val_class_false_positives[class_id] += false_positives
                             val_class_false_negatives[class_id] += false_negatives
                             val_class_total_gt[class_id] += np.sum(valid_gt_mask)
                             val_class_total_pred[class_id] += np.sum(valid_pred_mask)
 
-                    try:
-                        # Convert CPU arrays for inputs
-                        vol_raw_np = val_raws[vol_idx] if val_raws is not None else None
-                        vol_seg_np = (
-                            val_segmentations[vol_idx]
-                            if val_segmentations is not None
-                            else None
-                        )
-                        vol_mask_np = (
-                            val_masks[vol_idx] if val_masks is not None else None
-                        )
-
-                        # current_val_targets is a tensor on device; convert to numpy on CPU
-                        if isinstance(current_val_targets, torch.Tensor):
-                            try:
-                                tgt_np = current_val_targets.squeeze(0).cpu().numpy()
-                            except Exception:
-                                tgt_np = None
-                        else:
-                            tgt_np = current_val_targets
-
-                        if data_loader_3d.output_type in [
-                            "affinities",
-                            "affinities_lsds",
-                        ]:
-                            vol_predictions = torch.sigmoid(vol_logits)
-                        # vol_predictions may be tensor; convert to numpy
-                        if (
-                            "vol_predictions" in locals()
-                            and vol_predictions is not None
-                        ):
-                            try:
-                                pred_np = vol_predictions.squeeze(0).cpu().numpy()
-                            except Exception:
-                                pred_np = None
-                        else:
-                            pred_np = None
-
-                        # Call helper to build gif and log it
-                        t0 = time.time()
-                        create_and_log_validation_video_fast(
-                            writer=writer,
-                            vol_idx=vol_idx,
-                            vol_raw=vol_raw_np,
-                            vol_seg=vol_seg_np,
-                            vol_mask=vol_mask_np,
-                            vol_targets=tgt_np,
-                            vol_predictions=pred_np,
-                            epoch_step=epoch,
-                            tag_prefix="validation",
-                            fps=4,
-                        )
-                        # Also log per-volume loss to tensorboard
-                        writer.add_scalar(
-                            f"validation/volume_{vol_idx}_loss", vol_loss, epoch
-                        )
-                        print(time.time() - t0)
-                    except Exception as e:
-                        print(
-                            f"Warning: failed to create/log validation gif for vol {vol_idx}: {e}"
-                        )
-                    # --- END NEW GIF LOGGING ---
-
-                    # Immediately free GPU memory for this volume
-                    del vol_features, vol_logits, current_val_mask
+                    # Free GPU memory
+                    del (
+                        vol_features,
+                        current_val_logits,
+                        current_val_mask,
+                        current_val_targets,
+                    )
                     if "vol_predictions" in locals():
-                        del vol_predictions
+                        del current_val_predictions
                     if vol_context_features is not None:
                         del vol_context_features
                     if "single_vol" in locals():
@@ -2878,6 +2769,20 @@ def train_3d_unet_memory_efficient_v2(
                 # Calculate final validation metrics from accumulated values
                 val_loss = val_total_loss / val_total_voxels
                 val_acc = val_total_correct / val_total_voxels
+                try:
+
+                    # Create combined video and snapshot
+                    log_validation_losses_to_tensorboard(
+                        writer=writer,
+                        epoch=epoch,
+                        train_loss=train_loss,
+                        val_loss_overall=val_loss,
+                        val_loss_per_crop=val_loss_per_crop,
+                    )
+                except Exception as e:
+                    print(
+                        f"Warning: failed to create combined validation visualizations: {e}"
+                    )
 
                 # TIMING: Print validation timing summary
                 total_val_time = total_val_dinov3_time + total_val_inference_time
@@ -2906,6 +2811,7 @@ def train_3d_unet_memory_efficient_v2(
                     f"    Total UNet inference:     {total_val_inference_time:.3f}s ({val_inference_pct:.1f}%) - Avg: {avg_val_inference_time:.3f}s/vol"
                 )
                 print(f"    Total validation time:    {total_val_time:.3f}s")
+                print(f"    TensorBoard logs will be written to: {tb_log_dir}")
 
                 # Print detailed DINOv3 breakdown if available (from first validation volume)
                 if "val_detailed_timing" in locals() and val_detailed_timing:
@@ -3229,6 +3135,26 @@ def train_3d_unet_memory_efficient_v2(
                 pickle.dump(stats_data, f)
 
             # Save full model checkpoint if this is the best performance
+            if is_best_model or (
+                checkpoint_every_n_epochs is not None
+                and (epoch + 1) % checkpoint_every_n_epochs == 0
+            ):
+                try:
+                    log_multi_volume_grid_to_tensorboard(
+                        writer=writer,
+                        all_vol_data=all_vol_data,
+                        epoch_step=epoch,
+                        tag_prefix="validation",
+                        fps=4,
+                        scale_up=1,
+                        show_seg_column=True,
+                        show_mask_column=True,
+                        save_gif_every=0,  # Set to non-zero if you want periodic GIF saves
+                    )
+                except Exception as e:
+                    print(
+                        f"Warning: failed to log multi-volume grid to TensorBoard: {e}"
+                    )
             if is_best_model:
                 checkpoint_data = {
                     **stats_data,
