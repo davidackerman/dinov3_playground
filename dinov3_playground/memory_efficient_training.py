@@ -36,11 +36,15 @@ from .tensorboard_helpers import (
 # Handle both relative and absolute imports
 try:
     from .data_processing import sample_training_data
-    from .models import ImprovedClassifier, SimpleClassifier
+    from .models import ImprovedClassifier, SimpleClassifier, DINOv3UNet3DPipeline
     from .model_training import balance_classes
 except ImportError:
     from dinov3_playground.data_processing import sample_training_data
-    from dinov3_playground.models import ImprovedClassifier, SimpleClassifier
+    from dinov3_playground.models import (
+        ImprovedClassifier,
+        SimpleClassifier,
+        DINOv3UNet3DPipeline,
+    )
     from dinov3_playground.model_training import balance_classes
 from torch.amp import autocast  # Updated import
 from torch.cuda.amp import GradScaler  # Keep GradScaler from cuda.amp
@@ -50,7 +54,6 @@ import pickle
 import glob
 import os
 from datetime import datetime
-
 
 # NEW IMPORTS FOR TENSORBOARD + GIF CREATION
 from torch.utils.tensorboard import SummaryWriter
@@ -157,6 +160,7 @@ class MemoryEfficientDataLoader3D:
         output_type="labels",  # NEW PARAMETER: "labels", "affinities", or "affinities_lsds"
         affinity_offsets=None,  # NEW PARAMETER: list of (z,y,x) offsets for affinities
         lsds_sigma=20.0,  # NEW PARAMETER: sigma for LSDS computation
+        use_anyup=False,  # NEW PARAMETER: use AnyUp for upsampling DINOv2 features
     ):
         """
         Initialize memory-efficient 3D data loader.
@@ -206,6 +210,9 @@ class MemoryEfficientDataLoader3D:
         lsds_sigma : float, default=20.0
             Sigma parameter for LSDS computation (only used when output_type="affinities_lsds").
             Controls the smoothing scale for Local Shape Descriptors.
+        use_anyup : bool, default=False
+            If True, uses AnyUp model for upsampling DINOv2 features instead of interpolation.
+            Provides higher quality upsampling by using both high-res images and low-res features.
         """
 
         # Validate inputs with ROI-level padding support
@@ -309,6 +316,14 @@ class MemoryEfficientDataLoader3D:
         self.use_orthogonal_planes = (
             use_orthogonal_planes  # Store orthogonal planes mode
         )
+        self.use_anyup = use_anyup  # Store AnyUp upsampling mode
+
+        # Print AnyUp status
+        if self.use_anyup:
+            print("  - AnyUp: Enabled for high-quality feature upsampling")
+        else:
+            print("  - AnyUp: Disabled, using interpolation for upsampling")
+
         self.verbose = verbose  # Store verbose output mode
 
         # Handle affinity output
@@ -398,10 +413,10 @@ class MemoryEfficientDataLoader3D:
         Returns:
         --------
         tuple: (batch_volumes, batch_gt, batch_masks, batch_context)
-               - batch_volumes: shape (batch_size, D, H, W)
-               - batch_gt: shape (batch_size, D, H, W) for labels or (batch_size, num_offsets, D, H, W) for affinities
-               - batch_masks: shape (batch_size, D, H, W)
-               - batch_context: None or shape (batch_size, D, H, W)
+                - batch_volumes: shape (batch_size, D, H, W)
+                - batch_gt: shape (batch_size, D, H, W) for labels or (batch_size, num_offsets, D, H, W) for affinities
+                - batch_masks: shape (batch_size, D, H, W)
+                - batch_context: None or shape (batch_size, D, H, W)
         """
         # Sample random volumes from training pool
         sampled_indices = self.rng.choice(
@@ -458,12 +473,12 @@ class MemoryEfficientDataLoader3D:
         Returns:
         --------
         tuple: (val_volumes, val_gt, val_masks, val_context)
-               - val_volumes: shape (val_pool_size, D, H, W)
-               - val_gt: shape (val_pool_size, D, H, W) for labels,
-                         (val_pool_size, num_offsets, D, H, W) for affinities,
-                         or (val_pool_size, 10 + num_offsets, D, H, W) for affinities_lsds
-               - val_masks: shape (val_pool_size, D, H, W)
-               - val_context: None or shape (val_pool_size, D, H, W)
+                - val_volumes: shape (val_pool_size, D, H, W)
+                - val_gt: shape (val_pool_size, D, H, W) for labels,
+                            (val_pool_size, num_offsets, D, H, W) for affinities,
+                            or (val_pool_size, 10 + num_offsets, D, H, W) for affinities_lsds
+                - val_masks: shape (val_pool_size, D, H, W)
+                - val_context: None or shape (val_pool_size, D, H, W)
         """
         val_volumes = self.raw_data[self.val_indices]
         val_gt = self.gt_data[self.val_indices]
@@ -510,53 +525,40 @@ class MemoryEfficientDataLoader3D:
         self, volumes, epoch=None, batch=None, enable_detailed_timing=False
     ):
         """
-        Extract DINOv3 features from 3D volumes by processing slices.
-        Uses orthogonal planes if enabled.
+        Extract DINOv3 features from 3D volumes.
         """
-        from .models import DINOv3UNet3DPipeline
-        from .dinov3_core import get_current_model_info
+        import torch
+        import time
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        if volumes.ndim == 3:
-            volumes = volumes[np.newaxis, ...]
-
-        batch_size, depth, height, width = volumes.shape
-
-        # Get current model info to determine output channels
-        model_info = get_current_model_info()
-        current_output_channels = model_info["output_channels"]
-
-        # Create a temporary pipeline instance for feature extraction
-        temp_pipeline = DINOv3UNet3DPipeline(
-            num_classes=2,  # Dummy value, only using for feature extraction
-            input_size=self.target_volume_size,
-            dinov3_slice_size=self.dinov3_slice_size,
-            base_channels=32,  # Dummy value
-            input_channels=current_output_channels,
-            use_orthogonal_planes=self.use_orthogonal_planes,
-            device=device,
-            verbose=self.verbose,  # Pass verbose flag to suppress messages
-        )
-
-        # GPU-accelerated batch processing optimization
-        import time
-
+        batch_size = len(volumes)
         batch_processing_start = time.time()
 
-        # Simple GPU-optimized stacking - no complex batch processing
-        # Pre-allocate GPU tensor for batch features to avoid repeated memory allocation
-        expected_shape = (
-            batch_size,
-            current_output_channels,
-            *self.target_volume_size,
+        # Initialize pipeline with use_anyup parameter
+        temp_pipeline = DINOv3UNet3DPipeline(
+            input_size=self.target_volume_size,
+            dinov3_slice_size=self.dinov3_slice_size,
+            device=device,
+            use_orthogonal_planes=self.use_orthogonal_planes,
+            use_anyup=self.use_anyup,
         )
-        batch_features = torch.zeros(expected_shape, device=device, dtype=torch.float32)
 
-        # Process each volume through the pipeline's feature extractor
-        # with GPU-optimized direct assignment instead of list append + stack
+        # Pre-allocate output tensor on GPU
+        from .dinov3_core import get_current_model_info
+
+        model_info = get_current_model_info()
+        output_channels = model_info["output_channels"]
+        batch_features = torch.zeros(
+            (batch_size, output_channels, *self.target_volume_size),
+            device=device,
+            dtype=torch.float32,
+        )
+
+        detailed_timing = {}
+
+        # Process each volume in the batch
         for b in range(batch_size):
-            # Extract a single volume
             single_volume = volumes[b : b + 1]  # Keep batch dimension
 
             # Use the pipeline's orthogonal feature extraction
@@ -3498,8 +3500,8 @@ def train_3d_unet_with_memory_efficient_loader(
     learn_upsampling=False,  # NEW PARAMETER
     dinov3_stride=None,  # NEW PARAMETER for sliding window inference
     use_orthogonal_planes=False,  # NEW PARAMETER for orthogonal plane processing
-    enable_detailed_timing=True,  # NEW PARAMETER for detailed timing
-    verbose=True,  # NEW PARAMETER to control verbose output
+    enable_detailed_timing=False,  # NEW PARAMETER for detailed timing
+    verbose=False,  # NEW PARAMETER to control verbose output
     # DATA RESOLUTION PARAMETERS
     min_resolution_for_raw=None,  # NEW PARAMETER for raw data resolution
     base_resolution=None,  # NEW PARAMETER for ground truth resolution
@@ -3521,6 +3523,7 @@ def train_3d_unet_with_memory_efficient_loader(
     lsds_sigma=20.0,  # Sigma parameter for LSDS computation (only used when output_type='affinities_lsds')
     use_batchrenorm=False,  # Whether to use BatchRenorm instead of BatchNorm (more stable for small batches
     mask_clip_distance=None,
+    use_anyup=False,
 ):
     """
     Memory-efficient 3D UNet training with multiple precision and memory optimization options.
@@ -3706,10 +3709,12 @@ def train_3d_unet_with_memory_efficient_loader(
         learn_upsampling=learn_upsampling,
         dinov3_stride=dinov3_stride,  # NEW: Sliding window parameter
         use_orthogonal_planes=use_orthogonal_planes,  # NEW: Orthogonal planes parameter
+        enable_detailed_timing=enable_detailed_timing,  # NEW: Detailed timing parameter
         verbose=verbose,  # NEW: Verbose output parameter
         output_type=output_type,  # NEW: Output type (labels or affinities or affinities_lsds)
         affinity_offsets=affinity_offsets,  # NEW: Affinity offsets
         lsds_sigma=lsds_sigma,  # NEW: LSDS sigma parameter
+        use_anyup=use_anyup,
     )
 
     print("Data loader created successfully!")

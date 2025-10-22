@@ -894,7 +894,6 @@ class DINOv3UNet3D(nn.Module):
             nn.Dropout3d(0.1),
         )
 
-
     def _make_upsampling_layers(self):
         """Create learned upsampling layers to bring DINOv3 features to target resolution."""
         layers = []
@@ -1255,6 +1254,8 @@ class DINOv3UNet3DPipeline(nn.Module):
         device=None,
         verbose=True,  # Control verbose output
         use_batchrenorm=False,
+        use_anyup=False,  # NEW: Use AnyUp for upsampling features
+        anyup_batch_size=16,
     ):
         """
         Initialize the complete 3D DINOv3-UNet pipeline.
@@ -1276,6 +1277,8 @@ class DINOv3UNet3DPipeline(nn.Module):
             If False, processes only XY planes (original behavior).
         device : torch.device, optional
             Device for processing
+        use_anyup : bool, default=False
+            If True, uses AnyUp model for upsampling DINOv2 features instead of interpolation.
         """
         super(DINOv3UNet3DPipeline, self).__init__()
 
@@ -1288,9 +1291,15 @@ class DINOv3UNet3DPipeline(nn.Module):
                 f"DINOv3UNet3DPipeline initialized with dinov3_slice_size: {self.dinov3_slice_size}"
             )
         self.use_orthogonal_planes = use_orthogonal_planes
+        # Initialize AnyUp model if requested
+        self.use_anyup = use_anyup
+        self.anyup_model = None
         self.device = device or torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
         )
+        self.anyup_batch_size = anyup_batch_size
+        if self.use_anyup:
+            self._initialize_anyup()
 
         # Determine input channels (DINOv3 feature channels)
         if input_channels is None:
@@ -1300,14 +1309,20 @@ class DINOv3UNet3DPipeline(nn.Module):
             model_info = get_current_model_info()
             input_channels = model_info["output_channels"]
 
-        # # 3D UNet for processing DINOv3 features
-        # self.unet3d = DINOv3UNet3D(
-        #     input_channels=input_channels,
-        #     num_classes=num_classes,
-        #     base_channels=base_channels,
-        #     input_size=input_size,
-        #     use_batchrenorm=use_batchrenorm,
-        # )
+    def _initialize_anyup(self):
+        """Initialize the AnyUp upsampling model."""
+        import torch
+
+        try:
+            self.anyup_model = torch.hub.load("wimmerth/anyup", "anyup")
+            self.anyup_model = self.anyup_model.to(self.device).eval()
+            if self.verbose:
+                print("✓ AnyUp model initialized successfully")
+        except Exception as e:
+            print(f"Warning: Failed to load AnyUp model: {e}")
+            print("Falling back to interpolation upsampling")
+            self.use_anyup = False
+            self.anyup_model = None
 
     def extract_dinov3_features_3d_batch(
         self,
@@ -2124,6 +2139,9 @@ class DINOv3UNet3DPipeline(nn.Module):
         """
         Process multiple slices in batches for efficiency.
 
+        NOW WITH ANYUP SUPPORT: When self.use_anyup is True, uses AnyUp for upsampling
+        DINOv2 features instead of bilinear interpolation.
+
         Parameters:
         -----------
         all_slices : list
@@ -2143,6 +2161,8 @@ class DINOv3UNet3DPipeline(nn.Module):
         from skimage.transform import resize
         import torch.nn.functional as F
         import time
+        import torch
+        import gc
 
         all_features = []
         num_slices = len(all_slices)
@@ -2155,6 +2175,7 @@ class DINOv3UNet3DPipeline(nn.Module):
                 "total_dinov3_inference_time": 0.0,
                 "total_feature_extraction_time": 0.0,
                 "total_downsampling_time": 0.0,
+                "total_anyup_time": 0.0,  # NEW: Track AnyUp time
                 "num_batches": 0,
                 "avg_batch_size": 0.0,
             }
@@ -2242,9 +2263,7 @@ class DINOv3UNet3DPipeline(nn.Module):
                 dinov3_start = time.time()
 
             # Process entire batch through DINOv3
-            batch_features = process(
-                batch_array
-            )  # (output_channels, batch_size, H_feat, W_feat)
+            batch_features, high_res_images = process(batch_array, return_images=True)
 
             # TIMING: End DINOv3 inference, start feature extraction
             if enable_timing:
@@ -2284,51 +2303,165 @@ class DINOv3UNet3DPipeline(nn.Module):
 
             # Process each dimension group in batch
             slice_results = [None] * len(batch_slices)
-            for (target_dim1, target_dim2), indices in dim_groups.items():
-                if len(indices) > 1:
-                    # Multiple slices with same target dimensions - batch process
-                    group_features = batch_features_tensor[
-                        indices
-                    ]  # (group_size, output_channels, H_feat, W_feat)
-                    group_resized = F.interpolate(
-                        group_features,
-                        size=(target_dim1, target_dim2),
-                        mode="bilinear",
-                        align_corners=False,
+
+            # ============ ANYUP INTEGRATION HERE ============
+            if self.use_anyup and self.anyup_model is not None:
+                # Use AnyUp for upsampling instead of interpolation
+                anyup_start = time.time() if enable_timing else None
+
+                # Prepare high-res images for AnyUp
+                # batch_array shape: (batch_size, H, W) - the original upsampled images
+                # Convert to torch tensor
+                # high_res_images = torch.from_numpy(batch_array).float()
+
+                # Ensure on correct device
+                # device = self.device
+                # high_res_images = high_res_images.to(device)
+                device = self.device
+
+                # Add channel dimension and ensure RGB (3 channels)
+                if high_res_images.dim() == 3:  # (B, H, W)
+                    high_res_images = high_res_images.unsqueeze(1)  # (B, 1, H, W)
+
+                # Normalize to [0, 1] if needed
+                if high_res_images.max() > 1.0:
+                    high_res_images = high_res_images / 255.0
+
+                # Convert grayscale to RGB for AnyUp
+                if high_res_images.shape[1] == 1:
+                    high_res_images = high_res_images.repeat(1, 3, 1, 1)
+
+                # Process each dimension group with AnyUp in sub-batches
+                for (target_dim1, target_dim2), indices in dim_groups.items():
+                    for (target_dim1, target_dim2), indices in dim_groups.items():
+                        # Get features for this group
+                        group_features = batch_features_tensor[
+                            indices
+                        ]  # (group_size, C, H_feat, W_feat)
+                        group_images = high_res_images[indices]  # (group_size, 3, H, W)
+
+                        # Process in sub-batches of 16
+                        num_in_group = len(indices)
+
+                        for sub_batch_start in range(
+                            0, num_in_group, self.anyup_batch_size
+                        ):
+                            sub_batch_end = min(
+                                sub_batch_start + self.anyup_batch_size, num_in_group
+                            )
+
+                            # Get sub-batch
+                            sub_features = group_features[sub_batch_start:sub_batch_end]
+                            sub_images = group_images[sub_batch_start:sub_batch_end]
+
+                            # Run AnyUp - ensure inputs are on GPU and convert to float16
+                            with torch.no_grad():
+                                # Move to GPU first, then convert to float16
+                                sub_images_fp16 = sub_images.to(device).half()
+                                sub_features_fp16 = sub_features.to(device).half()
+
+                                with torch.amp.autocast(
+                                    device_type=device.type, dtype=torch.float16
+                                ):
+                                    print(
+                                        f"      AnyUp upsampling: {sub_images_fp16.shape} + {sub_features_fp16.shape} → {target_dim1}×{target_dim2}"
+                                    )
+
+                                    upsampled = self.anyup_model(
+                                        sub_images_fp16,
+                                        sub_features_fp16,
+                                        output_size=(target_dim1, target_dim2),
+                                    )
+
+                            # Store results - convert back to float32 and move to CPU
+                            for j in range(sub_batch_end - sub_batch_start):
+                                original_idx = indices[sub_batch_start + j]
+                                slice_results[original_idx] = (
+                                    upsampled[j].float().cpu().detach()
+                                )
+
+                            # CRITICAL: Aggressive cleanup after each sub-batch
+                            del (
+                                upsampled,
+                                sub_features,
+                                sub_images,
+                                sub_images_fp16,
+                                sub_features_fp16,
+                            )
+                            if device.type == "cuda":
+                                torch.cuda.empty_cache()
+                                torch.cuda.synchronize()
+                            gc.collect()
+
+                        # Additional cleanup after each dimension group
+                        del group_features, group_images
+                        if device.type == "cuda":
+                            torch.cuda.empty_cache()
+
+                if enable_timing:
+                    anyup_end = time.time()
+                    anyup_time = anyup_end - anyup_start
+                    timing_info["total_anyup_time"] += anyup_time
+                    timing_info["total_downsampling_time"] += anyup_time
+                    print(
+                        f"      AnyUp feature upsampling: {len(dim_groups)} dimension groups in {anyup_time:.3f}s"
                     )
-                    # Store results back to original positions
-                    for j, idx in enumerate(indices):
-                        slice_results[idx] = group_resized[j]
-                else:
-                    # Single slice - process individually (still more efficient than before)
-                    idx = indices[0]
-                    single_feature = batch_features_tensor[
-                        idx : idx + 1
-                    ]  # (1, output_channels, H_feat, W_feat)
-                    single_resized = F.interpolate(
-                        single_feature,
-                        size=(target_dim1, target_dim2),
-                        mode="bilinear",
-                        align_corners=False,
+                    for (dim1, dim2), indices in dim_groups.items():
+                        print(
+                            f"        {len(indices)} slices: {batch_features_tensor.shape[2]}×{batch_features_tensor.shape[3]} → {dim1}×{dim2} (AnyUp)"
+                        )
+
+                # Clean up
+                del high_res_images
+                gc.collect()
+
+            else:
+                # Use original interpolation method
+                for (target_dim1, target_dim2), indices in dim_groups.items():
+                    if len(indices) > 1:
+                        # Multiple slices with same target dimensions - batch process
+                        group_features = batch_features_tensor[
+                            indices
+                        ]  # (group_size, output_channels, H_feat, W_feat)
+                        group_resized = F.interpolate(
+                            group_features,
+                            size=(target_dim1, target_dim2),
+                            mode="bilinear",
+                            align_corners=False,
+                        )
+                        # Store results back to original positions
+                        for j, idx in enumerate(indices):
+                            slice_results[idx] = group_resized[j]
+                    else:
+                        # Single slice - process individually (still more efficient than before)
+                        idx = indices[0]
+                        single_feature = batch_features_tensor[
+                            idx : idx + 1
+                        ]  # (1, output_channels, H_feat, W_feat)
+                        single_resized = F.interpolate(
+                            single_feature,
+                            size=(target_dim1, target_dim2),
+                            mode="bilinear",
+                            align_corners=False,
+                        )
+                        slice_results[idx] = single_resized[0]
+
+                # TIMING: End feature resizing
+                if enable_timing:
+                    resize_end = time.time()
+                    batch_resize_time = resize_end - resize_start
+                    timing_info["total_downsampling_time"] += batch_resize_time
+                    print(
+                        f"      DINOv3 feature resizing: {len(dim_groups)} dimension groups in {batch_resize_time:.3f}s"
                     )
-                    slice_results[idx] = single_resized[0]
+                    for (dim1, dim2), indices in dim_groups.items():
+                        print(
+                            f"        {len(indices)} slices: DINOv3 feature → {dim1}×{dim2}"
+                        )
 
             # Add all processed slices to results
             for result in slice_results:
                 all_features.append(result)
-
-            # TIMING: End feature resizing
-            if enable_timing:
-                resize_end = time.time()
-                batch_resize_time = resize_end - resize_start
-                timing_info["total_downsampling_time"] += batch_resize_time
-                print(
-                    f"      DINOv3 feature resizing: {len(dim_groups)} dimension groups in {batch_resize_time:.3f}s"
-                )
-                for (dim1, dim2), indices in dim_groups.items():
-                    print(
-                        f"        {len(indices)} slices: DINOv3 32×32 → {dim1}×{dim2}"
-                    )
 
         # Calculate average batch size
         if enable_timing and timing_info["num_batches"] > 0:
