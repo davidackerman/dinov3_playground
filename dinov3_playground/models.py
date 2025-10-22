@@ -24,6 +24,141 @@ from .dinov3_core import (
 )  # Assuming output_channels is defined there
 
 
+# ---------------------------
+# Correct BatchRenorm implementation (1d/2d/3d)
+# ---------------------------
+import torch
+import torch.nn as nn
+
+
+class _BatchRenormNd(nn.Module):
+    def __init__(
+        self,
+        num_features,
+        eps=1e-5,
+        momentum=0.1,
+        rmax=3.0,
+        dmax=5.0,
+        affine=True,
+        track_running_stats=True,
+        dims=2,
+    ):
+        super().__init__()
+        self.num_features = num_features
+        self.eps = eps
+        self.momentum = momentum
+        self.rmax = rmax
+        self.dmax = dmax
+        self.affine = affine
+        self.track_running_stats = track_running_stats
+        self.dims = dims  # 1,2,3 for BatchNorm1d/2d/3d
+
+        if self.affine:
+            self.weight = nn.Parameter(torch.ones(num_features))
+            self.bias = nn.Parameter(torch.zeros(num_features))
+        else:
+            self.register_parameter("weight", None)
+            self.register_parameter("bias", None)
+
+        if self.track_running_stats:
+            self.register_buffer("running_mean", torch.zeros(num_features))
+            self.register_buffer("running_var", torch.ones(num_features))
+            self.register_buffer(
+                "num_batches_tracked", torch.tensor(0, dtype=torch.long)
+            )
+        else:
+            self.register_buffer("running_mean", None)
+            self.register_buffer("running_var", None)
+            self.register_buffer("num_batches_tracked", None)
+
+    def forward(self, x):
+        # x shape: (N, C, *spatial)
+        if x.dim() < 2:
+            raise ValueError("Input for BatchRenorm must have >=2 dims")
+
+        reduce_dims = [0] + list(range(2, x.dim()))
+        if self.training:
+            # compute batch mean/var
+            batch_mean = x.mean(dim=reduce_dims, keepdim=False)
+            batch_var = x.var(dim=reduce_dims, unbiased=False, keepdim=False)
+            batch_std = torch.sqrt(batch_var + self.eps)
+            # print("\n\n*********asdfasdfasdfasdfasdafdadfadfadfsfsadsfdsfd")
+            # print("batch_mean:", batch_mean)
+            # print("batch_var:", batch_var)
+            # print("batch_std:", batch_std)
+            # print("running_mean:", self.running_mean)
+            if self.track_running_stats:
+                # compute renorm parameters (no gradients through running stats)
+                running_std = torch.sqrt(self.running_var.to(x.dtype) + self.eps)
+                r = (batch_std.detach() / running_std).clamp(1.0 / self.rmax, self.rmax)
+                d = (
+                    (batch_mean.detach() - self.running_mean.to(x.dtype)) / running_std
+                ).clamp(-self.dmax, self.dmax)
+
+                # update running stats in-place under no_grad
+                with torch.no_grad():
+                    self.running_mean.mul_(1 - self.momentum).add_(
+                        self.momentum * batch_mean
+                    )
+                    self.running_var.mul_(1 - self.momentum).add_(
+                        self.momentum * batch_var
+                    )
+                    self.num_batches_tracked.add_(1)
+            else:
+                r = torch.ones_like(batch_std)
+                d = torch.zeros_like(batch_mean)
+
+            # reshape for broadcasting
+            shape = [1, -1] + [1] * (x.dim() - 2)
+            batch_mean_b = batch_mean.view(shape)
+            batch_std_b = batch_std.view(shape)
+            r_b = r.view(shape)
+            d_b = d.view(shape)
+
+            x_hat = (x - batch_mean_b) / batch_std_b
+            x_renorm = r_b * x_hat + d_b
+
+            if self.affine:
+                w = self.weight.view(1, -1, *([1] * (x.dim() - 2)))
+                b = self.bias.view(1, -1, *([1] * (x.dim() - 2)))
+                return w * x_renorm + b
+            return x_renorm
+
+        else:
+            # inference uses running stats
+            if self.track_running_stats:
+                running_std = torch.sqrt(self.running_var.to(x.dtype) + self.eps)
+                rm = self.running_mean.to(x.dtype).view([1, -1] + [1] * (x.dim() - 2))
+                rs = running_std.view([1, -1] + [1] * (x.dim() - 2))
+                x_hat = (x - rm) / rs
+                if self.affine:
+                    w = self.weight.view(1, -1, *([1] * (x.dim() - 2)))
+                    b = self.bias.view(1, -1, *([1] * (x.dim() - 2)))
+                    return w * x_hat + b
+                return x_hat
+            return x
+
+
+class BatchRenorm1d(_BatchRenormNd):
+    def __init__(self, num_features, **kwargs):
+        super().__init__(num_features, dims=1, **kwargs)
+
+
+class BatchRenorm2d(_BatchRenormNd):
+    def __init__(self, num_features, **kwargs):
+        super().__init__(num_features, dims=2, **kwargs)
+
+
+class BatchRenorm3d(_BatchRenormNd):
+    def __init__(self, num_features, **kwargs):
+        super().__init__(num_features, dims=3, **kwargs)
+
+
+### ---------------------------
+### End batchrenorm
+### ---------------------------
+
+
 class ImprovedClassifier(nn.Module):
     """
     Enhanced neural network classifier with batch normalization and dropout.
@@ -43,6 +178,7 @@ class ImprovedClassifier(nn.Module):
         num_classes=2,
         dropout_rate=0.3,
         use_batch_norm=True,
+        use_batch_renorm=False,
         activation="relu",
     ):
         """
@@ -66,6 +202,7 @@ class ImprovedClassifier(nn.Module):
         super(ImprovedClassifier, self).__init__()
 
         self.use_batch_norm = use_batch_norm
+        self.use_batch_renorm = use_batch_renorm
         self.activation = activation
 
         # Build layers dynamically
@@ -73,12 +210,13 @@ class ImprovedClassifier(nn.Module):
         dims = [input_dim] + hidden_dims
 
         for i in range(len(dims) - 1):
-            # Linear layer
             layers.append(nn.Linear(dims[i], dims[i + 1]))
 
-            # Batch normalization
             if use_batch_norm:
-                layers.append(nn.BatchNorm1d(dims[i + 1]))
+                if use_batch_renorm:
+                    layers.append(BatchRenorm1d(dims[i + 1]))
+                else:
+                    layers.append(nn.BatchNorm1d(dims[i + 1]))
 
             # Activation
             if activation == "leaky_relu":
@@ -86,7 +224,6 @@ class ImprovedClassifier(nn.Module):
             else:
                 layers.append(nn.ReLU())
 
-            # Dropout
             layers.append(nn.Dropout(dropout_rate))
 
         # Final output layer
@@ -221,7 +358,9 @@ class DINOv3UNet(nn.Module):
     - Output: Segmentation map (H, W, num_classes)
     """
 
-    def __init__(self, input_channels=384, num_classes=2, base_channels=64):
+    def __init__(
+        self, input_channels=384, num_classes=2, base_channels=64, use_batchrenorm=False
+    ):
         """
         Initialize DINOv3 UNet.
 
@@ -235,37 +374,42 @@ class DINOv3UNet(nn.Module):
             Base number of channels in the UNet
         """
         super(DINOv3UNet, self).__init__()
+        self.use_batchrenorm = use_batchrenorm
 
-        self.input_channels = input_channels
-        self.num_classes = num_classes
+        # choose normalization layer
+        Norm2d = BatchRenorm2d if self.use_batchrenorm else nn.BatchNorm2d
 
         # Input projection to reduce channels
         self.input_conv = nn.Conv2d(input_channels, base_channels, kernel_size=1)
 
         # Encoder (downsampling path)
-        self.enc1 = self._make_encoder_block(base_channels, base_channels)
-        self.enc2 = self._make_encoder_block(base_channels, base_channels * 2)
-        self.enc3 = self._make_encoder_block(base_channels * 2, base_channels * 4)
-        self.enc4 = self._make_encoder_block(base_channels * 4, base_channels * 8)
+        self.enc1 = self._make_encoder_block(base_channels, base_channels, Norm2d)
+        self.enc2 = self._make_encoder_block(base_channels, base_channels * 2, Norm2d)
+        self.enc3 = self._make_encoder_block(
+            base_channels * 2, base_channels * 4, Norm2d
+        )
+        self.enc4 = self._make_encoder_block(
+            base_channels * 4, base_channels * 8, Norm2d
+        )
 
         # Bottleneck
         self.bottleneck = self._make_encoder_block(
-            base_channels * 8, base_channels * 16
+            base_channels * 8, base_channels * 16, Norm2d
         )
 
         # Decoder (upsampling path) - Fixed channel calculations
         # After concatenation: upsampled + skip connection
         self.dec4 = self._make_decoder_block(
-            base_channels * 16 + base_channels * 8, base_channels * 8
+            base_channels * 16 + base_channels * 8, base_channels * 8, Norm2d
         )
         self.dec3 = self._make_decoder_block(
-            base_channels * 8 + base_channels * 4, base_channels * 4
+            base_channels * 8 + base_channels * 4, base_channels * 4, Norm2d
         )
         self.dec2 = self._make_decoder_block(
-            base_channels * 4 + base_channels * 2, base_channels * 2
+            base_channels * 4 + base_channels * 2, base_channels * 2, Norm2d
         )
         self.dec1 = self._make_decoder_block(
-            base_channels * 2 + base_channels, base_channels
+            base_channels * 2 + base_channels, base_channels, Norm2d
         )
 
         # Final output layer
@@ -274,25 +418,25 @@ class DINOv3UNet(nn.Module):
         # Pooling
         self.pool = nn.MaxPool2d(2)
 
-    def _make_encoder_block(self, in_channels, out_channels):
+    def _make_encoder_block(self, in_channels, out_channels, Norm):
         """Create an encoder block with two convolutions."""
         return nn.Sequential(
             nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_channels),
+            Norm(out_channels),
             nn.ReLU(inplace=True),
             nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_channels),
+            Norm(out_channels),
             nn.ReLU(inplace=True),
         )
 
-    def _make_decoder_block(self, in_channels, out_channels):
+    def _make_decoder_block(self, in_channels, out_channels, Norm):
         """Create a decoder block with two convolutions."""
         return nn.Sequential(
             nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_channels),
+            Norm(out_channels),
             nn.ReLU(inplace=True),
             nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_channels),
+            Norm(out_channels),
             nn.ReLU(inplace=True),
         )
 
@@ -539,20 +683,17 @@ class ContextAttentionFusion(nn.Module):
     raw feature dominance.
     """
 
-    def __init__(self, channels):
+    def __init__(self, channels, use_batchrenorm=False):
         super().__init__()
+        Norm3d = BatchRenorm3d if use_batchrenorm else nn.BatchNorm3d
         self.channels = channels
-
-        # Context projection to match raw feature dimensions
         self.context_proj = nn.Sequential(
             nn.Conv3d(channels, channels // 4, 1),
-            nn.BatchNorm3d(channels // 4),
+            Norm3d(channels // 4),
             nn.ReLU(inplace=True),
             nn.Conv3d(channels // 4, channels, 1),
-            nn.Sigmoid(),  # Attention weights between 0 and 1
+            nn.Sigmoid(),
         )
-
-        # Optional residual connection for raw features
         self.raw_proj = nn.Conv3d(channels, channels, 1)
 
     def forward(self, raw_features, context_features):
@@ -601,41 +742,19 @@ class DINOv3UNet3D(nn.Module):
         base_channels=32,
         input_size=(112, 112, 112),
         use_half_precision=False,
-        learn_upsampling=False,  # NEW PARAMETER
-        dinov3_feature_size=None,  # NEW PARAMETER
-        use_gradient_checkpointing=True,  # NEW PARAMETER for memory efficiency
-        use_context_fusion=False,  # NEW PARAMETER for context fusion
-        context_channels=384,  # NEW PARAMETER for context feature dimension
+        learn_upsampling=False,
+        dinov3_feature_size=None,
+        use_gradient_checkpointing=True,
+        use_context_fusion=False,
+        context_channels=384,
+        use_batchrenorm=False,
     ):
-        """
-        Initialize DINOv3 3D UNet.
-
-        Parameters:
-        -----------
-        input_channels : int, default=384
-            Number of input channels (DINOv3 feature dimension)
-        num_classes : int, default=2
-            Number of output classes
-        base_channels : int, default=32
-            Base number of channels in the UNet (lower than 2D due to memory)
-        input_size : tuple, default=(112, 112, 112)
-            Expected output spatial dimensions (D, H, W)
-        use_half_precision : bool, default=False
-            Whether to use half precision (float16)
-        learn_upsampling : bool, default=False
-            If True, UNet learns upsampling from lower-res DINOv3 features
-            If False, DINOv3 features are pre-interpolated to full resolution
-        dinov3_feature_size : tuple, optional
-            Spatial size of DINOv3 features (D, H, W) when learn_upsampling=True
-            If None, assumes same as input_size
-        use_gradient_checkpointing : bool, default=True
-            Whether to use gradient checkpointing for memory efficiency
-        use_context_fusion : bool, default=False
-            Whether to use context features for multi-scale fusion
-        context_channels : int, default=384
-            Number of context feature channels (should match input_channels)
-        """
+        print(
+            "******************************Using batchrenorm in UNET:", use_batchrenorm
+        )
         super(DINOv3UNet3D, self).__init__()
+        self.use_batchrenorm = use_batchrenorm
+        Norm3d = BatchRenorm3d if self.use_batchrenorm else nn.BatchNorm3d
 
         self.input_channels = input_channels
         self.num_classes = num_classes
@@ -664,32 +783,42 @@ class DINOv3UNet3D(nn.Module):
             self.learned_upsample = None
 
         # Encoder (downsampling path)
-        self.enc1 = self._make_encoder_block(self.base_channels, self.base_channels)
-        self.enc2 = self._make_encoder_block(self.base_channels, self.base_channels * 2)
+        self.enc1 = self._make_encoder_block(
+            self.base_channels, self.base_channels, Norm3d
+        )
+        self.enc2 = self._make_encoder_block(
+            self.base_channels, self.base_channels * 2, Norm3d
+        )
         self.enc3 = self._make_encoder_block(
-            self.base_channels * 2, self.base_channels * 4
+            self.base_channels * 2, self.base_channels * 4, Norm3d
         )
         self.enc4 = self._make_encoder_block(
-            self.base_channels * 4, self.base_channels * 8
+            self.base_channels * 4, self.base_channels * 8, Norm3d
         )
 
         # Bottleneck
         self.bottleneck = self._make_encoder_block(
-            self.base_channels * 8, self.base_channels * 16
+            self.base_channels * 8, self.base_channels * 16, Norm3d
         )
 
         # Decoder (upsampling path)
         self.dec4 = self._make_decoder_block(
-            self.base_channels * 16 + self.base_channels * 8, self.base_channels * 8
+            self.base_channels * 16 + self.base_channels * 8,
+            self.base_channels * 8,
+            Norm3d,
         )
         self.dec3 = self._make_decoder_block(
-            self.base_channels * 8 + self.base_channels * 4, self.base_channels * 4
+            self.base_channels * 8 + self.base_channels * 4,
+            self.base_channels * 4,
+            Norm3d,
         )
         self.dec2 = self._make_decoder_block(
-            self.base_channels * 4 + self.base_channels * 2, self.base_channels * 2
+            self.base_channels * 4 + self.base_channels * 2,
+            self.base_channels * 2,
+            Norm3d,
         )
         self.dec1 = self._make_decoder_block(
-            self.base_channels * 2 + self.base_channels, self.base_channels
+            self.base_channels * 2 + self.base_channels, self.base_channels, Norm3d
         )
 
         # Final output layer
@@ -724,51 +853,55 @@ class DINOv3UNet3D(nn.Module):
 
             # Context fusion modules for each skip connection level
             self.context_fusion1 = ContextAttentionFusion(
-                self.base_channels
-            )  # Full resolution
+                self.base_channels, use_batchrenorm=self.use_batchrenorm
+            )
             self.context_fusion2 = ContextAttentionFusion(
-                self.base_channels * 2
-            )  # 1/2 resolution
+                self.base_channels * 2, use_batchrenorm=self.use_batchrenorm
+            )
             self.context_fusion3 = ContextAttentionFusion(
-                self.base_channels * 4
-            )  # 1/4 resolution
+                self.base_channels * 4, use_batchrenorm=self.use_batchrenorm
+            )
             self.context_fusion4 = ContextAttentionFusion(
-                self.base_channels * 8
-            )  # 1/8 resolution
+                self.base_channels * 8, use_batchrenorm=self.use_batchrenorm
+            )
 
         # Convert to half precision if requested
         if use_half_precision:
             self.half()
             print("Model converted to half precision (float16)")
 
-    def _make_encoder_block(self, in_channels, out_channels):
+    def _make_encoder_block(self, in_channels, out_channels, Norm):
         """Create a 3D encoder block with two convolutions."""
         return nn.Sequential(
             nn.Conv3d(in_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm3d(out_channels),
+            Norm(out_channels),
             nn.ReLU(inplace=True),
             nn.Conv3d(out_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm3d(out_channels),
+            Norm(out_channels),
             nn.ReLU(inplace=True),
-            nn.Dropout3d(0.1),  # Light dropout in encoder
+            nn.Dropout3d(0.1),
         )
 
-    def _make_decoder_block(self, in_channels, out_channels):
+    def _make_decoder_block(self, in_channels, out_channels, Norm):
         """Create a 3D decoder block with two convolutions."""
         return nn.Sequential(
             nn.Conv3d(in_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm3d(out_channels),
+            Norm(out_channels),
             nn.ReLU(inplace=True),
             nn.Conv3d(out_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm3d(out_channels),
+            Norm(out_channels),
             nn.ReLU(inplace=True),
-            nn.Dropout3d(0.1),  # Light dropout in decoder
+            nn.Dropout3d(0.1),
         )
+
 
     def _make_upsampling_layers(self):
         """Create learned upsampling layers to bring DINOv3 features to target resolution."""
         layers = []
         current_channels = self.base_channels
+
+        # ✅ FIX: Use consistent normalization (same as rest of network)
+        Norm3d = BatchRenorm3d if self.use_batchrenorm else nn.BatchNorm3d
 
         # Calculate how many upsampling stages we need
         max_factor = max(self.upsampling_factor)
@@ -788,7 +921,7 @@ class DINOv3UNet3D(nn.Module):
                         stride=2,
                         padding=1,
                     ),  # 2x
-                    nn.BatchNorm3d(current_channels),
+                    Norm3d(current_channels),  # ✅ Changed from nn.BatchNorm3d
                     nn.ReLU(inplace=True),
                     nn.ConvTranspose3d(
                         current_channels,
@@ -797,7 +930,7 @@ class DINOv3UNet3D(nn.Module):
                         stride=2,
                         padding=1,
                     ),  # 4x
-                    nn.BatchNorm3d(current_channels),
+                    Norm3d(current_channels),  # ✅ Changed from nn.BatchNorm3d
                     nn.ReLU(inplace=True),
                     nn.ConvTranspose3d(
                         current_channels,
@@ -806,7 +939,7 @@ class DINOv3UNet3D(nn.Module):
                         stride=2,
                         padding=1,
                     ),  # 8x
-                    nn.BatchNorm3d(current_channels),
+                    Norm3d(current_channels),  # ✅ Changed from nn.BatchNorm3d
                     nn.ReLU(inplace=True),
                 ]
             )
@@ -821,7 +954,7 @@ class DINOv3UNet3D(nn.Module):
                         stride=2,
                         padding=1,
                     ),  # 2x
-                    nn.BatchNorm3d(current_channels),
+                    Norm3d(current_channels),  # ✅ Changed from nn.BatchNorm3d
                     nn.ReLU(inplace=True),
                     nn.ConvTranspose3d(
                         current_channels,
@@ -830,7 +963,7 @@ class DINOv3UNet3D(nn.Module):
                         stride=2,
                         padding=1,
                     ),  # 4x
-                    nn.BatchNorm3d(current_channels),
+                    Norm3d(current_channels),  # ✅ Changed from nn.BatchNorm3d
                     nn.ReLU(inplace=True),
                 ]
             )
@@ -845,7 +978,7 @@ class DINOv3UNet3D(nn.Module):
                         stride=2,
                         padding=1,
                     ),  # 2x
-                    nn.BatchNorm3d(current_channels),
+                    Norm3d(current_channels),  # ✅ Changed from nn.BatchNorm3d
                     nn.ReLU(inplace=True),
                 ]
             )
@@ -1121,6 +1254,7 @@ class DINOv3UNet3DPipeline(nn.Module):
         use_orthogonal_planes=True,  # Process all 3 orthogonal planes
         device=None,
         verbose=True,  # Control verbose output
+        use_batchrenorm=False,
     ):
         """
         Initialize the complete 3D DINOv3-UNet pipeline.
@@ -1166,13 +1300,191 @@ class DINOv3UNet3DPipeline(nn.Module):
             model_info = get_current_model_info()
             input_channels = model_info["output_channels"]
 
-        # 3D UNet for processing DINOv3 features
-        self.unet3d = DINOv3UNet3D(
-            input_channels=input_channels,
-            num_classes=num_classes,
-            base_channels=base_channels,
-            input_size=input_size,
+        # # 3D UNet for processing DINOv3 features
+        # self.unet3d = DINOv3UNet3D(
+        #     input_channels=input_channels,
+        #     num_classes=num_classes,
+        #     base_channels=base_channels,
+        #     input_size=input_size,
+        #     use_batchrenorm=use_batchrenorm,
+        # )
+
+    def extract_dinov3_features_3d_batch(
+        self,
+        volume_batch,
+        use_orthogonal_planes=None,
+        enable_timing=False,
+        target_output_size=None,
+    ):
+        """
+        GPU-optimized batch processing of multiple 3D volumes simultaneously.
+        This method processes all volumes in the batch together for maximum efficiency.
+
+        Parameters:
+        -----------
+        volume_batch : numpy.ndarray
+            Batch of volumes of shape (batch_size, D, H, W)
+        use_orthogonal_planes : bool, optional
+            If True, processes slices in all 3 orthogonal planes (XY, XZ, YZ) and averages them.
+        target_output_size : tuple, optional
+            Target size (D, H, W) for the output features.
+
+        Returns:
+        --------
+        torch.Tensor: DINOv3 features (batch_size, output_channels, D, H, W)
+        """
+        if isinstance(volume_batch, torch.Tensor):
+            volume_batch = volume_batch.cpu().numpy()
+
+        batch_size, depth, height, width = volume_batch.shape
+
+        # Determine processing size and output size
+        if target_output_size is not None:
+            output_d, output_h, output_w = target_output_size
+        else:
+            output_d, output_h, output_w = self.input_size
+
+        import time
+
+        detailed_timing = {}
+        start_time = time.time()
+
+        if enable_timing:
+            print(f"\n=== GPU-Optimized Batch DINOv3 Processing ===")
+            print(f"Batch size: {batch_size}")
+            print(f"Input volume per batch: {(depth, height, width)}")
+            print(f"Output target: {(output_d, output_h, output_w)}")
+
+        # Use instance variable if parameter not provided
+        if use_orthogonal_planes is None:
+            use_orthogonal_planes = self.use_orthogonal_planes
+
+        # Pre-allocate output tensor on GPU for maximum efficiency
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        from .dinov3_core import get_current_model_info
+
+        model_info = get_current_model_info()
+        output_channels = model_info["output_channels"]
+
+        batch_output_shape = (batch_size, output_channels, output_d, output_h, output_w)
+        batch_features = torch.zeros(
+            batch_output_shape, device=device, dtype=torch.float32
         )
+
+        if use_orthogonal_planes:
+            # GPU-optimized batch processing for all 3 planes
+            plane_features = []
+            plane_timings = {}
+
+            if enable_timing:
+                print(f"Processing {batch_size} volumes across 3 orthogonal planes...")
+
+            # Process all volumes for each plane type
+            for plane_name in ["xy", "xz", "yz"]:
+                plane_start = time.time()
+
+                # Process all volumes in batch for this plane
+                plane_batch_features = torch.zeros(
+                    batch_output_shape, device=device, dtype=torch.float32
+                )
+
+                for b in range(batch_size):
+                    single_volume_features = self._extract_features_plane(
+                        volume_batch[b : b + 1],
+                        plane_name,
+                        depth,
+                        height,
+                        width,
+                        slice_batch_size=512,
+                        enable_timing=False,
+                        output_d=output_d,
+                        output_h=output_h,
+                        output_w=output_w,
+                    )
+
+                    # Direct GPU assignment
+                    if (
+                        single_volume_features.dim() == 5
+                        and single_volume_features.shape[0] == 1
+                    ):
+                        plane_batch_features[b] = single_volume_features.squeeze(0).to(
+                            device
+                        )
+                    else:
+                        plane_batch_features[b] = single_volume_features.to(device)
+
+                plane_features.append(plane_batch_features)
+                plane_timings[f"{plane_name}_extraction"] = time.time() - plane_start
+
+                if enable_timing:
+                    print(
+                        f"  {plane_name.upper()} plane batch: {tuple(plane_batch_features.shape)} in {plane_timings[f'{plane_name}_extraction']:.3f}s"
+                    )
+
+            # GPU-accelerated averaging across all planes
+            averaging_start = time.time()
+            # Stack all plane features: (3, batch_size, channels, D, H, W)
+            all_planes_stacked = torch.stack(plane_features, dim=0)
+            # Average across planes: (batch_size, channels, D, H, W)
+            batch_features = all_planes_stacked.mean(dim=0)
+            plane_timings["averaging"] = time.time() - averaging_start
+
+            # Free memory
+            del plane_features, all_planes_stacked
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+            if enable_timing:
+                print(
+                    f"  Averaged all planes: {tuple(batch_features.shape)} in {plane_timings['averaging']:.3f}s"
+                )
+                detailed_timing.update(plane_timings)
+
+        else:
+            # Single XY plane batch processing
+            if enable_timing:
+                print(f"Processing {batch_size} volumes for XY plane only...")
+
+            xy_start = time.time()
+            for b in range(batch_size):
+                single_features = self._extract_features_plane(
+                    volume_batch[b : b + 1],
+                    "xy",
+                    depth,
+                    height,
+                    width,
+                    slice_batch_size=512,
+                    enable_timing=False,
+                    output_d=output_d,
+                    output_h=output_h,
+                    output_w=output_w,
+                )
+
+                if single_features.dim() == 5 and single_features.shape[0] == 1:
+                    batch_features[b] = single_features.squeeze(0).to(device)
+                else:
+                    batch_features[b] = single_features.to(device)
+
+            detailed_timing["xy_batch_extraction"] = time.time() - xy_start
+
+        # Final timing
+        detailed_timing["total_batch_time"] = time.time() - start_time
+        detailed_timing["batch_size"] = batch_size
+        detailed_timing["processing_method"] = "gpu_batch_optimized"
+
+        if enable_timing:
+            print(f"\n=== Batch Processing Summary ===")
+            print(f"Total batch time: {detailed_timing['total_batch_time']:.3f}s")
+            print(
+                f"Average time per volume: {detailed_timing['total_batch_time']/batch_size:.3f}s"
+            )
+            print(f"Final batch shape: {tuple(batch_features.shape)}")
+            print(
+                f"GPU memory used: {batch_features.element_size() * batch_features.nelement() / 1e6:.2f} MB"
+            )
+
+            return batch_features, detailed_timing
+        else:
+            return batch_features
 
     def extract_dinov3_features_3d(
         self,
@@ -1472,183 +1784,6 @@ class DINOv3UNet3DPipeline(nn.Module):
                 return result, detailed_timing
         else:
             return result
-
-    def extract_dinov3_features_3d_batch(
-        self,
-        volume_batch,
-        use_orthogonal_planes=None,
-        enable_timing=False,
-        target_output_size=None,
-    ):
-        """
-        GPU-optimized batch processing of multiple 3D volumes simultaneously.
-        This method processes all volumes in the batch together for maximum efficiency.
-
-        Parameters:
-        -----------
-        volume_batch : numpy.ndarray
-            Batch of volumes of shape (batch_size, D, H, W)
-        use_orthogonal_planes : bool, optional
-            If True, processes slices in all 3 orthogonal planes (XY, XZ, YZ) and averages them.
-        target_output_size : tuple, optional
-            Target size (D, H, W) for the output features.
-
-        Returns:
-        --------
-        torch.Tensor: DINOv3 features (batch_size, output_channels, D, H, W)
-        """
-        if isinstance(volume_batch, torch.Tensor):
-            volume_batch = volume_batch.cpu().numpy()
-
-        batch_size, depth, height, width = volume_batch.shape
-
-        # Determine processing size and output size
-        if target_output_size is not None:
-            output_d, output_h, output_w = target_output_size
-        else:
-            output_d, output_h, output_w = self.input_size
-
-        import time
-
-        detailed_timing = {}
-        start_time = time.time()
-
-        if enable_timing:
-            print(f"\n=== GPU-Optimized Batch DINOv3 Processing ===")
-            print(f"Batch size: {batch_size}")
-            print(f"Input volume per batch: {(depth, height, width)}")
-            print(f"Output target: {(output_d, output_h, output_w)}")
-
-        # Use instance variable if parameter not provided
-        if use_orthogonal_planes is None:
-            use_orthogonal_planes = self.use_orthogonal_planes
-
-        # Pre-allocate output tensor on GPU for maximum efficiency
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        from .dinov3_core import get_current_model_info
-
-        model_info = get_current_model_info()
-        output_channels = model_info["output_channels"]
-
-        batch_output_shape = (batch_size, output_channels, output_d, output_h, output_w)
-        batch_features = torch.zeros(
-            batch_output_shape, device=device, dtype=torch.float32
-        )
-
-        if use_orthogonal_planes:
-            # GPU-optimized batch processing for all 3 planes
-            plane_features = []
-            plane_timings = {}
-
-            if enable_timing:
-                print(f"Processing {batch_size} volumes across 3 orthogonal planes...")
-
-            # Process all volumes for each plane type
-            for plane_name in ["xy", "xz", "yz"]:
-                plane_start = time.time()
-
-                # Process all volumes in batch for this plane
-                plane_batch_features = torch.zeros(
-                    batch_output_shape, device=device, dtype=torch.float32
-                )
-
-                for b in range(batch_size):
-                    single_volume_features = self._extract_features_plane(
-                        volume_batch[b : b + 1],
-                        plane_name,
-                        depth,
-                        height,
-                        width,
-                        slice_batch_size=512,
-                        enable_timing=False,
-                        output_d=output_d,
-                        output_h=output_h,
-                        output_w=output_w,
-                    )
-
-                    # Direct GPU assignment
-                    if (
-                        single_volume_features.dim() == 5
-                        and single_volume_features.shape[0] == 1
-                    ):
-                        plane_batch_features[b] = single_volume_features.squeeze(0).to(
-                            device
-                        )
-                    else:
-                        plane_batch_features[b] = single_volume_features.to(device)
-
-                plane_features.append(plane_batch_features)
-                plane_timings[f"{plane_name}_extraction"] = time.time() - plane_start
-
-                if enable_timing:
-                    print(
-                        f"  {plane_name.upper()} plane batch: {tuple(plane_batch_features.shape)} in {plane_timings[f'{plane_name}_extraction']:.3f}s"
-                    )
-
-            # GPU-accelerated averaging across all planes
-            averaging_start = time.time()
-            # Stack all plane features: (3, batch_size, channels, D, H, W)
-            all_planes_stacked = torch.stack(plane_features, dim=0)
-            # Average across planes: (batch_size, channels, D, H, W)
-            batch_features = all_planes_stacked.mean(dim=0)
-            plane_timings["averaging"] = time.time() - averaging_start
-
-            # Free memory
-            del plane_features, all_planes_stacked
-            torch.cuda.empty_cache() if torch.cuda.is_available() else None
-
-            if enable_timing:
-                print(
-                    f"  Averaged all planes: {tuple(batch_features.shape)} in {plane_timings['averaging']:.3f}s"
-                )
-                detailed_timing.update(plane_timings)
-
-        else:
-            # Single XY plane batch processing
-            if enable_timing:
-                print(f"Processing {batch_size} volumes for XY plane only...")
-
-            xy_start = time.time()
-            for b in range(batch_size):
-                single_features = self._extract_features_plane(
-                    volume_batch[b : b + 1],
-                    "xy",
-                    depth,
-                    height,
-                    width,
-                    slice_batch_size=512,
-                    enable_timing=False,
-                    output_d=output_d,
-                    output_h=output_h,
-                    output_w=output_w,
-                )
-
-                if single_features.dim() == 5 and single_features.shape[0] == 1:
-                    batch_features[b] = single_features.squeeze(0).to(device)
-                else:
-                    batch_features[b] = single_features.to(device)
-
-            detailed_timing["xy_batch_extraction"] = time.time() - xy_start
-
-        # Final timing
-        detailed_timing["total_batch_time"] = time.time() - start_time
-        detailed_timing["batch_size"] = batch_size
-        detailed_timing["processing_method"] = "gpu_batch_optimized"
-
-        if enable_timing:
-            print(f"\n=== Batch Processing Summary ===")
-            print(f"Total batch time: {detailed_timing['total_batch_time']:.3f}s")
-            print(
-                f"Average time per volume: {detailed_timing['total_batch_time']/batch_size:.3f}s"
-            )
-            print(f"Final batch shape: {tuple(batch_features.shape)}")
-            print(
-                f"GPU memory used: {batch_features.element_size() * batch_features.nelement() / 1e6:.2f} MB"
-            )
-
-            return batch_features, detailed_timing
-        else:
-            return batch_features
 
     def _extract_features_plane(
         self,

@@ -1,135 +1,155 @@
 """
-DINOv3 Core Processing Module
+DINOv3 Core Processing Module (HF-only, ViT or ConvNeXt)
+- Robust to HF outputs for both backbones
+- Removes CLS/special tokens for ViT
+- Handles ConvNeXt outputs as (B, C, H, W) or (B, L, C)
+- Sliding-window upsampling via stride < patch/effective reduction
+- Device-aware AMP (CPU/CUDA; MPS runs without autocast)
 
-This module contains the core DINOv3 feature extraction functionality including:
-- Model initialization and configuration
-- Feature processing and normalization
-- Utility functions for tensor operations
-
-Author: GitHub Copilot
-Date: 2025-09-11
+Public API (unchanged):
+  initialize_dinov3, get_current_model_info, ensure_initialized, get_img,
+  round_to_multiple, ensure_multiple, normalize_01, normalize_features,
+  apply_normalization_stats, process
 """
 
 import torch
 import torch.nn.functional as F
 import numpy as np
 from PIL import Image
-from transformers import AutoImageProcessor, DINOv3ViTModel
+from transformers import AutoImageProcessor, AutoModel
 import functools
 
 
-def enable_amp_inference(model, amp_dtype=torch.bfloat16):
+# -------------------- AMP wrapper (device-aware) --------------------
+def enable_amp_inference(model, amp_dtype=torch.bfloat16, device_type=None):
+    # device_type: "cuda", "cpu", "mps" (None -> infer)
+    if device_type is None:
+        try:
+            device_type = next(model.parameters()).device.type
+        except StopIteration:
+            device_type = "cuda" if torch.cuda.is_available() else "cpu"
+
     orig_forward = model.forward
 
     @functools.wraps(orig_forward)
     def amp_forward(*args, **kwargs):
-        with torch.autocast(device_type="cuda", dtype=amp_dtype):
-            return orig_forward(*args, **kwargs)
+        if device_type in ("cuda", "cpu"):
+            with torch.autocast(device_type=device_type, dtype=amp_dtype):
+                return orig_forward(*args, **kwargs)
+        # e.g., MPS or unknown: no autocast
+        return orig_forward(*args, **kwargs)
 
     model.forward = amp_forward
     return model
 
 
-# Global variables to be initialized
+# -------------------- Globals (names unchanged) --------------------
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 processor = None
 model = None
 output_channels = None
 current_model_id = None
 
+# Internals to support both ViT & ConvNeXt
+_is_convnext = False  # True if loaded backbone is ConvNeXt
+_effective_patch = None  # ViT: patch_size; ConvNeXt: inferred reduction
+_vit_patch_size = None  # cached ViT patch size
+_last_processed_hw = None  # (H, W) used to compute effective_patch for ConvNeXt
 
+
+# -------------------- Init & Info --------------------
 def initialize_dinov3(
     model_id="facebook/dinov3-vits16-pretrain-lvd1689m", image_size=896, device=None
 ):
     """
     Initialize DINOv3 model and processor with specified configuration.
 
-    Parameters:
-    -----------
-    model_id : str, default="facebook/dinov3-vits16-pretrain-lvd1689m"
-        HuggingFace model identifier
-    image_size : int, default=896
-        Input image size (height and width)
-    device : torch.device, optional
-        Device to load model on
-
     Returns:
-    --------
-    tuple: (processor, model, output_channels)
+        (processor, model, output_channels)
     """
     global processor, model, output_channels, current_model_id, DEVICE
+    global _is_convnext, _effective_patch, _vit_patch_size, _last_processed_hw
 
     if device is not None:
         DEVICE = device
 
-    ## Only reinitialize if model_id has changed
-    # if current_model_id != model_id:
-    print(f"Initializing DINOv3 with model: {model_id}")
+    # Detect ConvNeXt vs ViT from model_id (simple but effective)
+    lid = (model_id or "").lower()
+    _is_convnext = "convnext" in lid
 
-    # Initialize processor
+    print("=" * 80)
+    print(f"[init] Initializing DINOv3 with model: {model_id}")
+    print(f"[init] Target image size: {image_size}x{image_size}")
+    print(f"[init] Device: {DEVICE}")
+
+    # HF processor (works for both backbones); force square resize/crop to image_size
     processor = AutoImageProcessor.from_pretrained(model_id)
-
-    # Override the default size to handle specified image size
     processor.size = {"height": image_size, "width": image_size}
     processor.crop_size = {"height": image_size, "width": image_size}
 
-    # Initialize model
-    model = DINOv3ViTModel.from_pretrained(model_id)
-    model = enable_amp_inference(model, torch.bfloat16)
+    # HF model
+    model = AutoModel.from_pretrained(model_id)
+    model = enable_amp_inference(model, torch.bfloat16, device_type=DEVICE.type)
     model.to(DEVICE)
     model.eval()
 
-    # Get output dimensions from model configuration
-    output_channels = model.config.hidden_size
+    # Output channels & "patch" bookkeeping
+    if _is_convnext:
+        output_channels = None
+        _effective_patch = None
+        _vit_patch_size = None
+        print(
+            "[init] Backbone: ConvNeXt (effective reduction will be inferred on first forward)"
+        )
+    else:
+        # ViT: hidden dim + patch size from config
+        hidden = getattr(model.config, "hidden_size", None)
+        if hidden is None:
+            hidden = getattr(model.config, "embed_dim", None)
+        output_channels = int(hidden)
+        _vit_patch_size = int(getattr(model.config, "patch_size", 16))
+        _effective_patch = _vit_patch_size
+        print(
+            f"[init] Backbone: ViT (patch size = {_vit_patch_size}, hidden={output_channels})"
+        )
+
     current_model_id = model_id
+    _last_processed_hw = None
 
-    print(f"DINOv3 initialized:")
-    print(f"  Model ID: {model_id}")
-    print(f"  Image size: {image_size}x{image_size}")
-    print(f"  Output channels: {output_channels}")
-    print(f"  Device: {DEVICE}")
-
+    print(
+        f"[init] Output channels (now or later): {output_channels if output_channels is not None else '(lazy)'}"
+    )
+    print("=" * 80)
     return processor, model, output_channels
 
 
 def get_current_model_info():
-    """
-    Get information about the currently loaded model.
-
-    Returns:
-    --------
-    dict: Model information
-    """
     return {
         "model_id": current_model_id,
         "output_channels": output_channels,
         "device": DEVICE,
         "is_initialized": model is not None,
+        "is_convnext": _is_convnext,
+        "effective_patch": _effective_patch,
+        "vit_patch_size": _vit_patch_size,
+        "last_processed_hw": _last_processed_hw,
     }
 
 
 def ensure_initialized(model_id=None):
-    """
-    Ensure DINOv3 is initialized. Raises error if not initialized and no model_id provided.
-
-    Parameters:
-    -----------
-    model_id : str, optional
-        Model ID to use if not already initialized
-    """
-    global processor, model, output_channels
-
+    global processor, model
     if model is None or processor is None:
         if model_id is None:
             raise RuntimeError(
-                "DINOv3 model is not initialized. Please call initialize_dinov3(model_id) first, "
-                "or provide model_id parameter to the function you're calling."
+                "DINOv3 model is not initialized. Call initialize_dinov3(model_id) first, "
+                "or pass model_id to the function you're calling."
             )
         initialize_dinov3(model_id)
 
 
+# -------------------- Small utilities (unchanged) --------------------
 def get_img():
-    """Load and return a sample image for testing."""
+    """Simple sample image (requires internet)."""
     import requests
     from io import BytesIO
 
@@ -140,68 +160,42 @@ def get_img():
 
 
 def round_to_multiple(x: int, k: int) -> int:
-    """Round x to the nearest multiple of k."""
     return round(x / k) * k
 
 
 def ensure_multiple(size: int, patch: int) -> int:
-    """Ensure size is a multiple of patch size."""
     return round_to_multiple(size, patch)
 
 
 def normalize_01(x: torch.Tensor) -> torch.Tensor:
-    """Normalize tensor to [0, 1] range."""
     return (x - x.min()) / (x.max() - x.min() + 1e-8)
 
 
 def normalize_features(features, method="standardize", eps=1e-6):
-    """
-    Normalize feature vectors using various methods.
-
-    Parameters:
-    -----------
-    features : numpy.ndarray
-        Feature array of shape (n_samples, n_features)
-    method : str, default="standardize"
-        Normalization method: "standardize", "minmax", "unit", or "robust"
-    eps : float, default=1e-6
-        Small epsilon for numerical stability
-
-    Returns:
-    --------
-    tuple: (normalized_features, normalization_stats)
-    """
     if method == "standardize":
-        # Z-score normalization: (x - mean) / std
         mean = np.mean(features, axis=0)
         std = np.std(features, axis=0)
-        std = np.where(std < eps, eps, std)  # Avoid division by zero
+        std = np.where(std < eps, eps, std)
         normalized = (features - mean) / std
         stats = {"method": "standardize", "mean": mean, "std": std}
-
     elif method == "minmax":
-        # Min-max normalization: (x - min) / (max - min)
         min_val = np.min(features, axis=0)
         max_val = np.max(features, axis=0)
         range_val = max_val - min_val
-        range_val = np.where(range_val < eps, eps, range_val)  # Avoid division by zero
+        range_val = np.where(range_val < eps, eps, range_val)
         normalized = (features - min_val) / range_val
         stats = {"method": "minmax", "min": min_val, "max": max_val, "range": range_val}
-
     elif method == "unit":
-        # Unit vector normalization: x / ||x||
         norms = np.linalg.norm(features, axis=1, keepdims=True)
-        norms = np.where(norms < eps, eps, norms)  # Avoid division by zero
+        norms = np.where(norms < eps, eps, norms)
         normalized = features / norms
         stats = {"method": "unit", "eps": eps}
-
     elif method == "robust":
-        # Robust normalization using median and IQR
         median = np.median(features, axis=0)
         q75 = np.percentile(features, 75, axis=0)
         q25 = np.percentile(features, 25, axis=0)
         iqr = q75 - q25
-        iqr = np.where(iqr < eps, eps, iqr)  # Avoid division by zero
+        iqr = np.where(iqr < eps, eps, iqr)
         normalized = (features - median) / iqr
         stats = {
             "method": "robust",
@@ -210,155 +204,325 @@ def normalize_features(features, method="standardize", eps=1e-6):
             "q75": q75,
             "iqr": iqr,
         }
-
     else:
         raise ValueError(f"Unknown normalization method: {method}")
-
     return normalized, stats
 
 
 def apply_normalization_stats(features, stats):
-    """
-    Apply previously computed normalization statistics to new features.
-
-    Parameters:
-    -----------
-    features : numpy.ndarray
-        Feature array to normalize
-    stats : dict
-        Normalization statistics from normalize_features()
-
-    Returns:
-    --------
-    numpy.ndarray: Normalized features
-    """
     method = stats["method"]
     eps = 1e-6
-
     if method == "standardize":
-        normalized = (features - stats["mean"]) / stats["std"]
-
-    elif method == "minmax":
-        normalized = (features - stats["min"]) / stats["range"]
-
-    elif method == "unit":
+        return (features - stats["mean"]) / stats["std"]
+    if method == "minmax":
+        return (features - stats["min"]) / stats["range"]
+    if method == "unit":
         norms = np.linalg.norm(features, axis=1, keepdims=True)
         norms = np.where(norms < eps, eps, norms)
-        normalized = features / norms
+        return features / norms
+    if method == "robust":
+        return (features - stats["median"]) / stats["iqr"]
+    raise ValueError(f"Unknown normalization method: {method}")
 
-    elif method == "robust":
-        normalized = (features - stats["median"]) / stats["iqr"]
 
+# -------------------- Internal helpers --------------------
+def _extract_vit_patch_features(outputs, inputs, batch_size):
+    """
+    ViT path: outputs.last_hidden_state -> (B, tokens, C)
+    Remove special tokens (e.g., CLS/distill), reshape to (C, B, ph, pw)
+    """
+    global model, _vit_patch_size, _effective_patch, _last_processed_hw, output_channels
+
+    # Robust grab
+    if hasattr(outputs, "last_hidden_state"):
+        features = outputs.last_hidden_state  # (B, T, C)
+    elif isinstance(outputs, (tuple, list)) and len(outputs) > 0:
+        features = outputs[0]
     else:
-        raise ValueError(f"Unknown normalization method: {method}")
+        raise RuntimeError("Unexpected ViT outputs: no last_hidden_state")
 
-    return normalized
+    B, T, C = features.shape
+    ph, pw = inputs["pixel_values"].shape[-2:]
+    patch_size = int(getattr(model.config, "patch_size", _vit_patch_size or 16))
+    _vit_patch_size = patch_size
+    _effective_patch = patch_size
+    _last_processed_hw = (ph, pw)
+
+    expected_ph = ph // patch_size
+    expected_pw = pw // patch_size
+    expected_patch_tokens = expected_ph * expected_pw
+
+    # Remove all special tokens (CLS/distill/others) at the *front*
+    num_special = T - expected_patch_tokens
+    if num_special < 0:
+        # Some models may not resize exactly; try to infer grid from T (no specials case)
+        expected_ph = expected_pw = int(np.sqrt(T))
+        expected_patch_tokens = expected_ph * expected_pw
+        num_special = T - expected_patch_tokens
+    if num_special > 0:
+        patch_features = features[:, num_special:, :]  # drop CLS/distill/etc.
+        # print(f"[vit] Dropped {num_special} special token(s).")
+    else:
+        patch_features = features
+
+    # Output channels (hidden dim)
+    if output_channels is None:
+        output_channels = int(patch_features.shape[-1])
+
+    # Reshape into grid (B, ph, pw, C)
+    if patch_features.shape[1] != expected_patch_tokens:
+        raise RuntimeError(
+            f"[vit] Token count mismatch after dropping specials: "
+            f"T'={patch_features.shape[1]} vs expected {expected_patch_tokens} "
+            f"(ph={expected_ph}, pw={expected_pw}, patch={patch_size})"
+        )
+
+    spatial_features = patch_features.reshape(batch_size, expected_ph, expected_pw, -1)
+    out = (
+        spatial_features.permute(3, 0, 1, 2)
+        .contiguous()
+        .cpu()
+        .numpy()
+        .astype(np.float32)
+    )
+
+    # print(
+    #     f"[vit] last_hidden_state: (B={B}, T={T}, C={C}) -> grid (C={out.shape[0]}, B={out.shape[1]}, ph={expected_ph}, pw={expected_pw}) "
+    #     f"| patch={patch_size}"
+    # )
+    return out
+
+
+def _extract_convnext_map(outputs, inputs):
+    """
+    ConvNeXt path: accept either (B, C, h, w) or (B, L, C) where L = h*w (+ optional specials).
+    - If 3D, will auto-drop up to a few leading special tokens to make L' factorable.
+    Return (C, B, h, w). Also infer effective_patch and output_channels.
+    """
+    global _effective_patch, _last_processed_hw, output_channels
+
+    # Pick a usable tensor from outputs
+    feats = None
+    if hasattr(outputs, "last_hidden_state"):
+        feats = outputs.last_hidden_state
+        src_tag = "last_hidden_state"
+    elif hasattr(outputs, "logits"):
+        feats = outputs.logits
+        src_tag = "logits"
+    elif isinstance(outputs, (tuple, list)) and len(outputs) > 0:
+        feats = outputs[0]
+        src_tag = "tuple[0]"
+    else:
+        raise RuntimeError("Unexpected ConvNeXt outputs: no usable tensor.")
+
+    ph, pw = inputs["pixel_values"].shape[-2:]  # processed H, W
+    _last_processed_hw = (ph, pw)
+
+    # 4D path is straightforward
+    if feats.ndim == 4:
+        B, C, h, w = feats.shape
+        eff_h = max(1, ph // max(1, h))
+        eff_w = max(1, pw // max(1, w))
+        _effective_patch = eff_h if eff_h == eff_w else int(round((eff_h + eff_w) / 2))
+        if output_channels is None:
+            output_channels = int(C)
+        out = feats.permute(1, 0, 2, 3).contiguous().cpu().numpy().astype(np.float32)
+        # print(
+        #     f"[convnext/4D] src={src_tag} feats: (B={B}, C={C}, h={h}, w={w}) "
+        #     f"-> (C={out.shape[0]}, B={out.shape[1]}, h={h}, w={w}) | inferred_effective_patch={_effective_patch} "
+        #     f"(from ph={ph}, pw={pw})"
+        # )
+        return out
+
+    # 3D path: (B, L, C) possibly with extra special tokens at the front
+    if feats.ndim == 3:
+        B, L, C = feats.shape
+
+        def try_factor(L_try, ph, pw):
+            # infer reduction s from ph*pw and L_try
+            s_float = np.sqrt((ph * pw) / max(1, L_try))
+            s = int(round(s_float))
+            if s < 1:
+                return None
+            h = ph // s
+            w = pw // s
+            if h * w == L_try:
+                return s_float, s, h, w
+            return None
+
+        # First attempt: no specials
+        guess = try_factor(L, ph, pw)
+        dropped = 0
+
+        # If that fails, drop up to a few leading tokens until it works
+        if guess is None:
+            for k in range(1, 5):  # try dropping 1..4 specials
+                guess = try_factor(L - k, ph, pw)
+                if guess is not None:
+                    dropped = k
+                    break
+
+        if guess is None:
+            # Final fallback: purely square grid from L (or L-1 if perfect square)
+            side = int(round(np.sqrt(L)))
+            if side * side == L:
+                s = max(1, int(round(ph / side)))
+                h, w = side, side
+                s_float = ph / max(1, h)
+            elif (side * side == (L - 1)) and L > 1:
+                dropped = 1
+                s = max(1, int(round(ph / side)))
+                h, w = side, side
+                s_float = ph / max(1, h)
+            else:
+                raise RuntimeError(
+                    f"[convnext/3D] Could not infer spatial map: ph={ph}, pw={pw}, L={L}"
+                )
+        else:
+            s_float, s, h, w = guess
+
+        if dropped > 0:
+            feats = feats[:, dropped:, :]
+            L_after = feats.shape[1]
+            # print(
+            #     f"[convnext/3D] Dropped {dropped} leading special token(s) from sequence "
+            #     f"(L {L} -> {L_after}) to form grid {h}x{w}."
+            # )
+
+        _effective_patch = int(s)
+        if output_channels is None:
+            output_channels = int(C)
+
+        feats_hw = feats.reshape(B, h, w, C)
+        out = feats_hw.permute(3, 0, 1, 2).contiguous().cpu().numpy().astype(np.float32)
+        # print(
+        #     f"[convnext/3D] src={src_tag} feats: (B={B}, L={L}, C={C}) -> grid (h={h}, w={w}) "
+        #     f"-> (C={out.shape[0]}, B={out.shape[1]}, h={h}, w={w}) | inferred_effective_patch={_effective_patch} "
+        #     f"(ph={ph}, pw={pw}, s≈{s_float:.3f}→{_effective_patch})"
+        # )
+        return out
+
+    raise RuntimeError("Unexpected ConvNeXt tensor rank (expect 3D or 4D).")
+
+
+def _process_single_standard(data, image_size):
+    """
+    Process data through the model without sliding window.
+    Input:
+        data: np.ndarray, (batch_size, height, width)
+    Returns:
+        np.ndarray: (C, B, patch_h, patch_w)  [ConvNeXt: patch_h/w are feature map size]
+    """
+    global model, processor, DEVICE, _is_convnext
+
+    batch_size, height, width = data.shape
+
+    # Convert to PIL Images for the processor
+    pil_images = []
+    for i in range(batch_size):
+        img = data[i]
+        # robust to constant slices
+        denom = img.max() - img.min() + 1e-8
+        img_normalized = ((img - img.min()) / denom * 255).astype(np.uint8)
+        pil_image = Image.fromarray(img_normalized).convert("RGB")
+        pil_images.append(pil_image)
+
+    # Process through HF processor
+    inputs = processor(images=pil_images, return_tensors="pt")
+    inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
+
+    with torch.no_grad():
+        outputs = model(**inputs)
+
+        # Prefer last_hidden_state; fall back to logits/first tuple
+        if hasattr(outputs, "last_hidden_state"):
+            lhs = outputs.last_hidden_state
+            lhs_tag = "last_hidden_state"
+        elif hasattr(outputs, "logits"):
+            lhs = outputs.logits
+            lhs_tag = "logits"
+        elif isinstance(outputs, (tuple, list)) and len(outputs) > 0:
+            lhs = outputs[0]
+            lhs_tag = "tuple[0]"
+        else:
+            raise RuntimeError("Unexpected model outputs: no usable tensor.")
+
+        # print(
+        #     f"[forward] is_convnext={_is_convnext} | pixel_values={tuple(inputs['pixel_values'].shape)} "
+        #     f"| using='{lhs_tag}' with shape={tuple(lhs.shape)}"
+        # )
+
+        # Branching by rank; for 3D we choose by backbone type
+        if lhs.ndim == 3:
+            if _is_convnext:
+                out = _extract_convnext_map(outputs, inputs)
+            else:
+                out = _extract_vit_patch_features(outputs, inputs, batch_size)
+        elif lhs.ndim == 4:
+            out = _extract_convnext_map(outputs, inputs)
+        else:
+            raise RuntimeError("Unknown output rank for vision backbone.")
+
+    return out
 
 
 def _combine_shifted_features(
-    all_shift_features, stride, patch_size, output_channels, batch_size
+    all_shift_features, stride, patch_size, output_channels_local, batch_size
 ):
     """
     Combine features from multiple shifted windows into a higher resolution grid.
-
-    Parameters:
-    -----------
-    all_shift_features : list
-        List of feature arrays from each shift
-    stride : int
-        Stride used for shifting
-    patch_size : int
-        DINOv3 patch size
-    output_channels : int
-        Number of feature channels
-    batch_size : int
-        Batch size
-
-    Returns:
-    --------
-    numpy.ndarray: Combined high resolution features
+    (C, B, ph, pw) -> interleaved (C, B, hi_h, hi_w)
     """
-    # Get dimensions from first shift
-    first_features = all_shift_features[0]  # (channels, batch, patch_h, patch_w)
+    first_features = all_shift_features[0]
     _, _, patch_h, patch_w = first_features.shape
 
-    # Calculate high resolution dimensions
     scale_factor = patch_size // stride  # e.g., 16//8 = 2
     high_res_h = patch_h * scale_factor
     high_res_w = patch_w * scale_factor
 
-    # Debug output suppressed during training to show progress bars clearly
-    # print(f"Combining features: {patch_h}x{patch_w} -> {high_res_h}x{high_res_w} (scale: {scale_factor}x)")
-
-    # Initialize high resolution feature map (use float32 for model compatibility)
     high_res_features = np.zeros(
-        (output_channels, batch_size, high_res_h, high_res_w), dtype=np.float32
+        (output_channels_local, batch_size, high_res_h, high_res_w), dtype=np.float32
     )
 
-    # Interleave features from different shifts to create high resolution output
     shift_idx = 0
     for dy in range(0, patch_size, stride):
         for dx in range(0, patch_size, stride):
             if shift_idx < len(all_shift_features):
-                features = all_shift_features[
-                    shift_idx
-                ]  # (channels, batch, patch_h, patch_w)
-
-                # Interleave this shift's features into the high-res grid
-                # Each feature from this shift goes to positions offset by (dy, dx)
-                # in the stride pattern
+                features = all_shift_features[shift_idx]  # (C, B, ph, pw)
                 for i in range(patch_h):
                     for j in range(patch_w):
-                        # Calculate the high-res position for this feature
-                        high_res_i = i * scale_factor + (dy // stride)
-                        high_res_j = j * scale_factor + (dx // stride)
-
-                        # Make sure we don't exceed bounds
-                        if high_res_i < high_res_h and high_res_j < high_res_w:
-                            high_res_features[:, :, high_res_i, high_res_j] = features[
-                                :, :, i, j
-                            ]
-
+                        hi_i = i * scale_factor + (dy // stride)
+                        hi_j = j * scale_factor + (dx // stride)
+                        if hi_i < high_res_h and hi_j < high_res_w:
+                            high_res_features[:, :, hi_i, hi_j] = features[:, :, i, j]
                 shift_idx += 1
 
+    # print(
+    #     f"[sliding] Combined {len(all_shift_features)} shifts -> high-res grid "
+    #     f"(C={output_channels_local}, B={batch_size}, H={high_res_h}, W={high_res_w}) "
+    #     f"| scale={scale_factor} (patch={patch_size}, stride={stride})"
+    # )
     return high_res_features
 
 
 def _process_sliding_window(data, stride, patch_size, image_size):
     """
-    Process data using sliding window inference for higher resolution features.
-
-    Parameters:
-    -----------
-    data : numpy.ndarray
-        Input images of shape (batch_size, height, width)
-    stride : int
-        Stride for sliding window
-    patch_size : int
-        DINOv3 patch size (typically 16)
-    image_size : int
-        DINOv3 input image size
-
-    Returns:
-    --------
-    numpy.ndarray: High resolution features
+    Sliding window inference for higher resolution features.
+    'patch_size' is ViT.patch_size or ConvNeXt effective reduction.
     """
     global model, processor, DEVICE
 
     batch_size, height, width = data.shape
 
-    # Calculate how many shifts we need
-    # For stride < patch_size, we need multiple shifts to cover all positions
     if stride >= patch_size:
-        shifts = [(0, 0)]  # No sliding window needed
+        shifts = [(0, 0)]
     else:
-        shifts = []
-        # Generate shifts from 0 to (patch_size - stride) in steps of stride
-        for dy in range(0, patch_size, stride):
-            for dx in range(0, patch_size, stride):
-                shifts.append((dy, dx))
+        shifts = [
+            (dy, dx)
+            for dy in range(0, patch_size, stride)
+            for dx in range(0, patch_size, stride)
+        ]
 
-    # Pre-pad all images to handle maximum shifts
     max_shift = patch_size - stride if stride < patch_size else 0
 
     if max_shift > 0:
@@ -366,188 +530,72 @@ def _process_sliding_window(data, stride, patch_size, image_size):
             (batch_size, height + max_shift, width + max_shift), dtype=data.dtype
         )
         for b in range(batch_size):
-            # Pad with reflection to avoid edge artifacts
             padded_data[b] = np.pad(
                 data[b], ((0, max_shift), (0, max_shift)), mode="reflect"
             )
     else:
-        padded_data = data  # No padding needed
+        padded_data = data
 
-    # Get number of output channels from a test run
-    test_features = _process_single_standard(data[:1], image_size)  # Just first image
-    output_channels = test_features.shape[0]
+    # Determine output channels (and, for ConvNeXt, cache effective_patch) via a tiny run
+    # print("[sliding] Probing a tiny forward to resolve channels/effective_patch...")
+    test_features = _process_single_standard(data[:1], image_size)  # (C, 1, ph, pw)
+    output_channels_local = test_features.shape[0]
+    # print(
+    #     f"[sliding] Probe result: C={output_channels_local}, effective_patch={_effective_patch}"
+    # )
 
-    # Collect all shifted data for batched processing
+    # Collect shifted data
     all_shifted_data = []
-
     for dy, dx in shifts:
-        # Extract shifted windows from pre-padded data
-        shifted_data = np.zeros((batch_size, height, width), dtype=data.dtype)
+        shifted = np.zeros((batch_size, height, width), dtype=data.dtype)
         for b in range(batch_size):
-            # Extract the shifted region
-            start_y = dy
-            start_x = dx
-            end_y = start_y + height
-            end_x = start_x + width
-            shifted_data[b] = padded_data[b, start_y:end_y, start_x:end_x]
+            shifted[b] = padded_data[b, dy : dy + height, dx : dx + width]
+        all_shifted_data.append(shifted)
 
-        all_shifted_data.append(shifted_data)
+    combined_shifted_data = np.concatenate(
+        all_shifted_data, axis=0
+    )  # (num_shifts*B, H, W)
+    # print(
+    #     f"[sliding] Running combined batch of {combined_shifted_data.shape[0]} slices for {len(shifts)} shift(s)"
+    # )
+    combined_features = _process_single_standard(
+        combined_shifted_data, image_size
+    )  # (C, num_shifts*B, ph, pw)
 
-    # Combine all shifts into one big batch for efficient processing
-    # Shape: (num_shifts * batch_size, height, width)
-    combined_shifted_data = np.concatenate(all_shifted_data, axis=0)
-
-    # Process all shifts in one DINOv3 call
-    combined_features = _process_single_standard(combined_shifted_data, image_size)
-
-    # Split the results back into individual shifts
-    # combined_features shape: (output_channels, num_shifts * batch_size, patch_h, patch_w)
+    # Split by shifts
     all_shift_features = []
     for i in range(len(shifts)):
-        start_idx = i * batch_size
-        end_idx = start_idx + batch_size
-        shift_features = combined_features[:, start_idx:end_idx, :, :]
-        all_shift_features.append(shift_features)
+        s = i * batch_size
+        e = s + batch_size
+        all_shift_features.append(combined_features[:, s:e, :, :])
 
-    # Now we need to combine the shifted features into a higher resolution grid
-    # Each shift gives us features at positions that are stride apart
     if stride == patch_size:
-        # No overlapping, just return the first (and only) shift
-        high_res_features = all_shift_features[0]
+        return all_shift_features[0]
     else:
-        # Combine overlapping features by interleaving them
-        high_res_features = _combine_shifted_features(
-            all_shift_features, stride, patch_size, output_channels, batch_size
+        return _combine_shifted_features(
+            all_shift_features, stride, patch_size, output_channels_local, batch_size
         )
 
-    return high_res_features
 
-
-def _process_single_standard(data, image_size):
-    """
-    Process data through standard DINOv3 without sliding window.
-
-    Parameters:
-    -----------
-    data : numpy.ndarray
-        Input images of shape (batch_size, height, width)
-    image_size : int
-        DINOv3 input image size
-
-    Returns:
-    --------
-    numpy.ndarray: Standard resolution features
-    """
-    global model, processor, DEVICE
-
-    batch_size, height, width = data.shape
-
-    # Convert to PIL Images for the processor
-    pil_images = []
-    for i in range(batch_size):
-        # Normalize to 0-255 range for PIL
-        img_normalized = (
-            (data[i] - data[i].min()) / (data[i].max() - data[i].min() + 1e-8) * 255
-        ).astype(np.uint8)
-        pil_image = Image.fromarray(img_normalized).convert("RGB")
-        pil_images.append(pil_image)
-
-    # Process through DINOv3 processor
-    inputs = processor(images=pil_images, return_tensors="pt")
-    inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
-
-    # Extract features
-    with torch.no_grad():
-        outputs = model(**inputs)
-        # Use last_hidden_state which has shape (batch_size, num_tokens, hidden_size)
-        features = outputs.last_hidden_state
-
-        # Calculate expected number of patch tokens based on input size and patch size
-        # Get the actual processed image size from the inputs
-        processed_height, processed_width = inputs["pixel_values"].shape[-2:]
-        patch_size = model.config.patch_size
-
-        # Calculate expected patch grid dimensions
-        expected_patch_h = processed_height // patch_size
-        expected_patch_w = processed_width // patch_size
-        expected_patch_tokens = expected_patch_h * expected_patch_w
-
-        # Total tokens = patch_tokens + special_tokens (CLS + register tokens)
-        total_tokens = features.shape[1]
-        num_special_tokens = total_tokens - expected_patch_tokens
-
-        # Extract only patch features (skip special tokens at the beginning)
-        if num_special_tokens > 0:
-            patch_features = features[
-                :, num_special_tokens:, :
-            ]  # Shape: (batch_size, num_patches, hidden_size)
-        else:
-            # Fallback: if calculation doesn't work, assume all tokens are patch tokens
-            patch_features = features
-            expected_patch_h = expected_patch_w = int(np.sqrt(total_tokens))
-            print(
-                f"Warning: Could not determine special tokens, using all {total_tokens} tokens as patches"
-            )
-
-        # Verify we have the expected number of patch tokens
-        actual_patch_tokens = patch_features.shape[1]
-        if actual_patch_tokens != expected_patch_tokens:
-            print(
-                f"Warning: Expected {expected_patch_tokens} patch tokens, got {actual_patch_tokens}"
-            )
-            # Recalculate patch dimensions based on actual tokens
-            expected_patch_h = expected_patch_w = int(np.sqrt(actual_patch_tokens))
-            if expected_patch_h * expected_patch_w != actual_patch_tokens:
-                # If not a perfect square, find the closest factorization
-                factors = []
-                for i in range(1, int(np.sqrt(actual_patch_tokens)) + 1):
-                    if actual_patch_tokens % i == 0:
-                        factors.append((i, actual_patch_tokens // i))
-                # Choose the factor pair closest to square
-                expected_patch_h, expected_patch_w = min(
-                    factors, key=lambda x: abs(x[0] - x[1])
-                )
-                print(
-                    f"Using {expected_patch_h}x{expected_patch_w} patch grid for {actual_patch_tokens} tokens"
-                )
-
-        # Reshape to spatial format
-        # Reshape: (batch_size, num_patches, hidden_size) -> (batch_size, patch_h, patch_w, hidden_size)
-        spatial_features = patch_features.reshape(
-            batch_size, expected_patch_h, expected_patch_w, -1
-        )
-
-        # Rearrange to (hidden_size, batch_size, patch_h, patch_w) to match expected output format
-        output = spatial_features.permute(3, 0, 1, 2).cpu().numpy().astype(np.float32)
-
-    return output
-
-
+# -------------------- Public API --------------------
 def process(data, model_id=None, image_size=896, stride=None):
     """
     Process raw image data through DINOv3 to extract features.
 
     Supports sliding window inference for higher resolution outputs by using
-    overlapping patches with stride < patch_size.
+    overlapping patches with stride < patch_size (ViT) or < effective_patch (ConvNeXt).
 
-    Parameters:
-    -----------
-    data : numpy.ndarray
-        Input images of shape (batch_size, height, width) or (height, width)
-    model_id : str, optional
-        Model ID to use (will initialize if different from current)
-    image_size : int, default=896
-        Input image size for DINOv3
-    stride : int, optional
-        Stride for sliding window inference. If None, uses patch_size (no overlap).
-        If stride < patch_size, creates overlapping windows for higher resolution.
+    Args:
+        data : np.ndarray (H, W) or (B, H, W)
+        model_id : str (optional) -> initializes/switches model
+        image_size : int (resize/crop target)
+        stride : int (None -> no overlap; else < patch/effective_patch for HR)
 
     Returns:
-    --------
-    numpy.ndarray: Features of shape (output_channels, batch_size, patch_h, patch_w)
-        If stride is provided, patch_h and patch_w will be higher than default.
+        np.ndarray: (C, B, patch_h, patch_w)
     """
-    global model, processor, DEVICE
+    global model, processor, DEVICE, current_model_id, output_channels
+    global _is_convnext, _effective_patch, _vit_patch_size
 
     # Initialize or switch model if needed
     if model_id is not None and model_id != current_model_id:
@@ -555,21 +603,24 @@ def process(data, model_id=None, image_size=896, stride=None):
     else:
         ensure_initialized(model_id)
 
-    # Handle single image
+    # Ensure batch dim
     if data.ndim == 2:
-        data = data[np.newaxis, ...]  # Add batch dimension
+        data = data[np.newaxis, ...]
 
-    batch_size, height, width = data.shape
-
-    # If stride is specified and different from patch size, use sliding window inference
-    patch_size = model.config.patch_size
+    # Decide the "patch size" concept for sliding:
+    if not _is_convnext:
+        patch_size = _vit_patch_size or int(getattr(model.config, "patch_size", 16))
+    else:
+        # If effective_patch not known yet, infer by a small run
+        if _effective_patch is None:
+            # print("[process] effective_patch unknown for ConvNeXt; probing...")
+            _ = _process_single_standard(data[:1], image_size)
+            # print(f"[process] effective_patch inferred: {_effective_patch}")
+        patch_size = int(_effective_patch)
 
     if stride is not None and stride != patch_size:
+        # print(f"[process] Sliding-window mode: patch={patch_size}, stride={stride}")
         return _process_sliding_window(data, stride, patch_size, image_size)
 
-    # Otherwise, use standard processing
+    # print(f"[process] Single-pass mode: patch/effective={patch_size}")
     return _process_single_standard(data, image_size)
-
-
-# DINOv3 initialization is now explicit only
-# Call initialize_dinov3() with your desired parameters before using the model

@@ -60,6 +60,16 @@ from .losses import (
     get_loss_function,
 )
 
+# Affinity utilities
+from .affinity_utils import (
+    compute_affinities_3d,
+    compute_affinities_2d,
+    compute_boundary_weights,
+    AffinityLoss,
+    BoundaryWeightedAffinityLoss,
+    affinities_to_instances,
+)
+
 # Visualization
 try:
     from .visualization import (
@@ -142,6 +152,13 @@ __all__ = [
     "FocalDiceLoss",
     "TverskyLoss",
     "get_loss_function",
+    # Affinity utilities
+    "compute_affinities_3d",
+    "compute_affinities_2d",
+    "compute_boundary_weights",
+    "AffinityLoss",
+    "BoundaryWeightedAffinityLoss",
+    "affinities_to_instances",
     # Visualization
     "plot_training_history",
     "plot_class_distribution",

@@ -9,3 +9,4 @@
 # zarr
 # funlib.geometry
 # cellmap_flow
+edt  # For boundary-weighted loss (Euclidean Distance Transform)
