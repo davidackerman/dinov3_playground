@@ -43,7 +43,12 @@ class DINOv3UNetInference:
     from a training export directory.
     """
 
-    def __init__(self, export_dir: str, device: Optional[str] = None):
+    def __init__(
+        self,
+        export_dir: str,
+        device: Optional[str] = None,
+        checkpoint_preference: str = "best",
+    ):
         """
         Initialize the inference class.
 
@@ -62,6 +67,8 @@ class DINOv3UNetInference:
         self.dinov3_model = None
         self.model_config = None
         self.training_config = None
+        # checkpoint preference: "best" or "latest"
+        self.checkpoint_preference = checkpoint_preference
 
         # Load the model
         self._load_model()
@@ -92,15 +99,43 @@ class DINOv3UNetInference:
         # Take the most recent directory (sort by name, which includes timestamp)
         checkpoint_dir = sorted(timestamp_dirs)[-1]
 
-        # Find best model checkpoint - the training saves as "best.pkl"
-        best_model_path = checkpoint_dir / "best.pkl"
+        # Select checkpoint file according to preference
+        best_model_path = None
+        if getattr(self, "checkpoint_preference", "best") == "latest":
+            # look for epoch checkpoints highest-numbered
+            epoch_files = list(checkpoint_dir.glob("checkpoint_epoch_*.pkl"))
+            max_file = None
+            max_num = -1
+            import re
+
+            for f in epoch_files:
+                m = re.search(r"checkpoint_epoch_(\d+)\.pkl$", f.name)
+                if m:
+                    try:
+                        num = int(m.group(1))
+                    except Exception:
+                        continue
+                    if num > max_num:
+                        max_num = num
+                        max_file = f
+
+            if max_file is not None:
+                best_model_path = max_file
+            else:
+                # fallback to best.pkl
+                best_model_path = checkpoint_dir / "best.pkl"
+        else:
+            best_model_path = checkpoint_dir / "best.pkl"
+
+        # If preferred file isn't present, fall back to any non-stats .pkl as before
         if not best_model_path.exists():
-            # Look for any .pkl files as fallback
             pkl_files = list(checkpoint_dir.glob("*.pkl"))
             pkl_files = [f for f in pkl_files if not f.name.startswith("stats_epoch_")]
             if pkl_files:
-                best_model_path = pkl_files[0]  # Take the first non-epoch file
-                warnings.warn(f"No best.pkl found, using {best_model_path.name}")
+                best_model_path = pkl_files[0]
+                warnings.warn(
+                    f"No preferred checkpoint found, using {best_model_path.name}"
+                )
             else:
                 raise ValueError(f"No model checkpoints found in {checkpoint_dir}")
 
@@ -185,7 +220,7 @@ class DINOv3UNetInference:
             # Assume the entire checkpoint is the state dict
             self.unet.load_state_dict(checkpoint)
 
-        self.unet.eval()
+        self.unet.train()
 
         print(f"✅ Model loaded successfully!")
         print(f"   - Device: {self.device}")
@@ -293,7 +328,12 @@ class DINOv3UNet3DInference:
     from a training export directory.
     """
 
-    def __init__(self, export_dir: str, device: Optional[str] = None):
+    def __init__(
+        self,
+        export_dir: str,
+        device: Optional[str] = None,
+        checkpoint_preference: str = "best",
+    ):
         """
         Initialize the 3D inference class.
 
@@ -312,6 +352,8 @@ class DINOv3UNet3DInference:
         self.data_loader = None
         self.model_config = None
         self.training_config = None
+        # checkpoint preference: "best" or "latest"
+        self.checkpoint_preference = checkpoint_preference
 
         # Load the model
         self._load_model()
@@ -342,15 +384,40 @@ class DINOv3UNet3DInference:
         # Take the most recent directory (sort by name, which includes timestamp)
         checkpoint_dir = sorted(timestamp_dirs)[-1]
 
-        # Find best model checkpoint - the training saves as "best.pkl"
-        best_model_path = checkpoint_dir / "best.pkl"
+        # Select checkpoint file according to preference (same logic as 2D loader)
+        best_model_path = None
+        if getattr(self, "checkpoint_preference", "best") == "latest":
+            epoch_files = list(checkpoint_dir.glob("checkpoint_epoch_*.pkl"))
+            max_file = None
+            max_num = -1
+            import re
+
+            for f in epoch_files:
+                m = re.search(r"checkpoint_epoch_(\d+)\.pkl$", f.name)
+                if m:
+                    try:
+                        num = int(m.group(1))
+                    except Exception:
+                        continue
+                    if num > max_num:
+                        max_num = num
+                        max_file = f
+
+            if max_file is not None:
+                best_model_path = max_file
+            else:
+                best_model_path = checkpoint_dir / "best.pkl"
+        else:
+            best_model_path = checkpoint_dir / "best.pkl"
+
         if not best_model_path.exists():
-            # Look for any .pkl files as fallback
             pkl_files = list(checkpoint_dir.glob("*.pkl"))
             pkl_files = [f for f in pkl_files if not f.name.startswith("stats_epoch_")]
             if pkl_files:
-                best_model_path = pkl_files[0]  # Take the first non-epoch file
-                warnings.warn(f"No best.pkl found, using {best_model_path.name}")
+                best_model_path = pkl_files[0]
+                warnings.warn(
+                    f"No preferred checkpoint found, using {best_model_path.name}"
+                )
             else:
                 raise ValueError(f"No model checkpoints found in {checkpoint_dir}")
 
@@ -505,7 +572,7 @@ class DINOv3UNet3DInference:
         else:
             self.unet3d.load_state_dict(checkpoint)
 
-        self.unet3d.train()
+        self.unet3d.eval()
 
         # Get orthogonal planes setting from training config
         # Default to False for backward compatibility with models trained before orthogonal planes were added
@@ -656,13 +723,13 @@ class DINOv3UNet3DInference:
                     # else:
                     #     lsds_logits = logits[:, :num_lsds, ...]
                     #     aff_logits = logits[:, num_lsds:, ...]
-
+                    #
                     #     # Apply sigmoid only to affinity logits
                     #     aff_probs = torch.sigmoid(aff_logits)
-
+                    #
                     #     # Compose predictions: LSDS raw logits first, then affinity probabilities
                     #     predictions = torch.cat([lsds_logits, aff_probs], dim=1)
-
+                    #
                     #     # Keep a matching 'probabilities' variable for downstream return
                     #     probabilities = predictions
             else:
@@ -771,7 +838,10 @@ class DINOv3UNet3DInference:
 
 
 def load_inference_model(
-    export_dir: str, model_type: str = "auto", device: Optional[str] = None
+    export_dir: str,
+    model_type: str = "auto",
+    device: Optional[str] = None,
+    checkpoint_preference: str = "best",
 ) -> Union[DINOv3UNetInference, DINOv3UNet3DInference]:
     """
     Convenience function to automatically load the appropriate inference model.
@@ -876,9 +946,13 @@ def load_inference_model(
             warnings.warn("No checkpoint directories found, defaulting to 2D")
 
     if model_type == "3d":
-        return DINOv3UNet3DInference(export_dir, device)
+        return DINOv3UNet3DInference(
+            export_dir, device, checkpoint_preference=checkpoint_preference
+        )
     else:
-        return DINOv3UNetInference(export_dir, device)
+        return DINOv3UNetInference(
+            export_dir, device, checkpoint_preference=checkpoint_preference
+        )
 
 
 # Example usage functions
