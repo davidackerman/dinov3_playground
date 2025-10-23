@@ -3059,6 +3059,7 @@ def train_3d_unet_memory_efficient_v2(
                     "memory_efficient_mode": memory_efficient_mode,
                     "learn_upsampling": learn_upsampling,  # Add upsampling mode
                     "use_orthogonal_planes": data_loader_3d.use_orthogonal_planes,  # Add orthogonal planes setting
+                    "use_anyup": data_loader_3d.use_anyup,  # Add AnyUp setting
                     "train_volume_pool_size": data_loader_3d.train_volume_pool_size,
                     "val_volume_pool_size": data_loader_3d.val_volume_pool_size,
                     "checkpoint_every_n_epochs": checkpoint_every_n_epochs,  # Add checkpoint frequency

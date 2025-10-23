@@ -2306,6 +2306,7 @@ class DINOv3UNet3DPipeline(nn.Module):
 
             # ============ ANYUP INTEGRATION HERE ============
             if self.use_anyup and self.anyup_model is not None:
+                print(f"      Using AnyUp for feature upsampling instead of interpolation")
                 # Use AnyUp for upsampling instead of interpolation
                 anyup_start = time.time() if enable_timing else None
 
@@ -2363,9 +2364,10 @@ class DINOv3UNet3DPipeline(nn.Module):
                                 with torch.amp.autocast(
                                     device_type=device.type, dtype=torch.float16
                                 ):
-                                    print(
-                                        f"      AnyUp upsampling: {sub_images_fp16.shape} + {sub_features_fp16.shape} → {target_dim1}×{target_dim2}"
-                                    )
+                                    if enable_timing:
+                                        print(
+                                            f"      AnyUp upsampling: {sub_images_fp16.shape} + {sub_features_fp16.shape} → {target_dim1}×{target_dim2}"
+                                        )
 
                                     upsampled = self.anyup_model(
                                         sub_images_fp16,
