@@ -61,6 +61,7 @@ def per_sample_mean(x, mask, weights=None, eps=1e-8):
     B = x.shape[0]
     m = mask.unsqueeze(1).expand_as(x)  # [B,C,D,H,W]
     xw = x * m
+
     if weights is not None:
         w = weights
         if w.dim() == 5 and w.shape[1] == 1:
@@ -1064,6 +1065,7 @@ class BoundaryWeightedAffinityFocalLSDSLoss(torch.nn.Module):
         pos_weight=None,
         lsds_weight=0.25,
         affinity_weight=1.0,
+        boundary_weight_power=1.0,
         mask_clip_distance=None,
     ):
         super(BoundaryWeightedAffinityFocalLSDSLoss, self).__init__()
@@ -1077,6 +1079,7 @@ class BoundaryWeightedAffinityFocalLSDSLoss(torch.nn.Module):
         self.lsds_weight = lsds_weight
         self.affinity_weight = affinity_weight
         self.mask_clip_distance = mask_clip_distance
+        self.boundary_weight_power = boundary_weight_power
 
         # MSE loss for LSDS
         self.mse_loss = torch.nn.MSELoss(reduction="none")
@@ -1107,26 +1110,19 @@ class BoundaryWeightedAffinityFocalLSDSLoss(torch.nn.Module):
         predictions,
         targets,
         instance_seg=None,
+        boundary_weights=None,
         mask=None,
         return_components=False,
     ):
-        """
-        predictions : (B, 10 + num_offsets, D, H, W)
-        targets     : same shape
-        instance_seg: (B, D, H, W)
-        mask        : (B, D, H, W) valid-region mask (0/1)
-        """
         B = predictions.shape[0]
         device = predictions.device
         dtype = predictions.dtype
 
-        # Split LSDS and affinities
         pred_lsds = predictions[:, : self.num_lsds, ...]
         pred_affs = predictions[:, self.num_lsds :, ...]
         target_lsds = targets[:, : self.num_lsds, ...]
         target_affs = targets[:, self.num_lsds :, ...]
 
-        # Default mask = all valid
         if mask is None:
             mask = torch.ones(
                 (B, predictions.shape[2], predictions.shape[3], predictions.shape[4]),
@@ -1134,95 +1130,128 @@ class BoundaryWeightedAffinityFocalLSDSLoss(torch.nn.Module):
                 dtype=dtype,
             )
 
-        # Keep an unclipped version around for boundary weights
         og_mask_np = mask.detach().to("cpu").numpy()
 
-        # Optional mask erosion (clip distance)
         if self.mask_clip_distance and self.mask_clip_distance > 0:
             mask = self.erode_mask(mask, self.mask_clip_distance)
 
+        # ✅ Check for empty mask
+        if mask.sum() == 0:
+            return torch.tensor(0.0, device=device, dtype=dtype, requires_grad=True)
+
         # -------------------------
-        # LSDS loss (Huber by default; fall back to MSE if desired)
+        # LSDS loss
         # -------------------------
-        # Using sigmoid on predictions as in your original code
         pred_lsds_sig = torch.sigmoid(pred_lsds)
 
-        # Swap to SmoothL1 for robustness (beta≈1.0 is a good start)
-        # If you want MSE, set use_huber=False
-        use_huber = True
-        if use_huber:
-            lsds_per_voxel = torch.nn.functional.smooth_l1_loss(
-                pred_lsds_sig, target_lsds, reduction="none", beta=1.0
-            )
-        else:
-            lsds_per_voxel = self.mse_loss(pred_lsds_sig, target_lsds)
+        lsds_per_voxel = torch.nn.functional.smooth_l1_loss(
+            pred_lsds_sig, target_lsds, reduction="none", beta=1.0
+        )
 
-        # Per-sample masked mean, then batch-mean (no extra weights)
         lsds_loss, lsds_denoms = per_sample_mean(lsds_per_voxel, mask)
 
         # -------------------------
         # Boundary weights
         # -------------------------
-        if isinstance(instance_seg, torch.Tensor):
-            instance_seg_np = instance_seg.detach().to("cpu").numpy()
-        else:
-            instance_seg_np = instance_seg
+        if boundary_weights is None:
+            if isinstance(instance_seg, torch.Tensor):
+                instance_seg_np = instance_seg.detach().to("cpu").numpy()
+            else:
+                instance_seg_np = instance_seg
 
-        if instance_seg_np.ndim == 3:
-            instance_seg_np = instance_seg_np[np.newaxis, ...]  # [B,D,H,W]
+            if instance_seg_np.ndim == 3:
+                instance_seg_np = instance_seg_np[np.newaxis, ...]
 
-        bweights_list = []
-        for b in range(B):
-            weights = compute_boundary_weights(
-                instance_seg_np[b],
-                boundary_weight=self.boundary_weight,
-                sigma=self.sigma,
-                anisotropy=self.anisotropy,
-                mask=og_mask_np[b],
-                black_border=False,
+            bweights_list = []
+            for b in range(B):
+                weights = compute_boundary_weights(
+                    instance_seg_np[b],
+                    boundary_weight=self.boundary_weight,
+                    sigma=self.sigma,
+                    anisotropy=self.anisotropy,
+                    mask=og_mask_np[b],
+                    black_border=False,
+                )
+                bweights_list.append(weights)
+
+            boundary_weights = torch.from_numpy(np.stack(bweights_list, axis=0)).to(
+                device=device, dtype=dtype
             )
-            bweights_list.append(weights)
-
-        boundary_weights = torch.from_numpy(np.stack(bweights_list, axis=0)).to(
-            device=device, dtype=dtype
-        )  # [B,D,H,W]
-        boundary_weights = boundary_weights.unsqueeze(1).expand_as(
-            pred_affs
-        )  # [B,C,D,H,W]
-
+        # ✅ Clamp boundary weights
+        # boundary_weights = torch.clamp(boundary_weights, min=0.1, max=10.0)
+        boundary_weights = boundary_weights.detach()  # ✅ Detach here
+        boundary_weights = boundary_weights**self.boundary_weight_power
+        boundary_weights = boundary_weights.unsqueeze(1).expand_as(pred_affs)
         # -------------------------
-        # Affinity focal
+        # ✅ STABLE Affinity focal loss
         # -------------------------
-        # Slight target smoothing retained
         target_affs_smooth = target_affs * 0.96 + 0.02
 
-        # Focal computed via logpt trick (matches your code)
-        bce_per_voxel = torch.nn.functional.binary_cross_entropy_with_logits(
-            pred_affs, target_affs_smooth, reduction="none"
+        # ✅ Clamp logits to prevent extreme values
+        pred_affs_clamped = torch.clamp(pred_affs, min=-15, max=15)
+
+        # Get probabilities directly (more stable than exp(logpt))
+        pred_probs = torch.sigmoid(pred_affs_clamped)  # p
+
+        # Compute focal weight: (1 - p_t)^gamma where p_t is prob of true class
+        # If target=1, p_t = p;  if target=0, p_t = 1-p
+        p_t = target_affs_smooth * pred_probs + (1 - target_affs_smooth) * (
+            1 - pred_probs
         )
-        logpt = -bce_per_voxel
-        pt = torch.exp(logpt)  # p_t
-        focal = (1.0 - pt).pow(self.gamma)
+        p_t = torch.clamp(p_t, min=1e-7, max=1.0 - 1e-7)  # Numerical stability
+
+        focal_weight = (1 - p_t).pow(self.gamma)
+
+        # Alpha balancing
         alpha_factor = target_affs_smooth * self.alpha + (1 - target_affs_smooth) * (
             1 - self.alpha
         )
-        aff_per_voxel = -(alpha_factor * focal * logpt)  # positive loss
 
-        # Apply boundary weights
-        aff_per_voxel = aff_per_voxel * boundary_weights
-
-        # Per-sample masked+weighted mean for affinities
-        affinity_loss, aff_denoms = per_sample_mean(
-            aff_per_voxel, mask, weights=boundary_weights
+        # BCE loss
+        bce_loss = torch.nn.functional.binary_cross_entropy_with_logits(
+            pred_affs_clamped, target_affs_smooth, reduction="none"
         )
 
-        # -------------------------
-        # Combine
-        # -------------------------
+        # Final focal loss
+        aff_per_voxel = alpha_factor * focal_weight * bce_loss
+
+        # ✅ Check for NaN/Inf before applying weights
+        if torch.isnan(aff_per_voxel).any() or torch.isinf(aff_per_voxel).any():
+            print("⚠️ NaN/Inf in affinity loss before weighting")
+            print(
+                f"  pred_probs: min={pred_probs.min():.4f}, max={pred_probs.max():.4f}"
+            )
+            print(f"  p_t: min={p_t.min():.4f}, max={p_t.max():.4f}")
+            print(
+                f"  focal_weight: min={focal_weight.min():.4f}, max={focal_weight.max():.4f}"
+            )
+            print(f"  bce_loss: min={bce_loss.min():.4f}, max={bce_loss.max():.4f}")
+            # Replace NaN with 0
+            aff_per_voxel = torch.where(
+                torch.isnan(aff_per_voxel) | torch.isinf(aff_per_voxel),
+                torch.zeros_like(aff_per_voxel),
+                aff_per_voxel,
+            )
+
+        # Apply boundary weights through per_sample_mean
+        affinity_loss, _ = per_sample_mean(
+            aff_per_voxel,
+            mask,
+            weights=boundary_weights,  # Original weights (max=5)
+        )
+
+        # ✅ Final checks
+        if torch.isnan(lsds_loss) or torch.isinf(lsds_loss):
+            print(f"⚠️ NaN/Inf in LSDS loss: {lsds_loss}")
+            lsds_loss = torch.zeros_like(lsds_loss)
+
+        if torch.isnan(affinity_loss) or torch.isinf(affinity_loss):
+            print(f"⚠️ NaN/Inf in affinity loss: {affinity_loss}")
+            affinity_loss = torch.zeros_like(affinity_loss)
+
         total_loss = self.lsds_weight * lsds_loss + self.affinity_weight * affinity_loss
 
         if return_components:
-            # Useful for TensorBoard: make them python floats (detach)
             out = {
                 "total": float(total_loss.detach().cpu()),
                 "lsds": float(lsds_loss.detach().cpu()),
@@ -1319,61 +1348,69 @@ if __name__ == "__main__":
         # raw = all_vol_data["vol_raw"]
         # gt = all_vol_data["vol_seg"]
         # targets = all_vol_data["vol_targets"]
-        # from lsd_lite import get_affs, get_lsds
+        from lsd_lite import get_affs, get_lsds
 
-        # new_affs = get_affs(
-        #     gt,
-        #     neighborhood=[
-        #         (1, 0, 0),
-        #         (0, 1, 0),
-        #         (0, 0, 1),
-        #         (3, 0, 0),
-        #         (0, 3, 0),
-        #         (0, 0, 3),
-        #         (9, 0, 0),
-        #         (0, 9, 0),
-        #         (0, 0, 9),
-        #     ],
-        #     dist="equality-no-bg",
-        #     pad=9,
-        # )
-        # new_lsds = get_lsds(gt, sigma=20.0)
-        # my_affs = compute_affinities_and_lsds_3d(
-        #     gt,
-        #     offsets=[
-        #         (1, 0, 0),
-        #         (0, 1, 0),
-        #         (0, 0, 1),
-        #         (3, 0, 0),
-        #         (0, 3, 0),
-        #         (0, 0, 3),
-        #         (9, 0, 0),
-        #         (0, 9, 0),
-        #         (0, 0, 9),
-        #     ],
-        #     lsds_sigma=20.0,
-        # )
-        # # swap x and z axes for gt
+        gt = instance_seg[0]
+        # gt upsample  to 128x128x128 from 32x32x32
+        gt = np.kron(gt, np.ones((4, 4, 4), dtype=gt.dtype))
 
-        # for i in range(len(gt)):
-        #     plt.figure()
-        #     # create two columns
-        #     plt.subplot(1, 4, 1)
-        #     print(np.unique(gt[i]))
-        #     # color unique values as red green blue
-        #     color_map = {0: (0, 0, 0), 4: (255, 0, 0), 220: (0, 255, 0)}
-        #     colored_gt = np.zeros((*gt[:, i, :].shape, 3), dtype=np.uint8)
-        #     for label, color in color_map.items():
-        #         plt.title(f"Slice {i} - label {label}")
-        #         colored_gt[gt[i] == label] = color
-        #     plt.imshow(colored_gt)
-        #     plt.subplot(1, 4, 2)
-        #     plt.title(f"Slice {i} - affs")
-        #     plt.imshow(targets[0, 10, i]>0,vmin=0,vmax=1)
-        #     plt.subplot(1, 4, 3)
-        #     plt.title(f"Slice {i} - new_affs")
-        #     plt.imshow(new_affs[0, i]>0,vmin=0,vmax=1)
-        #     plt.subplot(1, 4, 4)
-        #     plt.title(f"Slice {i} - my_affs")
-        #     plt.imshow(my_affs[10, i]>0,vmin=0,vmax=1)
+        new_affs = get_affs(
+            gt,
+            neighborhood=[
+                (1, 0, 0),
+                (0, 1, 0),
+                (0, 0, 1),
+                (3, 0, 0),
+                (0, 3, 0),
+                (0, 0, 3),
+                (9, 0, 0),
+                (0, 9, 0),
+                (0, 0, 9),
+            ],
+            dist="equality-no-bg",
+            pad=9,
+        )
+        new_lsds = get_lsds(gt, sigma=20.0)
+        import time
+
+        t0 = time.time()
+        my_affs = compute_affinities_and_lsds_3d(
+            gt,
+            offsets=[
+                (1, 0, 0),
+                (0, 1, 0),
+                (0, 0, 1),
+                (3, 0, 0),
+                (0, 3, 0),
+                (0, 0, 3),
+                (9, 0, 0),
+                (0, 9, 0),
+                (0, 0, 9),
+            ],
+            lsds_sigma=20.0,
+        )
+        print(f"My computation time: {time.time() - t0:.2f} seconds")
+        # swap x and z axes for gt
+
+        for i in range(len(gt)):
+            plt.figure()
+            # create two columns
+            plt.subplot(1, 4, 1)
+            print(np.unique(gt[i]))
+            # color unique values as red green blue
+            color_map = {0: (0, 0, 0), 4: (255, 0, 0), 220: (0, 255, 0)}
+            colored_gt = np.zeros((*gt[:, i, :].shape, 3), dtype=np.uint8)
+            for label, color in color_map.items():
+                plt.title(f"Slice {i} - label {label}")
+                colored_gt[gt[i] == label] = color
+            plt.imshow(colored_gt)
+            plt.subplot(1, 4, 2)
+            plt.title(f"Slice {i} - affs")
+            plt.imshow(targets[0, 10, i] > 0, vmin=0, vmax=1)
+            plt.subplot(1, 4, 3)
+            plt.title(f"Slice {i} - new_affs")
+            plt.imshow(new_affs[0, i] > 0, vmin=0, vmax=1)
+            plt.subplot(1, 4, 4)
+            plt.title(f"Slice {i} - my_affs")
+            plt.imshow(my_affs[10, i] > 0, vmin=0, vmax=1)
 # %%
