@@ -511,6 +511,7 @@ def get_loss_function(loss_type, class_weights=None, **kwargs):
             alpha=alpha,
             gamma=gamma,
             mask_clip_distance=kwargs.get("mask_clip_distance", 9),
+            boundary_weight_power=kwargs.get("boundary_weight_power", 1.0),
         )
 
     else:
