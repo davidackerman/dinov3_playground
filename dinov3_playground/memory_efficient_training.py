@@ -60,6 +60,12 @@ from torch.utils.tensorboard import SummaryWriter
 import matplotlib.pyplot as plt
 import imageio
 import io
+from .preprocessed_dataloader import (
+    PreprocessedDINOv3Dataset,
+    create_preprocessed_dataloader,
+)
+
+from typing import Optional, List, Tuple
 
 
 def print_class_metrics_table(
@@ -3148,7 +3154,7 @@ def train_3d_unet_memory_efficient_v2(
                         all_vol_data=all_vol_data,
                         epoch_step=epoch,
                         tag_prefix="validation",
-                        fps=4,
+                        fps=1,
                         scale_up=1,
                         show_seg_column=True,
                         show_mask_column=True,
@@ -3467,100 +3473,238 @@ def train_3d_unet_memory_efficient(
 
 
 def train_3d_unet_with_memory_efficient_loader(
-    raw_data,
-    gt_data,
-    gt_masks=None,  # NEW PARAMETER for GT extension masks
-    context_data=None,  # NEW PARAMETER for context volumes at lower resolution
-    context_scale=None,  # NEW PARAMETER for context resolution (e.g., 8 for 8nm)
-    train_volume_pool_size=20,
-    val_volume_pool_size=5,
-    num_classes=None,
-    class_names=None,  # NEW PARAMETER for class names (e.g., ['background', 'nuc', 'mito', 'er'])
-    target_volume_size=(64, 64, 64),
-    volumes_per_batch=1,
-    batches_per_epoch=10,
-    epochs=100,
-    learning_rate=1e-3,
-    weight_decay=1e-4,
-    patience=20,
-    min_delta=0.001,
-    base_channels=32,
-    dinov3_slice_size=256,
-    device=None,
-    seed=42,
-    model_id=None,
-    export_base_dir=None,
-    save_checkpoints=True,
-    checkpoint_every_n_epochs=None,  # Save model checkpoint every N epochs (in addition to best)
-    use_class_weighting=True,
-    # NEW MEMORY EFFICIENCY PARAMETERS
-    use_mixed_precision=True,
-    use_half_precision=False,
-    use_gradient_checkpointing=False,
-    memory_efficient_mode="auto",  # "auto", "aggressive", "conservative"
-    learn_upsampling=False,  # NEW PARAMETER
-    dinov3_stride=None,  # NEW PARAMETER for sliding window inference
-    use_orthogonal_planes=False,  # NEW PARAMETER for orthogonal plane processing
-    enable_detailed_timing=False,  # NEW PARAMETER for detailed timing
-    verbose=False,  # NEW PARAMETER to control verbose output
-    # DATA RESOLUTION PARAMETERS
-    min_resolution_for_raw=None,  # NEW PARAMETER for raw data resolution
-    base_resolution=None,  # NEW PARAMETER for ground truth resolution
-    # LOSS FUNCTION PARAMETERS
-    loss_type="weighted_ce",  # 'ce', 'weighted_ce', 'focal', 'dice', 'focal_dice', 'tversky', 'affinity', 'boundary_affinity'
-    focal_gamma=2.0,  # Focusing parameter for Focal Loss
-    focal_weight=0.5,  # Weight for focal component in combined loss
-    dice_weight=0.5,  # Weight for dice component in combined loss
-    dice_smooth=1.0,  # Smoothing for Dice loss
-    tversky_alpha=0.5,  # Tversky alpha (FP weight)
-    tversky_beta=0.5,  # Tversky beta (FN weight)
-    # BOUNDARY WEIGHTING PARAMETERS (for boundary_affinity loss)
-    boundary_weight=10.0,  # Maximum weight at instance boundaries (1.0 = no weighting)
-    boundary_sigma=5.0,  # Distance decay for boundary weights in pixels
-    boundary_anisotropy=None,  # Voxel anisotropy (z,y,x) for EDT; None = isotropic
-    # AFFINITY PARAMETERS
-    output_type="labels",  # 'labels' or 'affinities' or 'affinities_lsds'
-    affinity_offsets=None,  # List of (z,y,x) tuples for affinity computation
-    lsds_sigma=20.0,  # Sigma parameter for LSDS computation (only used when output_type='affinities_lsds')
-    use_batchrenorm=False,  # Whether to use BatchRenorm instead of BatchNorm (more stable for small batches
-    mask_clip_distance=None,
-    use_anyup=False,
+    raw_data=None,  # CHANGED: Now optional, for backward compatibility
+    gt_data=None,  # CHANGED: Now optional, for backward compatibility
+    gt_masks=None,
+    context_data=None,
+    context_scale=None,
+    preprocessed_dir: Optional[str] = None,  # NEW: For preprocessed data
+    train_volume_indices: Optional[
+        List[int]
+    ] = None,  # NEW: Specify training volumes (for preprocessed)
+    val_volume_indices: Optional[
+        List[int]
+    ] = None,  # NEW: Specify validation volumes (for preprocessed)
+    train_volume_pool_size: int = 20,
+    val_volume_pool_size: int = 5,
+    num_classes: Optional[int] = None,
+    class_names: Optional[List[str]] = None,
+    target_volume_size: tuple = (64, 64, 64),
+    volumes_per_batch: int = 1,
+    batches_per_epoch: Optional[int] = None,
+    epochs: int = 100,
+    learning_rate: float = 1e-3,
+    weight_decay: float = 1e-4,
+    patience: int = 20,
+    min_delta: float = 0.001,
+    base_channels: int = 32,
+    dinov3_slice_size: int = 256,
+    device: Optional[torch.device] = None,
+    seed: int = 42,
+    model_id: Optional[str] = None,
+    export_base_dir: Optional[str] = None,
+    save_checkpoints: bool = True,
+    checkpoint_every_n_epochs: Optional[int] = None,
+    use_class_weighting: bool = True,
+    # Memory efficiency parameters
+    use_mixed_precision: bool = True,
+    use_half_precision: bool = False,
+    use_gradient_checkpointing: bool = False,
+    memory_efficient_mode: str = "auto",
+    learn_upsampling: bool = False,
+    dinov3_stride: Optional[int] = None,
+    use_orthogonal_planes: bool = False,
+    enable_detailed_timing: bool = False,
+    verbose: bool = False,
+    # Data resolution parameters
+    min_resolution_for_raw: Optional[float] = None,
+    base_resolution: Optional[float] = None,
+    # Loss function parameters
+    loss_type: str = "weighted_ce",
+    focal_gamma: float = 2.0,
+    focal_weight: float = 0.5,
+    dice_weight: float = 0.5,
+    dice_smooth: float = 1.0,
+    tversky_alpha: float = 0.5,
+    tversky_beta: float = 0.5,
+    # Boundary weighting parameters
+    boundary_weight: float = 10.0,
+    boundary_weight_power: float = 1.0,
+    boundary_sigma: float = 5.0,
+    boundary_anisotropy: Optional[tuple] = None,
+    # Affinity parameters
+    output_type: str = "labels",
+    affinity_offsets: Optional[List[tuple]] = None,
+    lsds_sigma: float = 20.0,
+    use_batchrenorm: bool = False,
+    mask_clip_distance: Optional[float] = None,
+    use_anyup: bool = False,
+    # Preprocessed data specific parameters
+    num_threads: Optional[int] = None,
+    features_dtype: torch.dtype = torch.float32,
 ):
     """
-    Memory-efficient 3D UNet training with multiple precision and memory optimization options.
+    Train 3D UNet with memory-efficient data loading.
+
+    Supports TWO modes:
+    1. LEGACY MODE (on-the-fly feature extraction):
+       Pass raw_data and gt_data to extract DINOv3 features during training
+
+    2. PREPROCESSED MODE (fast loading from TensorStore):
+       Pass preprocessed_dir to load pre-extracted features
 
     Parameters:
     -----------
+    raw_data : numpy.ndarray, optional
+        Raw volume data (N, D, H, W) for legacy mode
+    gt_data : numpy.ndarray, optional
+        Ground truth data (N, D, H, W) for legacy mode
     gt_masks : numpy.ndarray, optional
-        Binary masks indicating valid ground truth regions (1) vs extended regions (0).
-        Shape must match gt_data. Used for GT extension functionality where raw volumes
-        extend beyond ground truth boundaries. If None, all regions are treated as valid.
+        Binary masks for valid GT regions (legacy mode)
+    context_data : numpy.ndarray, optional
+        Context volumes at lower resolution (legacy mode)
+    context_scale : float, optional
+        Context resolution in nm (legacy mode)
+    preprocessed_dir : str, optional
+        Directory containing preprocessed volumes (preprocessed mode)
+    train_volume_indices : list of int, optional
+        Indices of volumes for training (preprocessed mode). If None, auto-generates
+    val_volume_indices : list of int, optional
+        Indices of volumes for validation (preprocessed mode). If None, auto-generates
+    train_volume_pool_size : int
+        Number of training volumes
+    val_volume_pool_size : int
+        Number of validation volumes
+    num_classes : int, optional
+        Number of output classes. If None, auto-detected
+    class_names : list of str, optional
+        Names of classes
+    target_volume_size : tuple
+        Target volume size (D, H, W)
+    volumes_per_batch : int
+        Batch size
+    batches_per_epoch : int, optional
+        Number of batches per epoch. If None, uses all training data
+    epochs : int
+        Maximum number of training epochs
+    learning_rate : float
+        Initial learning rate
+    weight_decay : float
+        Weight decay for optimizer
+    patience : int
+        Early stopping patience
+    min_delta : float
+        Minimum improvement for early stopping
+    base_channels : int
+        Base number of channels in UNet
+    dinov3_slice_size : int
+        Size of DINOv3 input slices (legacy mode)
+    device : torch.device, optional
+        Device to train on. If None, auto-selects
+    seed : int
+        Random seed
+    model_id : str, optional
+        Model identifier
+    export_base_dir : str, optional
+        Base directory for exports
+    save_checkpoints : bool
+        Save model checkpoints
     checkpoint_every_n_epochs : int, optional
-        Save full model checkpoint every N epochs, regardless of performance.
-        In addition to always saving the best model, this allows periodic backups.
-        If None (default), only saves the best model and training statistics every epoch.
-        Example: checkpoint_every_n_epochs=10 saves model every 10 epochs.
+        Save checkpoint every N epochs
+    use_class_weighting : bool
+        Use class weighting in loss
+    use_mixed_precision : bool
+        Use automatic mixed precision
+    use_half_precision : bool
+        Use half precision for model
+    use_gradient_checkpointing : bool
+        Use gradient checkpointing
+    memory_efficient_mode : str
+        Memory optimization mode ('auto', 'aggressive', 'conservative')
+    learn_upsampling : bool
+        Use learned upsampling
     dinov3_stride : int, optional
-        Stride for DINOv3 sliding window inference. If None, uses patch_size (16) for standard inference.
-        Use smaller values (e.g., 8, 4) for higher resolution features at the cost of increased computation:
-        - stride=8: 4x more features, 4x slower
-        - stride=4: 16x more features, 16x slower
-        Best used with learn_upsampling=True to avoid downsampling high-res features.
-    use_orthogonal_planes : bool, optional
-        Whether to use orthogonal plane processing (XY, XZ, YZ slices) for more comprehensive 3D features.
-        When True, processes slices in all three orientations and averages the features.
-        Default is False (standard Z-slice only processing).
-    output_type : str, optional
-        Type of output target: 'labels' for class labels or 'affinities' for affinity graphs.
-        When 'affinities', GT is converted from instance segmentation to binary affinities.
-        Default is 'labels'.
-    affinity_offsets : list of tuples, optional
-        List of (z, y, x) offsets for computing affinities. Only used when output_type='affinities'.
-        If None and output_type='affinities', defaults to [(1,0,0), (0,1,0), (0,0,1)] for +z, +y, +x directions.
-    """
+        Stride for DINOv3 sliding window (legacy mode)
+    use_orthogonal_planes : bool
+        Use orthogonal plane processing (legacy mode)
+    enable_detailed_timing : bool
+        Enable detailed timing
+    verbose : bool
+        Verbose output
+    min_resolution_for_raw : float, optional
+        Minimum resolution for raw data
+    base_resolution : float, optional
+        Base resolution
+    loss_type : str
+        Loss function type
+    focal_gamma : float
+        Focal loss gamma
+    focal_weight : float
+        Focal loss weight
+    dice_weight : float
+        Dice loss weight
+    dice_smooth : float
+        Dice loss smoothing
+    tversky_alpha : float
+        Tversky alpha
+    tversky_beta : float
+        Tversky beta
+    boundary_weight : float
+        Boundary weight maximum
+    boundary_sigma : float
+        Boundary distance decay
+    boundary_anisotropy : tuple, optional
+        Voxel anisotropy
+    output_type : str
+        Output type ('labels', 'affinities', 'affinities_lsds')
+    affinity_offsets : list of tuple, optional
+        Affinity offsets
+    lsds_sigma : float
+        LSDS sigma
+    use_batchrenorm : bool
+        Use BatchRenorm
+    mask_clip_distance : float, optional
+        Mask clipping distance
+    use_anyup : bool
+        Use AnyUp for upsampling (legacy mode)
+    num_threads : int, optional
+        Number of threads for TensorStore (preprocessed mode)
+    features_dtype : torch.dtype
+        Dtype for features (torch.float16 or torch.float32, preprocessed mode)
 
-    # Auto-detect best memory settings
-    if memory_efficient_mode == "auto":
+    Returns:
+    --------
+    dict : Training results
+    """
+    # Determine which mode to use
+    use_preprocessed = preprocessed_dir is not None
+    use_legacy = raw_data is not None and gt_data is not None
+
+    if not use_preprocessed and not use_legacy:
+        raise ValueError(
+            "Must provide either:\n"
+            "  1. preprocessed_dir (for preprocessed mode), OR\n"
+            "  2. raw_data and gt_data (for legacy mode with on-the-fly feature extraction)"
+        )
+
+    if use_preprocessed and use_legacy:
+        raise ValueError(
+            "Cannot use both preprocessed_dir and raw_data/gt_data. "
+            "Choose one mode or the other."
+        )
+
+    # Auto-select device
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Set random seed
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(seed)
+
+    # Auto-detect memory settings
+    if memory_efficient_mode == "auto" and device.type == "cuda":
         gpu_memory_gb = torch.cuda.get_device_properties(device).total_memory / (
             1024**3
         )
@@ -3582,7 +3726,6 @@ def train_3d_unet_with_memory_efficient_loader(
             print(
                 f"Auto-detected GPU memory: {gpu_memory_gb:.1f}GB - Using standard settings"
             )
-
     elif memory_efficient_mode == "aggressive":
         use_mixed_precision = True
         use_half_precision = True
@@ -3597,14 +3740,462 @@ def train_3d_unet_with_memory_efficient_loader(
     print(f"  - Gradient checkpointing: {use_gradient_checkpointing}")
     print(f"  - Adjusted base channels: {base_channels}")
     print(f"  - Volumes per batch: {volumes_per_batch}")
-    # Auto-detect number of classes if not provided
-    if num_classes is None:
-        unique_classes = np.unique(gt_data)
-        num_classes = len(unique_classes)
-        print(
-            f"Auto-detected {num_classes} classes from ground truth data: {unique_classes}"
+
+    # ==================== LEGACY MODE ====================
+    if use_legacy:
+        print(f"\n{'='*80}")
+        print("LEGACY MODE: Using on-the-fly DINOv3 feature extraction")
+        print(f"{'='*80}\n")
+
+        # Import the original training function
+        from dinov3_playground.memory_efficient_training import (
+            train_3d_unet_memory_efficient_v2,
+        )
+        from dinov3_playground.memory_efficient_training import (
+            MemoryEfficientDataLoader3D,
         )
 
+        # Auto-detect number of classes if not provided
+        if num_classes is None:
+            unique_classes = np.unique(gt_data)
+            num_classes = len(unique_classes)
+            print(
+                f"Auto-detected {num_classes} classes from ground truth data: {unique_classes}"
+            )
+
+        # Generate default class names if not provided
+        if class_names is None:
+            if num_classes == 2:
+                class_names = ["background", "foreground"]
+            else:
+                class_names = ["background"] + [
+                    f"class_{i}" for i in range(1, num_classes)
+                ]
+            print(f"Generated default class names: {class_names}")
+
+        print(f"Setting up memory-efficient 3D UNet training:")
+        print(f"  Raw data shape: {raw_data.shape}")
+        print(f"  GT data shape: {gt_data.shape}")
+        print(f"  Number of classes: {num_classes}")
+        print(f"  Target volume size: {target_volume_size}")
+        print(f"  Training volume pool: {train_volume_pool_size}")
+        print(f"  Validation volumes: {val_volume_pool_size}")
+        print(f"  Volumes per batch: {volumes_per_batch}")
+        if batches_per_epoch is not None:
+            print(f"  Batches per epoch: {batches_per_epoch}")
+            print(f"  Total volumes per epoch: {volumes_per_batch * batches_per_epoch}")
+        print(f"  Max epochs: {epochs}")
+        print(f"  Base channels: {base_channels}")
+        print(f"  Device: {device}")
+        print()
+
+        # Create 3D data loader
+        print("Creating memory-efficient 3D data loader...")
+        data_loader_3d = MemoryEfficientDataLoader3D(
+            raw_data=raw_data,
+            gt_data=gt_data,
+            gt_masks=gt_masks,
+            context_data=context_data,
+            context_scale=context_scale,
+            train_volume_pool_size=train_volume_pool_size,
+            val_volume_pool_size=val_volume_pool_size,
+            target_volume_size=target_volume_size,
+            dinov3_slice_size=dinov3_slice_size,
+            seed=seed,
+            model_id=model_id,
+            learn_upsampling=learn_upsampling,
+            dinov3_stride=dinov3_stride,
+            use_orthogonal_planes=use_orthogonal_planes,
+            enable_detailed_timing=enable_detailed_timing,
+            verbose=verbose,
+            output_type=output_type,
+            affinity_offsets=affinity_offsets,
+            lsds_sigma=lsds_sigma,
+            use_anyup=use_anyup,
+        )
+
+        print("Data loader created successfully!")
+        print()
+
+        # Train 3D UNet
+        print("Starting 3D UNet training...")
+        results = train_3d_unet_memory_efficient_v2(
+            data_loader_3d=data_loader_3d,
+            num_classes=num_classes,
+            device=device,
+            epochs=epochs,
+            learning_rate=learning_rate,
+            weight_decay=weight_decay,
+            patience=patience,
+            min_delta=min_delta,
+            base_channels=base_channels,
+            volumes_per_batch=volumes_per_batch,
+            batches_per_epoch=(
+                batches_per_epoch if batches_per_epoch is not None else 10
+            ),
+            save_checkpoints=save_checkpoints,
+            checkpoint_every_n_epochs=checkpoint_every_n_epochs,
+            model_id=model_id,
+            export_base_dir=export_base_dir,
+            use_class_weighting=use_class_weighting,
+            use_mixed_precision=use_mixed_precision,
+            use_half_precision=use_half_precision,
+            use_gradient_checkpointing=use_gradient_checkpointing,
+            memory_efficient_mode=memory_efficient_mode,
+            learn_upsampling=learn_upsampling,
+            enable_detailed_timing=enable_detailed_timing,
+            min_resolution_for_raw=min_resolution_for_raw,
+            base_resolution=base_resolution,
+            class_names=class_names,
+            loss_type=loss_type,
+            focal_gamma=focal_gamma,
+            focal_weight=focal_weight,
+            dice_weight=dice_weight,
+            dice_smooth=dice_smooth,
+            tversky_alpha=tversky_alpha,
+            tversky_beta=tversky_beta,
+            boundary_weight=boundary_weight,
+            boundary_sigma=boundary_sigma,
+            boundary_anisotropy=boundary_anisotropy,
+            use_batchrenorm=use_batchrenorm,
+            mask_clip_distance=mask_clip_distance,
+        )
+
+        print(f"\n3D UNet training completed!")
+
+        if output_type in ["affinities", "affinities_lsds"]:
+            print(f"  Best validation loss: {results['best_val_loss']:.4f}")
+        else:
+            print(f"  Best validation accuracy: {results['best_val_acc']:.4f}")
+
+        print(f"  Epochs trained: {results['epochs_trained']}")
+
+        if save_checkpoints:
+            print(f"  Checkpoints saved to: {results['checkpoint_dir']}")
+
+        if "class_weights" in results and results["class_weights"] is not None:
+            print(f"  Class weights used: {results['class_weights']}")
+
+        return results
+
+    # ==================== PREPROCESSED MODE ====================
+    else:
+        print(f"\n{'='*80}")
+        print("PREPROCESSED MODE: Using pre-extracted DINOv3 features from TensorStore")
+        print(f"{'='*80}\n")
+
+        # Auto-generate volume indices if not provided
+        if train_volume_indices is None or val_volume_indices is None:
+            from pathlib import Path
+
+            preprocessed_path = Path(preprocessed_dir)
+            metadata_files = sorted(preprocessed_path.glob("volume_*_metadata.json"))
+
+            if not metadata_files:
+                raise ValueError(f"No preprocessed volumes found in {preprocessed_dir}")
+
+            all_indices = []
+            for mf in metadata_files:
+                idx = int(mf.stem.split("_")[1])
+                all_indices.append(idx)
+
+            all_indices = sorted(all_indices)
+            total_volumes = len(all_indices)
+
+            if total_volumes < train_volume_pool_size + val_volume_pool_size:
+                raise ValueError(
+                    f"Need at least {train_volume_pool_size + val_volume_pool_size} volumes, "
+                    f"but only found {total_volumes}"
+                )
+
+            if train_volume_indices is None:
+                train_volume_indices = all_indices[:train_volume_pool_size]
+
+            if val_volume_indices is None:
+                val_volume_indices = all_indices[
+                    train_volume_pool_size : train_volume_pool_size
+                    + val_volume_pool_size
+                ]
+
+            print(f"Auto-generated volume splits:")
+            print(f"  Training volumes: {train_volume_indices}")
+            print(f"  Validation volumes: {val_volume_indices}")
+
+        # Auto-detect num_classes if not provided
+        if num_classes is None:
+            temp_dataset = PreprocessedDINOv3Dataset(
+                preprocessed_dir=preprocessed_dir,
+                volume_indices=[train_volume_indices[0]],
+                num_threads=num_threads,
+                features_dtype=features_dtype,
+                load_boundary_weights=False,
+            )
+            _, gt, _, _, _ = temp_dataset[0]
+            unique_classes = torch.unique(gt).numpy()
+            num_classes = len(unique_classes)
+            print(
+                f"Auto-detected {num_classes} classes from ground truth data: {unique_classes}"
+            )
+            del temp_dataset
+
+        print(f"\nSetting up training with preprocessed data:")
+        print(f"  Preprocessed directory: {preprocessed_dir}")
+        print(f"  Number of classes: {num_classes}")
+        print(f"  Training volumes: {len(train_volume_indices)}")
+        print(f"  Validation volumes: {len(val_volume_indices)}")
+        print(f"  Volumes per batch: {volumes_per_batch}")
+        if batches_per_epoch is not None:
+            print(f"  Batches per epoch: {batches_per_epoch}")
+        else:
+            print(
+                f"  Batches per epoch: {len(train_volume_indices) // volumes_per_batch} (all training volumes)"
+            )
+        print(f"  Max epochs: {epochs}")
+        print(f"  Base channels: {base_channels}")
+        print(f"  Device: {device}")
+        print(f"  Output type: {output_type}")
+        print(f"  Loss type: {loss_type}")
+        print()
+
+        # Call the preprocessed training function
+        results = train_3d_unet_with_preprocessed_data(
+            preprocessed_dir=preprocessed_dir,
+            train_volume_indices=train_volume_indices,
+            val_volume_indices=val_volume_indices,
+            num_classes=num_classes,
+            device=device,
+            base_channels=base_channels,
+            learn_upsampling=learn_upsampling,
+            use_batchrenorm=use_batchrenorm,
+            epochs=epochs,
+            learning_rate=learning_rate,
+            weight_decay=weight_decay,
+            batch_size=volumes_per_batch,
+            batches_per_epoch=(
+                batches_per_epoch if batches_per_epoch is not None else 10
+            ),
+            patience=patience,
+            min_delta=min_delta,
+            loss_type=loss_type,
+            focal_gamma=focal_gamma,
+            focal_weight=focal_weight,
+            dice_weight=dice_weight,
+            dice_smooth=dice_smooth,
+            tversky_alpha=tversky_alpha,
+            tversky_beta=tversky_beta,
+            use_class_weighting=use_class_weighting,
+            dinov3_slice_size=dinov3_slice_size,
+            boundary_weight=boundary_weight,
+            boundary_weight_power=boundary_weight_power,
+            boundary_sigma=boundary_sigma,
+            boundary_anisotropy=boundary_anisotropy,
+            mask_clip_distance=mask_clip_distance,
+            use_mixed_precision=use_mixed_precision,
+            use_half_precision=use_half_precision,
+            use_gradient_checkpointing=use_gradient_checkpointing,
+            num_threads=num_threads,
+            features_dtype=features_dtype,
+            save_checkpoints=save_checkpoints,
+            checkpoint_every_n_epochs=checkpoint_every_n_epochs,
+            model_id=model_id,
+            affinity_offsets=affinity_offsets,
+            lsds_sigma=lsds_sigma,
+            export_base_dir=export_base_dir,
+            class_names=class_names,
+            min_resolution_for_raw=min_resolution_for_raw,
+            base_resolution=base_resolution,
+            enable_detailed_timing=enable_detailed_timing,
+            use_anyup=use_anyup,
+            use_orthogonal_planes=use_orthogonal_planes,
+        )
+
+        print(f"\n3D UNet training completed!")
+
+        if output_type in ["affinities", "affinities_lsds"]:
+            print(f"  Best validation loss: {results['best_val_loss']:.4f}")
+        else:
+            print(f"  Best validation metric: {results['best_metric']:.4f}")
+
+        print(f"  Epochs trained: {results['epochs_trained']}")
+
+        if save_checkpoints:
+            print(f"  Checkpoints saved to: {results['checkpoint_dir']}")
+
+        if results["class_weights"] is not None:
+            print(f"  Class weights used: {results['class_weights']}")
+
+        # Add backward compatibility aliases
+        results["best_val_acc"] = results["best_metric"]
+        results["best_mean_iou"] = results["best_metric"]
+
+        return results
+
+
+def train_3d_unet_with_preprocessed_data(
+    preprocessed_dir: str,
+    train_volume_indices: List[int],
+    val_volume_indices: List[int],
+    num_classes: int,
+    device: torch.device,
+    # Model architecture
+    base_channels: int = 32,
+    learn_upsampling: bool = False,
+    use_batchrenorm: bool = False,
+    dinov3_slice_size: int = 512,
+    # Training parameters
+    epochs: int = 100,
+    learning_rate: float = 1e-3,
+    weight_decay: float = 1e-4,
+    batch_size: int = 1,
+    batches_per_epoch: int = 10,
+    patience: int = 20,
+    min_delta: float = 0.001,
+    # Loss function parameters
+    loss_type: str = "weighted_ce",
+    focal_gamma: float = 2.0,
+    focal_weight: float = 0.5,
+    dice_weight: float = 0.5,
+    dice_smooth: float = 1.0,
+    tversky_alpha: float = 0.5,
+    tversky_beta: float = 0.5,
+    use_class_weighting: bool = True,
+    # Boundary weighting parameters
+    boundary_weight: float = 5.0,
+    boundary_sigma: float = 5.0,
+    boundary_weight_power: float = 1.0,
+    boundary_anisotropy: Optional[tuple] = None,
+    mask_clip_distance: Optional[float] = None,
+    # Performance options
+    use_mixed_precision: bool = True,
+    use_half_precision: bool = False,
+    use_gradient_checkpointing: bool = False,
+    num_threads: Optional[int] = None,
+    features_dtype: torch.dtype = torch.float32,
+    # Checkpointing
+    save_checkpoints: bool = True,
+    checkpoint_every_n_epochs: Optional[int] = None,
+    model_id: Optional[str] = None,
+    export_base_dir: Optional[str] = None,
+    # Data parameters
+    class_names: Optional[List[str]] = None,
+    affinity_offsets=None,
+    lsds_sigma: float = 20.0,
+    min_resolution_for_raw: Optional[float] = None,
+    base_resolution: Optional[float] = None,
+    enable_detailed_timing: bool = True,
+    ###
+    use_context_fusion=False,
+    context_channels=None,
+    use_anyup=False,
+    use_orthogonal_planes=False,
+):
+    """
+    Train 3D UNet using preprocessed DINOv3 features from TensorStore.
+
+    Parameters:
+    -----------
+    preprocessed_dir : str
+        Directory containing preprocessed volumes
+    train_volume_indices : list of int
+        Volume indices to use for training
+    val_volume_indices : list of int
+        Volume indices to use for validation
+    num_classes : int
+        Number of output classes
+    device : torch.device
+        Device to train on
+    base_channels : int
+        Base number of channels in UNet
+    learn_upsampling : bool
+        If True, use learned upsampling; if False, use bilinear interpolation
+    use_batchrenorm : bool
+        If True, use BatchRenorm instead of BatchNorm
+    epochs : int
+        Maximum number of training epochs
+    learning_rate : float
+        Initial learning rate
+    weight_decay : float
+        Weight decay for optimizer
+    batch_size : int
+        Batch size (number of volumes per batch)
+    patience : int
+        Early stopping patience
+    min_delta : float
+        Minimum improvement for early stopping
+    loss_type : str
+        Loss function type ('ce', 'weighted_ce', 'focal', 'dice', 'focal_dice', 'tversky',
+        'boundary_affinity', 'boundary_affinity_focal', 'boundary_affinity_focal_lsds')
+    focal_gamma : float
+        Focusing parameter for focal loss
+    focal_weight : float
+        Weight for focal component in combined loss
+    dice_weight : float
+        Weight for dice component in combined loss
+    dice_smooth : float
+        Smoothing parameter for dice loss
+    tversky_alpha : float
+        Tversky alpha (false positive weight)
+    tversky_beta : float
+        Tversky beta (false negative weight)
+    use_class_weighting : bool
+        If True, compute and use class weights
+    boundary_weight : float
+        Maximum weight at instance boundaries
+    boundary_sigma : float
+        Distance decay for boundary weights
+    boundary_anisotropy : tuple, optional
+        Voxel anisotropy (z, y, x) for EDT
+    mask_clip_distance : float, optional
+        Distance to clip mask weights
+    use_mixed_precision : bool
+        Use automatic mixed precision training
+    use_half_precision : bool
+        Use half precision for model weights
+    use_gradient_checkpointing : bool
+        Use gradient checkpointing to save memory
+    num_threads : int, optional
+        Number of threads for TensorStore. If None, uses 2x LSB_DJOB_NUMPROC
+    features_dtype : torch.dtype
+        Dtype for loading features (torch.float16 or torch.float32)
+    save_checkpoints : bool
+        Save model checkpoints
+    checkpoint_every_n_epochs : int, optional
+        Save checkpoint every N epochs
+    model_id : str, optional
+        Model identifier for checkpointing
+    export_base_dir : str, optional
+        Base directory for exports
+    class_names : list of str, optional
+        Names of classes
+    min_resolution_for_raw : float, optional
+        Minimum resolution for raw data (for metadata)
+    base_resolution : float, optional
+        Base resolution (for metadata)
+    enable_detailed_timing : bool
+        Enable detailed timing information
+
+    Returns:
+    --------
+    dict : Training results including model, losses, accuracies, etc.
+    """
+    print(f"{'='*80}")
+    print("Training 3D UNet with Preprocessed DINOv3 Features")
+    print(f"{'='*80}")
+    print(f"Preprocessed directory: {preprocessed_dir}")
+    print(
+        f"Training volumes: {len(train_volume_indices)} ({min(train_volume_indices)}-{max(train_volume_indices)})"
+    )
+    print(
+        f"Validation volumes: {len(val_volume_indices)} ({min(val_volume_indices)}-{max(val_volume_indices)})"
+    )
+    print(f"Batch size: {batch_size}")
+    print(f"Loss type: {loss_type}")
+    print(f"Class weighting: {use_class_weighting}")
+    print(f"Mixed precision: {use_mixed_precision}")
+    print(f"Features dtype: {features_dtype}")
+    print(f"Learn upsampling: {learn_upsampling}")
+    print(f"Use BatchRenorm: {use_batchrenorm}")
+    print(f"Features dtype: {features_dtype}")
     # Generate default class names if not provided
     if class_names is None:
         if num_classes == 2:
@@ -3613,175 +4204,801 @@ def train_3d_unet_with_memory_efficient_loader(
             class_names = ["background"] + [f"class_{i}" for i in range(1, num_classes)]
         print(f"Generated default class names: {class_names}")
     else:
-        # Validate class names
-        if len(class_names) != num_classes:
-            print(
-                f"WARNING: Number of class names ({len(class_names)}) doesn't match num_classes ({num_classes})"
-            )
-            print(f"  Provided names: {class_names}")
-            # Adjust class_names to match num_classes
-            if len(class_names) < num_classes:
-                class_names = class_names + [
-                    f"class_{i}" for i in range(len(class_names), num_classes)
-                ]
-            else:
-                class_names = class_names[:num_classes]
-            print(f"  Adjusted names: {class_names}")
+        print(f"Using provided class names: {class_names}")
 
-    print(f"Setting up memory-efficient 3D UNet training:")
-    print(f"  Raw data shape: {raw_data.shape}")
-    print(f"  GT data shape: {gt_data.shape}")
-    print(f"  Number of classes: {num_classes}")
-    print(f"  Classes in data: {np.unique(gt_data)}")
-    print(f"  Target volume size: {target_volume_size}")
-    print(f"  Training volume pool: {train_volume_pool_size}")
-    print(f"  Validation volumes: {val_volume_pool_size}")
-    print(f"  Volumes per batch: {volumes_per_batch}")
-    print(f"  Batches per epoch: {batches_per_epoch}")
-    print(f"  Total volumes per epoch: {volumes_per_batch * batches_per_epoch}")
-    print(f"  Max epochs: {epochs}")
-    print(f"  Base channels: {base_channels}")
-    print(f"  Device: {device}")
-    print(f"  Model ID: {model_id}")
-    print(f"  Export directory: {export_base_dir}")
-    print(f"  Save checkpoints: {save_checkpoints}")
-    if save_checkpoints and checkpoint_every_n_epochs is not None:
-        print(f"  Periodic checkpoint saving: Every {checkpoint_every_n_epochs} epochs")
-    print(f"  Use class weighting: {use_class_weighting}")
-    print()
+    # Initialize mixed precision scaler
+    scaler = GradScaler() if use_mixed_precision else None
 
-    # Validate input data
-    if len(raw_data) < val_volume_pool_size + 2:
-        raise ValueError(
-            f"Need at least {val_volume_pool_size + 2} volumes for training"
+    # Setup checkpoint saving
+    checkpoint_dir = None
+    if save_checkpoints:
+        base_path = get_checkpoint_base_path(
+            "dinov3_unet3d_preprocessed", model_id, export_base_dir
         )
+        checkpoint_dir = create_model_checkpoint_dir(base_path)
+        print(f"Model ID: {model_id}")
+        print(f"Export base: {export_base_dir}")
+        print(f"Checkpoints will be saved to: {checkpoint_dir}")
 
-    # Validate shapes with multi-resolution support
-    if raw_data.shape[0] != gt_data.shape[0]:
-        raise ValueError(
-            f"Number of volumes must match: {raw_data.shape[0]} vs {gt_data.shape[0]}"
-        )
-
-    # For multi-resolution training, we allow different spatial dimensions
-    # The raw data (high-res) and GT data (base-res) can have different sizes
-    raw_shape = raw_data.shape[1:]  # (D, H, W)
-    gt_shape = gt_data.shape[1:]  # (D, H, W)
-
-    if raw_shape == gt_shape:
-        print(f"✓ Same resolution: Raw and GT shapes match {raw_data.shape}")
-        resolution_mode = "same"
+    # Initialize TensorBoard writer
+    if save_checkpoints and checkpoint_dir is not None:
+        tb_log_dir = os.path.join(checkpoint_dir, "tensorboard")
     else:
-        print(f"✓ Multi-resolution training: Raw {raw_shape} vs GT {gt_shape}")
-        resolution_mode = "multi"
-
-        # Validate that dimensions are reasonable multiples/factors
-        # This helps catch obvious mistakes while allowing intentional multi-resolution
-        for dim_name, (raw_dim, gt_dim) in zip(
-            ["D", "H", "W"], zip(raw_shape, gt_shape)
-        ):
-            ratio = raw_dim / gt_dim
-            if ratio < 0.25 or ratio > 8.0:  # Allow 4x smaller to 8x larger
-                print(
-                    f"Warning: {dim_name} dimension ratio ({ratio:.2f}) is quite extreme"
-                )
-
-        print(f"  - Raw data will be processed at {raw_shape} resolution")
-        print(f"  - Features will be downsampled to match GT at {gt_shape} resolution")
-
-    if len(raw_data.shape) != 4:
-        raise ValueError(
-            f"Expected 4D data (num_volumes, D, H, W), got {raw_data.shape}"
+        tb_log_dir = os.path.join(
+            "/tmp",
+            "dinov3_tensorboard_preprocessed",
+            datetime.now().strftime("%Y%m%d_%H%M%S"),
         )
+    writer = SummaryWriter(log_dir=tb_log_dir)
+    print(f"TensorBoard logs: {tb_log_dir}")
 
-    # Create 3D data loader
-    print("Creating memory-efficient 3D data loader...")
-    data_loader_3d = MemoryEfficientDataLoader3D(
-        raw_data=raw_data,
-        gt_data=gt_data,
-        gt_masks=gt_masks,  # NEW: GT extension masks
-        context_data=context_data,  # NEW: Context volumes for spatial context
-        context_scale=context_scale,  # NEW: Context resolution in nm
-        train_volume_pool_size=train_volume_pool_size,
-        val_volume_pool_size=val_volume_pool_size,
-        target_volume_size=target_volume_size,
-        dinov3_slice_size=dinov3_slice_size,
-        seed=seed,
-        model_id=model_id,
-        learn_upsampling=learn_upsampling,
-        dinov3_stride=dinov3_stride,  # NEW: Sliding window parameter
-        use_orthogonal_planes=use_orthogonal_planes,  # NEW: Orthogonal planes parameter
-        enable_detailed_timing=enable_detailed_timing,  # NEW: Detailed timing parameter
-        verbose=verbose,  # NEW: Verbose output parameter
-        output_type=output_type,  # NEW: Output type (labels or affinities or affinities_lsds)
-        affinity_offsets=affinity_offsets,  # NEW: Affinity offsets
-        lsds_sigma=lsds_sigma,  # NEW: LSDS sigma parameter
-        use_anyup=use_anyup,
+    # Create datasets and dataloaders
+    print(f"\n{'='*80}")
+    print("Loading preprocessed data...")
+    print(f"{'='*80}")
+
+    train_dataset = PreprocessedDINOv3Dataset(
+        preprocessed_dir=preprocessed_dir,
+        volume_indices=train_volume_indices,
+        num_threads=num_threads,
+        features_dtype=features_dtype,
+        load_boundary_weights=("boundary" in loss_type),
+        load_raw=False,
     )
 
-    print("Data loader created successfully!")
-    print()
+    val_dataset = PreprocessedDINOv3Dataset(
+        preprocessed_dir=preprocessed_dir,
+        volume_indices=val_volume_indices,
+        num_threads=num_threads,
+        features_dtype=features_dtype,
+        load_boundary_weights=("boundary" in loss_type),
+        load_raw=True,
+    )
 
-    # Train 3D UNet
-    print("Starting 3D UNet training...")
-    results = train_3d_unet_memory_efficient_v2(
-        data_loader_3d=data_loader_3d,
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=0,  # Use TensorStore's internal parallelism
+        pin_memory=True if device.type == "cuda" else False,
+    )
+    from .threaded_prefetcher import ThreadedPrefetcher
+
+    prefetch_train_loader = ThreadedPrefetcher(train_loader, num_prefetch=1)
+
+    val_loader = torch.utils.data.DataLoader(
+        val_dataset,
+        batch_size=1,  # Validate one volume at a time
+        shuffle=False,
+        num_workers=0,
+        pin_memory=True if device.type == "cuda" else False,
+    )
+
+    print(f"Training batches per epoch: {len(train_loader)}")
+    print(f"Validation volumes: {len(val_loader)}")
+
+    # Calculate class weights from training data
+    class_weights_tensor = None
+
+    if use_class_weighting:
+        print(f"\n{'='*80}")
+        print("Calculating class weights from training data...")
+        print(f"{'='*80}")
+
+        all_train_labels = []
+        total_masked_voxels = 0
+
+        # Sample up to 10 training volumes for class weight calculation
+        sample_size = min(10, len(train_dataset))
+        sample_indices = np.random.choice(
+            len(train_dataset), size=sample_size, replace=False
+        )
+
+        for idx in sample_indices:
+            _, gt, _, _, mask = train_dataset[idx]
+
+            # Remove batch dimension
+            gt_np = gt.squeeze(0).numpy()
+            mask_np = (
+                mask.squeeze(0).numpy() if mask is not None else np.ones_like(gt_np)
+            )
+
+            # Only consider masked regions
+            if not np.all(mask_np == 1):
+                mask_bool = mask_np.astype(bool)
+                masked_labels = gt_np[mask_bool]
+                all_train_labels.append(masked_labels.flatten())
+                total_masked_voxels += np.sum(mask_bool)
+            else:
+                all_train_labels.append(gt_np.flatten())
+                total_masked_voxels += gt_np.size
+
+        train_labels_flat = np.concatenate(all_train_labels)
+        unique_classes, class_counts = np.unique(train_labels_flat, return_counts=True)
+        total_voxels = len(train_labels_flat)
+
+        class_weights = np.zeros(num_classes)
+        for class_id, count in zip(unique_classes, class_counts):
+            if class_id < num_classes:
+                class_weights[class_id] = total_voxels / (num_classes * count)
+
+        class_weights = class_weights * num_classes / np.sum(class_weights)
+        class_weights_tensor = torch.tensor(class_weights, dtype=torch.float32).to(
+            device
+        )
+
+        print(
+            f"Class distribution (from {sample_size} volumes, {total_masked_voxels:,} masked voxels):"
+        )
+        for class_id, count in zip(unique_classes, class_counts):
+            if class_id < num_classes:
+                percentage = (count / total_voxels) * 100
+                weight = class_weights[class_id]
+                print(
+                    f"  {class_names[class_id]}: {count:,} voxels ({percentage:.2f}%), weight: {weight:.3f}"
+                )
+
+        del all_train_labels, train_labels_flat
+    else:
+        print("Using unweighted loss (no class balancing)")
+
+    # Get feature dimensions from first training sample
+    _, sample_features, sample_gt, sample_target, _, _ = train_dataset[0]
+    input_channels = sample_features.shape[0]  # Remove batch dim
+    volume_shape = sample_gt.shape  # (D, H, W)
+    target_channels = (
+        sample_target.shape[1] if len(sample_target.shape) > 3 else num_classes
+    )
+
+    print(f"\n{'='*80}")
+    print("Data specifications:")
+    print(f"{'='*80}")
+    print(f"Input channels (DINOv3 features): {input_channels}")
+    print(f"Volume shape: {volume_shape}")
+    print(
+        f"Output channels: {target_channels if 'affinity' in loss_type or 'lsds' in loss_type else num_classes}"
+    )
+    print(f"Number of classes: {num_classes}")
+
+    # Determine output type from loss type
+    if "affinity" in loss_type and "lsds" in loss_type:
+        output_type = "affinities_lsds"
+    elif "affinity" in loss_type:
+        output_type = "affinities"
+    else:
+        output_type = "labels"
+
+    # Initialize model
+    print(f"\n{'='*80}")
+    print("Initializing 3D UNet...")
+    print(f"{'='*80}")
+    from dinov3_playground.models import DINOv3UNet3D
+
+    unet3d = DINOv3UNet3D(
+        input_channels=input_channels,  # Raw feature channels
         num_classes=num_classes,
-        device=device,
-        epochs=epochs,
-        learning_rate=learning_rate,
-        weight_decay=weight_decay,
-        patience=patience,
-        min_delta=min_delta,
         base_channels=base_channels,
-        volumes_per_batch=volumes_per_batch,
-        batches_per_epoch=batches_per_epoch,
-        save_checkpoints=save_checkpoints,
-        checkpoint_every_n_epochs=checkpoint_every_n_epochs,
-        model_id=model_id,
-        export_base_dir=export_base_dir,
-        use_class_weighting=use_class_weighting,
-        use_mixed_precision=use_mixed_precision,  # Pass through
-        use_half_precision=use_half_precision,  # Pass through additional params
-        use_gradient_checkpointing=use_gradient_checkpointing,
-        memory_efficient_mode=memory_efficient_mode,
-        learn_upsampling=learn_upsampling,  # Pass through new parameter
-        enable_detailed_timing=enable_detailed_timing,  # Pass through new parameter
-        min_resolution_for_raw=min_resolution_for_raw,  # Pass through data resolution parameters
-        base_resolution=base_resolution,
-        class_names=class_names,  # Pass through class names
-        # Pass through loss function parameters
+        input_size=volume_shape,
+        use_half_precision=use_half_precision,
+        learn_upsampling=learn_upsampling,
+        dinov3_feature_size=volume_shape[0],
+        use_gradient_checkpointing=True,  # Enable gradient checkpointing for memory efficiency
+        use_context_fusion=use_context_fusion,  # Enable context fusion architecture
+        context_channels=None,
+        use_batchrenorm=use_batchrenorm,
+    ).to(device)
+
+    print(
+        f"Model initialized with {sum(p.numel() for p in unet3d.parameters()):,} parameters"
+    )
+
+    if use_gradient_checkpointing:
+        # Enable gradient checkpointing if available
+        if hasattr(unet3d, "set_gradient_checkpointing"):
+            unet3d.set_gradient_checkpointing(True)
+            print("Gradient checkpointing enabled")
+
+    # Initialize optimizer and scheduler
+    optimizer = torch.optim.AdamW(
+        unet3d.parameters(),
+        lr=learning_rate,
+        weight_decay=weight_decay,
+    )
+    # optimizer = optim.Adam(
+    #     unet3d.parameters(), lr=learning_rate, weight_decay=weight_decay
+    # )
+
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min" if output_type != "labels" else "max",
+        factor=0.5,
+        patience=patience // 2,
+    )
+
+    # Initialize loss function
+    print(f"\n{'='*80}")
+    print("Initializing loss function...")
+    print(f"{'='*80}")
+
+    from .losses import get_loss_function
+
+    loss_fn = get_loss_function(
         loss_type=loss_type,
+        num_classes=num_classes,
+        class_weights=class_weights_tensor,
         focal_gamma=focal_gamma,
         focal_weight=focal_weight,
         dice_weight=dice_weight,
         dice_smooth=dice_smooth,
         tversky_alpha=tversky_alpha,
         tversky_beta=tversky_beta,
-        # Pass through boundary weighting parameters
         boundary_weight=boundary_weight,
         boundary_sigma=boundary_sigma,
-        boundary_anisotropy=boundary_anisotropy,
-        use_batchrenorm=use_batchrenorm,  # Pass through BatchRenorm option
+        device=device,
         mask_clip_distance=mask_clip_distance,
+        boundary_weight_power=boundary_weight_power,
     )
 
-    print(f"\n3D UNet training completed!")
+    print(f"Loss function: {loss_type}")
 
-    # Print different metrics based on output type
-    if output_type in ["affinities", "affinities_lsds"]:
-        print(f"  Best validation loss: {results['best_val_loss']:.4f}")
-    else:
-        print(f"  Best validation accuracy: {results['best_val_acc']:.4f}")
+    # Training loop
+    print(f"\n{'='*80}")
+    print("Starting training...")
+    print(f"{'='*80}\n")
 
-    print(f"  Epochs trained: {results['epochs_trained']}")
+    train_losses = []
+    val_losses = []
+    train_accs = []
+    val_accs = []
+    train_class_accs = []
+    val_class_accs = []
+    val_class_precisions = []
+    val_class_f1s = []
+    val_class_ious = []
 
-    if save_checkpoints:
-        print(f"  Checkpoints saved to: {results['checkpoint_dir']}")
+    best_metric = -float("inf") if output_type == "labels" else float("inf")
+    best_val_loss = float("inf")
+    epochs_without_improvement = 0
+    for epoch in range(epochs):
+        t0 = time.time()
+        print(f"Epoch {epoch+1}/{epochs}")
+        print(f"{'-'*80}")
 
-    if "class_weights" in results and results["class_weights"] is not None:
-        print(f"  Class weights used: {results['class_weights']}")
+        # Training phase
+        unet3d.train()
+        epoch_train_loss = 0.0
+        epoch_train_correct = 0
+        epoch_train_total = 0
+        batch_timing = time.time()
+        from tqdm import tqdm
 
-    return results
+        # Option 1: Don't use enumerate with prefetcher
+        pbar = tqdm(
+            prefetch_train_loader,  # Remove enumerate
+            desc="Training",
+            leave=False,
+            total=batches_per_epoch,
+        )
+
+        num_batches_processed = 0
+        for batch in pbar:  # Unpack batch directly
+            # save batch to npz for debugging
+            _, features, gt, target, boundary_weights, mask = batch
+            # features_numpy = features[:, ::100, :, :, :].cpu().numpy()
+            # print(
+            #     type(features),
+            #     type(gt),
+            #     type(target),
+            #     type(boundary_weights),
+            # )
+            # print("Feature shape:", features_numpy.shape)
+            # np.savez_compressed(
+            #     f"debug_batch_epoch{epoch+1}_batch{num_batches_processed+1}.npz",
+            #     raw=raw.cpu().numpy(),
+            #     features=features_numpy,
+            #     gt=gt.cpu().numpy(),
+            #     target=target.cpu().numpy(),
+            #     boundary_weights=(
+            #         boundary_weights.cpu().numpy()
+            #         if boundary_weights is not None
+            #         else None
+            #     ),
+            #     mask=mask.cpu().numpy() if mask is not None else None,
+            # )
+            # raise Exception("saved batch")
+            t1 = time.time()
+            # Move to device
+            features = features.to(device, non_blocking=True)
+            gt = gt.to(device, non_blocking=True)
+            target = target.to(device, non_blocking=True)
+            if boundary_weights is not None:
+                boundary_weights = boundary_weights.to(device, non_blocking=True)
+            if mask is not None:
+                mask = mask.to(device, non_blocking=True)
+
+            # 1. CHECK INPUT DATA FOR NaN/Inf
+            if torch.isnan(features).any() or torch.isinf(features).any():
+                print(f"⚠️ NaN/Inf in features at batch {batch_idx}, skipping...")
+                continue
+            if torch.isnan(target).any() or torch.isinf(target).any():
+                print(f"⚠️ NaN/Inf in target at batch {batch_idx}, skipping...")
+                continue
+
+            # 2. CLAMP BOUNDARY WEIGHTS
+            if boundary_weights is not None:
+                bw_max = boundary_weights.max().item()
+                if bw_max > 100:
+                    print(f"⚠️ Extreme boundary weight: {bw_max:.2f}, clamping to 10.0")
+                boundary_weights = torch.clamp(boundary_weights, min=0.1, max=10.0)
+
+                if (
+                    torch.isnan(boundary_weights).any()
+                    or torch.isinf(boundary_weights).any()
+                ):
+                    print(
+                        f"⚠️ NaN/Inf in boundary_weights at batch {num_batches_processed}, skipping..."
+                    )
+                    continue
+
+            optimizer.zero_grad()
+
+            # Forward pass
+            if use_mixed_precision:
+                with autocast(
+                    device_type=device.type, enabled=features_dtype == torch.float16
+                ):
+                    outputs = unet3d(features)
+
+                    # 3. CHECK OUTPUTS FOR EXTREME VALUES
+                    outputs_max = outputs.abs().max().item()
+                    if outputs_max > 50:
+                        print(f"⚠️ Extreme output: {outputs_max:.2f}, clamping...")
+                        outputs = torch.clamp(outputs, min=-10, max=10)
+
+                    # Compute loss
+                    if "boundary" in loss_type:
+                        loss = loss_fn(
+                            outputs,
+                            target,
+                            boundary_weights=boundary_weights,
+                            mask=mask,
+                        )
+                    else:
+                        loss = loss_fn(outputs, target, mask=mask)
+
+                # 4. CHECK LOSS BEFORE BACKWARD
+                if torch.isnan(loss) or torch.isinf(loss):
+                    print(
+                        f"⚠️ NaN/Inf loss at batch {num_batches_processed}, skipping..."
+                    )
+                    print(
+                        f"  Outputs: min={outputs.min():.4f}, max={outputs.max():.4f}, mean={outputs.mean():.4f}"
+                    )
+                    print(f"  Target: min={target.min():.4f}, max={target.max():.4f}")
+                    if boundary_weights is not None:
+                        print(
+                            f"  Boundary weights: min={boundary_weights.min():.4f}, max={boundary_weights.max():.4f}"
+                        )
+                    continue
+
+                # Backward with gradient clipping
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                # BEFORE gradient clipping, check which params have NaN:
+                # print("\n=== Checking for NaN gradients ===")
+                # nan_params = []
+                # for name, param in unet3d.named_parameters():
+                #     if param.grad is not None:
+                #         if torch.isnan(param.grad).any():
+                #             nan_params.append(name)
+                #             print(
+                #                 f"  ❌ NaN in {name}: min={param.grad.min()}, max={param.grad.max()}"
+                #             )
+                #             # Check grad norm for this param
+                #             param_grad_norm = param.grad.norm()
+                #             print(f"     Grad norm: {param_grad_norm}")
+
+                # if nan_params:
+                #     print(f"\n⚠️ Found NaN in {len(nan_params)} parameters")
+                #     print(f"  First few: {nan_params[:5]}")
+
+                # grad_norm = torch.nn.utils.clip_grad_norm_(
+                #     unet3d.parameters(), max_norm=1.0
+                # )
+
+                # # 5. CHECK FOR NaN IN GRADIENTS
+                # if torch.isnan(grad_norm):
+                #     print(
+                #         f"⚠️ NaN gradient norm at batch {batch_idx}, skipping optimizer step..."
+                #     )
+                #     optimizer.zero_grad()
+                #     continue
+
+                scaler.step(optimizer)
+                scaler.update()
+
+            epoch_train_loss += loss.item()
+            pbar.set_postfix({"Loss": f"{loss:.4f}"})
+            num_batches_processed += 1
+            if num_batches_processed >= batches_per_epoch:
+                break
+        avg_train_loss = epoch_train_loss / num_batches_processed
+        train_losses.append(avg_train_loss)
+        if output_type == "labels":
+            train_acc = (
+                epoch_train_correct / epoch_train_total
+                if epoch_train_total > 0
+                else 0.0
+            )
+            train_accs.append(train_acc)
+            print(f"Training - Loss: {avg_train_loss:.4f}, Accuracy: {train_acc:.4f}")
+        else:
+            print(
+                f"Training - Loss (time: {time.time() - t0:.4f}): {avg_train_loss:.4f}"
+            )
+
+        # Validation phase
+        unet3d.eval()
+        epoch_val_loss = 0.0
+        epoch_val_correct = 0
+        epoch_val_total = 0
+
+        # For per-class metrics
+        if output_type == "labels":
+            all_preds = []
+            all_gts = []
+            all_masks = []
+
+        all_vol_data = []
+        val_loss_per_crop = []
+        t0 = time.time()
+
+        with torch.no_grad():
+            for vol_idx, (
+                raw,
+                features,
+                gt,
+                target,
+                boundary_weights,
+                mask,
+            ) in enumerate(val_loader):
+                # Move to device
+                features = features.to(device, non_blocking=True)
+                gt = gt.to(device, non_blocking=True)
+                target = target.to(device, non_blocking=True)
+                if boundary_weights is not None:
+                    boundary_weights = boundary_weights.to(device, non_blocking=True)
+                if mask is not None:
+                    mask = mask.to(device, non_blocking=True)
+
+                # ✅ ADD MIXED PRECISION HERE
+                if use_mixed_precision:
+                    with autocast(device_type=device.type):
+                        outputs = unet3d(features)
+
+                        if output_type == "labels":
+                            loss = loss_fn(outputs, gt, mask=mask)
+                        elif "boundary" in loss_type:
+                            loss = loss_fn(
+                                outputs,
+                                target,
+                                boundary_weights=boundary_weights,
+                                mask=mask,
+                            )
+                        else:
+                            loss = loss_fn(outputs, target, mask=mask)
+                else:
+                    outputs = unet3d(features)
+
+                    if output_type == "labels":
+                        loss = loss_fn(outputs, gt, mask=mask)
+                    elif "boundary" in loss_type:
+                        loss = loss_fn(
+                            outputs,
+                            target,
+                            boundary_weights=boundary_weights,
+                            mask=mask,
+                        )
+                    else:
+                        loss = loss_fn(outputs, target, mask=mask)
+
+                epoch_val_loss += loss.item()
+
+                if output_type == "labels":
+                    predictions = torch.argmax(outputs, dim=1)
+                    if mask is not None:
+                        mask_bool = mask > 0.5
+                        correct = ((predictions == gt) & mask_bool).sum().item()
+                        total = mask_bool.sum().item()
+                    else:
+                        correct = (predictions == gt).sum().item()
+                        total = gt.numel()
+
+                    epoch_val_correct += correct
+                    epoch_val_total += total
+
+                    # Collect for per-class metrics
+                    all_preds.append(predictions.cpu().numpy())
+                    all_gts.append(gt.cpu().numpy())
+                    if mask is not None:
+                        all_masks.append(mask.cpu().numpy())
+
+                all_vol_data.append(
+                    {
+                        "vol_idx": vol_idx,
+                        "vol_raw": raw[0],
+                        "vol_seg": gt[0],
+                        "vol_mask": mask[0] if mask is not None else None,
+                        "vol_targets": target.cpu()[0],
+                        "vol_predictions": torch.sigmoid(outputs).cpu()[0],
+                        "vol_loss": loss.item(),  # ✅ Fixed: use .item() for scalar
+                    }
+                )
+                val_loss_per_crop.append(loss.item())  # ✅ Fixed: use .item()
+
+        avg_val_loss = epoch_val_loss / len(val_loader)
+        val_losses.append(avg_val_loss)
+
+        if output_type == "labels":
+            val_acc = (
+                epoch_val_correct / epoch_val_total if epoch_val_total > 0 else 0.0
+            )
+            val_accs.append(val_acc)
+
+            # # Calculate per-class metrics
+            # from dinov3_playground.metrics import calculate_per_class_metrics
+
+            # all_preds = np.concatenate([p.flatten() for p in all_preds])
+            # all_gts = np.concatenate([g.flatten() for g in all_gts])
+            # if all_masks:
+            #     all_masks = np.concatenate([m.flatten() for m in all_masks])
+            #     mask_bool = all_masks > 0.5
+            #     all_preds = all_preds[mask_bool]
+            #     all_gts = all_gts[mask_bool]
+
+            # class_metrics = calculate_per_class_metrics(all_preds, all_gts, num_classes)
+            # val_class_accs.append(class_metrics["accuracies"])
+            # val_class_precisions.append(class_metrics["precisions"])
+            # val_class_f1s.append(class_metrics["f1_scores"])
+            # val_class_ious.append(class_metrics["ious"])
+
+            # mean_iou = np.mean(
+            #     [iou for iou in class_metrics["ious"] if not np.isnan(iou)]
+            # )
+            # current_metric = mean_iou
+
+            # print(
+            #     f"Validation - Loss: {avg_val_loss:.4f}, Accuracy: {val_acc:.4f}, Mean IoU: {mean_iou:.4f}"
+            # )
+            # ious = class_metrics["ious"]
+            # print(
+            #     f"Per-class IoU: {', '.join([f'{class_names[i]}: {ious[i].item():.3f}' for i in range(num_classes)])}"
+            # )
+        else:
+            current_metric = -avg_val_loss  # For affinity/LSDS, lower loss is better
+            print(
+                f"Validation - Loss (time: {time.time() - t0:.4f}): {avg_val_loss:.4f}"
+            )
+
+        # Learning rate scheduling
+        if output_type == "labels":
+            scheduler.step(current_metric)
+        else:
+            scheduler.step(avg_val_loss)
+
+        # Log to TensorBoard
+        # Check for improvement
+        is_best_model = False
+        if output_type == "labels":
+            if current_metric > best_metric + min_delta:
+                best_metric = current_metric
+                best_val_loss = avg_val_loss
+                epochs_without_improvement = 0
+                is_best_model = True
+            else:
+                epochs_without_improvement += 1
+        else:
+            if avg_val_loss < best_val_loss - min_delta:
+                best_val_loss = avg_val_loss
+                best_metric = current_metric
+                epochs_without_improvement = 0
+                is_best_model = True
+            else:
+                epochs_without_improvement += 1
+
+        if save_checkpoints:
+            # For backward compatibility with checkpoint system, alias the best metric
+            best_val_acc = best_metric
+            stats_data = {
+                "epoch": epoch + 1,
+                "train_losses": train_losses,
+                "val_losses": val_losses,
+                "train_accs": train_accs,
+                "val_accs": val_accs,
+                "train_class_accs": train_class_accs,
+                "val_class_accs": val_class_accs,
+                "best_val_acc": best_val_acc,
+                "epochs_without_improvement": epochs_without_improvement,
+                "class_weights": (
+                    class_weights_tensor.cpu().numpy()
+                    if class_weights_tensor is not None
+                    else None
+                ),
+                "training_config": {
+                    "num_classes": num_classes,
+                    "class_names": class_names,  # Add class names
+                    "learning_rate": learning_rate,
+                    "weight_decay": weight_decay,
+                    "patience": patience,
+                    "min_delta": min_delta,
+                    "base_channels": base_channels,
+                    "volumes_per_batch": batch_size,
+                    "batches_per_epoch": batches_per_epoch,
+                    "epochs": epochs,  # Add total epochs
+                    "model_type": "dinov3_unet3d",
+                    "model_id": model_id,
+                    "input_channels": input_channels,
+                    "use_class_weighting": use_class_weighting,
+                    # Loss function parameters
+                    "loss_type": loss_type,
+                    "focal_gamma": focal_gamma,
+                    "focal_weight": focal_weight,
+                    "dice_weight": dice_weight,
+                    "dice_smooth": dice_smooth,
+                    "tversky_alpha": tversky_alpha,
+                    "tversky_beta": tversky_beta,
+                    # Volume and feature sizes
+                    "target_volume_size": volume_shape,
+                    "dinov3_slice_size": dinov3_slice_size,
+                    "image_size": volume_shape[0],  # For DINOv3 initialization
+                    "use_mixed_precision": use_mixed_precision,  # Add memory efficiency params
+                    "use_half_precision": use_half_precision,
+                    "use_gradient_checkpointing": use_gradient_checkpointing,
+                    "learn_upsampling": learn_upsampling,  # Add upsampling mode
+                    "use_orthogonal_planes": use_orthogonal_planes,  # Add orthogonal planes setting
+                    "use_anyup": use_anyup,  # Add AnyUp setting
+                    "train_volume_pool_size": len(train_volume_indices),
+                    "val_volume_pool_size": len(val_volume_indices),
+                    "checkpoint_every_n_epochs": checkpoint_every_n_epochs,  # Add checkpoint frequency
+                    "enable_detailed_timing": enable_detailed_timing,  # Add timing control
+                    # Data resolution parameters
+                    "min_resolution_for_raw": min_resolution_for_raw,  # Add raw data resolution
+                    "base_resolution": base_resolution,  # Add ground truth resolution
+                    # Context fusion parameters
+                    # Affinity parameters
+                    "affinity_offsets": affinity_offsets,
+                    "lsds_sigma": lsds_sigma,
+                    "output_type": output_type,
+                },
+                "model_config": {
+                    "num_classes": num_classes,
+                    "base_channels": base_channels,
+                    "input_size": volume_shape,  # 3D volume size
+                    "input_channels": input_channels,
+                    "model_id": model_id,
+                    "model_type": "dinov3_unet3d",
+                    "dinov3_slice_size": dinov3_slice_size,
+                    "learn_upsampling": learn_upsampling,  # Add upsampling mode to model config
+                    "use_orthogonal_planes": use_orthogonal_planes,  # Add orthogonal planes
+                    "use_half_precision": use_half_precision,  # Add precision settings
+                    "use_gradient_checkpointing": use_gradient_checkpointing,
+                    # Data resolution parameters for model recreation
+                    "min_resolution_for_raw": min_resolution_for_raw,
+                    "base_resolution": base_resolution,
+                    # Context fusion parameters
+                    "use_context_fusion": use_context_fusion,  # Add context fusion flag
+                },
+            }
+            stats_path = os.path.join(checkpoint_dir, f"stats_epoch_{epoch+1:04d}.pkl")
+            with open(stats_path, "wb") as f:
+                pickle.dump(stats_data, f)
+
+            latest_stats_path = os.path.join(checkpoint_dir, "latest_stats.pkl")
+            with open(latest_stats_path, "wb") as f:
+                pickle.dump(stats_data, f)
+
+            log_validation_losses_to_tensorboard(
+                writer=writer,
+                epoch=epoch,
+                train_loss=avg_train_loss,
+                val_loss_overall=avg_val_loss,
+                val_loss_per_crop=val_loss_per_crop,
+            )
+
+            # Save best model
+            if is_best_model:
+                checkpoint_data = {
+                    **stats_data,
+                    "unet3d_state_dict": unet3d.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
+                }
+
+                best_path = os.path.join(checkpoint_dir, "best.pkl")
+                with open(best_path, "wb") as f:
+                    pickle.dump(checkpoint_data, f)
+
+                if output_type == "labels":
+                    print(f"  *** NEW BEST MODEL SAVED: IoU={current_metric:.4f} ***")
+                else:
+                    print(f"  *** NEW BEST MODEL SAVED: Loss={avg_val_loss:.4f} ***")
+            # Periodic checkpoint
+            elif (
+                checkpoint_every_n_epochs
+                and (epoch + 1) % checkpoint_every_n_epochs == 0
+            ):
+                checkpoint_data = {
+                    **stats_data,
+                    "unet3d_state_dict": unet3d.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
+                }
+
+                epoch_path = os.path.join(
+                    checkpoint_dir, f"checkpoint_epoch_{epoch+1:04d}.pkl"
+                )
+                with open(epoch_path, "wb") as f:
+                    pickle.dump(checkpoint_data, f)
+                print(f"  *** PERIODIC CHECKPOINT SAVED: Epoch {epoch+1} ***")
+            print("Tensorboard results can be found at : ", tb_log_dir)
+            if is_best_model or (
+                checkpoint_every_n_epochs
+                and (epoch + 1) % checkpoint_every_n_epochs == 0
+            ):
+                try:
+                    log_multi_volume_grid_to_tensorboard(
+                        writer=writer,
+                        all_vol_data=all_vol_data,
+                        epoch_step=epoch,
+                        tag_prefix="validation",
+                        fps=1,
+                        scale_up=1,
+                        show_seg_column=True,
+                        show_mask_column=True,
+                        save_gif_every=0,  # Set to non-zero if you want periodic GIF saves
+                    )
+                except Exception as e:
+                    print(
+                        f"Warning: failed to log multi-volume grid to TensorBoard: {e}"
+                    )
+
+        # Early stopping
+        if epochs_without_improvement >= patience:
+            print(
+                f"Early stopping at epoch {epoch+1} (no improvement for {patience} epochs)"
+            )
+            break
+
+        # GPU cleanup
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    writer.close()
+
+    return {
+        "unet3d": unet3d,
+        "train_losses": train_losses,
+        "val_losses": val_losses,
+        "train_accs": train_accs if output_type == "labels" else None,
+        "val_accs": val_accs if output_type == "labels" else None,
+        "train_class_accs": train_class_accs if output_type == "labels" else None,
+        "val_class_accs": val_class_accs if output_type == "labels" else None,
+        "val_class_precisions": (
+            val_class_precisions if output_type == "labels" else None
+        ),
+        "val_class_f1s": val_class_f1s if output_type == "labels" else None,
+        "val_class_ious": val_class_ious if output_type == "labels" else None,
+        "best_metric": best_metric,
+        "best_val_loss": best_val_loss,
+        "epochs_trained": len(train_losses),
+        "checkpoint_dir": checkpoint_dir,
+        "export_base_dir": export_base_dir,
+        "class_weights": (
+            class_weights_tensor.cpu().numpy()
+            if class_weights_tensor is not None
+            else None
+        ),
+    }
 
 
 # Alias for consistency with 2D naming convention
