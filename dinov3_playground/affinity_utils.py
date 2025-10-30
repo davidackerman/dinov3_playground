@@ -1177,6 +1177,7 @@ class BoundaryWeightedAffinityFocalLSDSLoss(torch.nn.Module):
             boundary_weights = torch.from_numpy(np.stack(bweights_list, axis=0)).to(
                 device=device, dtype=dtype
             )
+
         # ✅ Clamp boundary weights
         # boundary_weights = torch.clamp(boundary_weights, min=0.1, max=10.0)
         boundary_weights = boundary_weights.detach()  # ✅ Detach here
