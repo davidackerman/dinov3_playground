@@ -101,7 +101,18 @@ class DINOv3UNetInference:
 
         # Select checkpoint file according to preference
         best_model_path = None
-        if getattr(self, "checkpoint_preference", "best") == "latest":
+        cpref = getattr(self, "checkpoint_preference", "best")
+        if isinstance(cpref, int) or (isinstance(cpref, str) and cpref.isdigit()):
+            # Look for checkpoint_epoch_XXXX.pkl for specified epoch
+            epoch_num = int(cpref)
+            epoch_str = f"{epoch_num:04d}"
+            epoch_path = checkpoint_dir / f"checkpoint_epoch_{epoch_str}.pkl"
+            if epoch_path.exists():
+                best_model_path = epoch_path
+            else:
+                # fallback to best.pkl
+                best_model_path = checkpoint_dir / "best.pkl"
+        elif cpref == "latest":
             # look for epoch checkpoints highest-numbered
             epoch_files = list(checkpoint_dir.glob("checkpoint_epoch_*.pkl"))
             max_file = None
@@ -189,7 +200,6 @@ class DINOv3UNetInference:
             or 512
         )
 
-        print(f"Initializing DINOv3 model: {model_id}")
         self.dinov3_processor, self.dinov3_model, output_channels = initialize_dinov3(
             model_id=model_id, image_size=image_size
         )
@@ -386,7 +396,20 @@ class DINOv3UNet3DInference:
 
         # Select checkpoint file according to preference (same logic as 2D loader)
         best_model_path = None
-        if getattr(self, "checkpoint_preference", "best") == "latest":
+        best_model_path = None
+        cpref = getattr(self, "checkpoint_preference", "best")
+        if isinstance(cpref, int) or (isinstance(cpref, str) and cpref.isdigit()):
+            # Look for checkpoint_epoch_XXXX.pkl for specified epoch
+            epoch_num = int(cpref)
+            epoch_str = f"{epoch_num:04d}"
+            epoch_path = checkpoint_dir / f"checkpoint_epoch_{epoch_str}.pkl"
+            if epoch_path.exists():
+                best_model_path = epoch_path
+            else:
+                # fallback to best.pkl
+                best_model_path = checkpoint_dir / "best.pkl"
+        elif cpref == "latest":
+            # look for epoch checkpoints highest-numbered
             epoch_files = list(checkpoint_dir.glob("checkpoint_epoch_*.pkl"))
             max_file = None
             max_num = -1
@@ -440,13 +463,14 @@ class DINOv3UNet3DInference:
                 self.model_config["affinity_offsets"] = self.training_config[
                     "affinity_offsets"
                 ]
+        use_anyup = self.training_config.get("use_anyup", False)
+
         if not self.model_config and self.training_config:
             # Better fallback reconstruction for 3D models
             target_volume_size = self.training_config.get(
                 "target_volume_size", (128, 128, 128)
             )
             dinov3_slice_size = self.training_config.get("dinov3_slice_size", 512)
-
             self.model_config = {
                 "num_classes": self.training_config.get("num_classes", 2),
                 "base_channels": self.training_config.get("base_channels", 64),
@@ -467,8 +491,11 @@ class DINOv3UNet3DInference:
                     "model_id", "facebook/dinov3-vitl16-pretrain-sat493m"
                 ),
                 "model_type": self.training_config.get("model_type", "dinov3_unet3d"),
+                "use_anyup": use_anyup,  # NEW - anyup
             }
-            print(f"Reconstructed 3D model_config from training_config")
+            print(
+                f"Reconstructed 3D model_config from training_config, use_anyup={use_anyup}"
+            )
 
         # Detect learned upsampling from state dict if not in config
         learn_upsampling = self.model_config.get("learn_upsampling", False)
@@ -509,9 +536,13 @@ class DINOv3UNet3DInference:
             or 512
         )
 
-        print(f"Initializing DINOv3 model: {model_id}")
+        dinov3_slice_size = self.model_config.get("dinov3_slice_size", 512)
+
+        print(
+            f"Initializing DINOv3 model: {model_id}, with image size: {dinov3_slice_size}"
+        )
         processor, model, output_channels = initialize_dinov3(
-            model_id=model_id, image_size=image_size
+            model_id=model_id, image_size=dinov3_slice_size
         )
 
         # Create 3D UNet model
@@ -587,6 +618,7 @@ class DINOv3UNet3DInference:
             base_channels=base_channels,
             input_channels=output_channels,  # Pass the input channels explicitly
             use_orthogonal_planes=use_orthogonal_planes,  # Use training config setting
+            use_anyup=use_anyup,  # Pass anyup setting
             device=self.device,
         )
         # Replace the pipeline's UNet with our trained model
@@ -614,6 +646,7 @@ class DINOv3UNet3DInference:
             learn_upsampling=learn_upsampling,  # Match training mode
             dinov3_stride=dinov3_stride,  # Match training stride
             use_orthogonal_planes=use_orthogonal_planes,  # Match training orthogonal setting
+            use_anyup=use_anyup,  # Match anyup setting
         )
 
         print(f"✅ 3D Model loaded successfully!")
@@ -626,6 +659,7 @@ class DINOv3UNet3DInference:
         print(f"   - DINOv3 stride: {dinov3_stride}")
         print(f"   - Learn upsampling: {learn_upsampling}")
         print(f"   - Use context fusion: {use_context_fusion}")
+        print(f"   - Use anyup: {use_anyup}")
         if use_context_fusion:
             print(f"   - Context channels: {context_channels}")
         print(f"   - Model config keys: {list(self.model_config.keys())}")
@@ -689,7 +723,8 @@ class DINOv3UNet3DInference:
             )
             context_features = None
             print(f"Feature extraction timing: {timing}")
-
+        # save first 10 features
+        np.save("local_features.npy", local_features[0, :10, ...].cpu().numpy())
         # Run through 3D UNet
         with torch.no_grad():
             if use_context_fusion:
@@ -950,7 +985,7 @@ def load_inference_model(
             export_dir, device, checkpoint_preference=checkpoint_preference
         )
     else:
-        return DINOv3UNetInference(
+        return DINOv3UNet3DInference(
             export_dir, device, checkpoint_preference=checkpoint_preference
         )
 
@@ -998,3 +1033,15 @@ def demo_3d_inference(export_dir: str):
     print(f"Predictions shape: {predictions.shape}")
     print(f"Probabilities shape: {probabilities.shape}")
     print(f"Unique predictions: {np.unique(predictions)}")
+
+
+# %%
+# import matplotlib.pyplot as plt
+# import numpy as np
+# data = np.load("/groups/cellmap/cellmap/ackermand/Programming/dinov3_playground/examples/local_features.npy")
+# # # make this a bigger figure
+# plt.figure(figsize=(10, 20))
+# for i in range(10):
+#     plt.subplot(10,1,i+1)
+#     plt.imshow(data[i,:,:,64])
+# %%

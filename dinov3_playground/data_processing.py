@@ -739,7 +739,7 @@ def _sample_single_orientation(
             if extends_before or extends_after:
                 if allow_extension_beyond_roi:
                     warnings.warn(
-                        f"Dataset {dataset_idx}: ROI {roi} extends beyond data bounds "
+                        f"Dataset {dataset_idx}({dataset_pairs[dataset_idx]}): ROI {roi} extends beyond data bounds "
                         f"[{overlap_begin} to {overlap_end}]. Will be padded with zeros.",
                         UserWarning,
                     )
@@ -765,7 +765,7 @@ def _sample_single_orientation(
 
         # If we get here, we couldn't find a valid crop with enough labels
         warnings.warn(
-            f"Dataset {dataset_idx}: Could not find crop with sufficient labels "
+            f"Dataset {dataset_idx}({dataset_pairs[dataset_idx]}): Could not find crop with sufficient labels "
             f"(min_label_fraction={min_label_fraction}) after {max_attempts} attempts",
             UserWarning,
         )
@@ -1299,11 +1299,20 @@ def load_random_3d_training_data(
                     gt_overlap_end = np.minimum(gt_overlap_end, class_end)
 
                 gt_overlap_shape = gt_overlap_end - gt_overlap_begin
-
+                max_possible_ground_truth_fraction = np.prod(
+                    gt_overlap_shape
+                ) / np.prod(volume_shape_nm)
+                if max_possible_ground_truth_fraction < min_ground_truth_fraction:
+                    print(
+                        f"  Dataset {dataset_idx}({dataset_pairs[dataset_idx]}): GT overlap region too small "
+                        f"for minimum ground truth fraction requirement "
+                        f"({max_possible_ground_truth_fraction:.4f} < {min_ground_truth_fraction})"
+                    )
+                    continue
                 # Check if GT overlap region exists (center constraint only needs a single voxel)
                 if np.any(gt_overlap_shape <= 0):
                     print(
-                        f"  Dataset {dataset_idx}: No GT overlap region found - GT regions don't intersect"
+                        f"  Dataset {dataset_idx}({dataset_pairs[dataset_idx]}): No GT overlap region found - GT regions don't intersect"
                     )
                     continue
 
@@ -1469,7 +1478,7 @@ def load_random_3d_training_data(
                         else "TensorStore/zarr compatibility error"
                     )
                     print(
-                        f"  Dataset {dataset_idx}: {error_type} for '{class_key}' in '{dataset_name}', {crop_info} - skipping this crop"
+                        f"  Dataset {dataset_idx}({dataset_pairs[dataset_idx]}): {error_type} for '{class_key}' in '{dataset_name}', {crop_info} - skipping this crop"
                     )
                     print(f"    ROI: {gt_roi}")
                     print(f"    Error: {str(e)[:100]}...")
@@ -1483,7 +1492,7 @@ def load_random_3d_training_data(
             # Skip this dataset entirely if no classes could be loaded
             if not class_volumes:
                 print(
-                    f"    ❌ All organelles failed for dataset {dataset_idx} - skipping entirely"
+                    f"    ❌ All organelles failed for dataset Dataset {dataset_idx}({dataset_pairs[dataset_idx]}) - skipping entirely"
                 )
                 continue
 
@@ -1622,7 +1631,7 @@ def load_random_3d_training_data(
 
             except (ValueError, RuntimeError, OSError, IndexError) as e:
                 print(
-                    f"  Dataset {dataset_idx}: Invalid ROI coordinates - skipping this crop"
+                    f"  Dataset {dataset_idx}({dataset_pairs[dataset_idx]}): Invalid ROI coordinates - skipping this crop"
                 )
                 print(f"    ROI: {padded_roi}")
                 print(f"    Error: {str(e)[:100]}...")
@@ -1678,7 +1687,7 @@ def load_random_3d_training_data(
 
                 except (ValueError, RuntimeError, OSError, IndexError) as e:
                     print(
-                        f"  Dataset {dataset_idx}: Failed to load context data - continuing without context"
+                        f"  Dataset {dataset_idx}({dataset_pairs[dataset_idx]}): Failed to load context data - continuing without context"
                     )
                     print(
                         f"    Context ROI: {context_roi if 'context_roi' in locals() else 'undefined'}"
@@ -1698,7 +1707,7 @@ def load_random_3d_training_data(
             )
             if gt_volume.shape != volume_shape:
                 print(
-                    f"  Dataset {dataset_idx}: GT shape mismatch - got: {gt_volume.shape}, expected: {volume_shape}"
+                    f"  Dataset {dataset_idx}({dataset_pairs[dataset_idx]}): GT shape mismatch - got: {gt_volume.shape}, expected: {volume_shape}"
                 )
                 continue
 
@@ -1778,7 +1787,9 @@ def load_random_3d_training_data(
             valid_gt_voxels = np.sum(gt_mask)  # Number of valid GT voxels
 
             if valid_gt_voxels == 0:
-                print(f"  Dataset {dataset_idx}: No valid GT region found - skipping")
+                print(
+                    f"  Dataset {dataset_idx}({dataset_pairs[dataset_idx]}): No valid GT region found - skipping"
+                )
                 continue
 
             for class_key, class_mask in class_fractions.items():
@@ -1790,7 +1801,7 @@ def load_random_3d_training_data(
             # Check minimum label fraction within valid GT regions
             if total_label_fraction < min_label_fraction:
                 print(
-                    f"  Dataset {dataset_idx}: label fraction {total_label_fraction:.3f} too low within valid GT regions"
+                    f"  Dataset {dataset_idx}({dataset_pairs[dataset_idx]}): label fraction {total_label_fraction:.3f} too low within valid GT regions"
                 )
                 continue
 
@@ -1798,7 +1809,7 @@ def load_random_3d_training_data(
             gt_fraction_of_total = valid_gt_voxels / np.prod(volume_shape)
             if gt_fraction_of_total < min_ground_truth_fraction:
                 print(
-                    f"  Dataset {dataset_idx}: ground truth fraction {gt_fraction_of_total:.3f} below min_ground_truth_fraction {min_ground_truth_fraction} - skipping"
+                    f"  Dataset {dataset_idx}({dataset_pairs[dataset_idx]}): ground truth fraction {gt_fraction_of_total:.3f} below min_ground_truth_fraction {min_ground_truth_fraction} - skipping"
                 )
                 continue
 
@@ -1813,17 +1824,17 @@ def load_random_3d_training_data(
 
                 if num_unique_ids < min_unique_ids:
                     print(
-                        f"  Dataset {dataset_idx}: only {num_unique_ids} unique instance IDs "
+                        f"  Dataset {dataset_idx}({dataset_pairs[dataset_idx]}): only {num_unique_ids} unique instance IDs "
                         f"(need {min_unique_ids}) within valid GT regions - skipping"
                     )
                     continue
                 print(
-                    f"  Dataset {dataset_idx}: {num_unique_ids} unique instance IDs found "
+                    f"  Dataset {dataset_idx}({dataset_pairs[dataset_idx]}): {num_unique_ids} unique instance IDs found "
                     f"(>= {min_unique_ids} required)"
                 )
 
             print(
-                f"  Dataset {dataset_idx}: label fraction {total_label_fraction:.3f} within valid GT regions, roi {gt_roi}"
+                f"  Dataset {dataset_idx}({dataset_pairs[dataset_idx]}): label fraction {total_label_fraction:.3f} within valid GT regions, roi {gt_roi}"
             )
 
             # Use the centralized augmentation helpers (keeps code modular)

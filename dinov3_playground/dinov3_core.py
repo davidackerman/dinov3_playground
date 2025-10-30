@@ -405,7 +405,7 @@ def _extract_convnext_map(outputs, inputs):
     raise RuntimeError("Unexpected ConvNeXt tensor rank (expect 3D or 4D).")
 
 
-def _process_single_standard(data, image_size):
+def _process_single_standard(data, image_size, return_images=False):
     """
     Process data through the model without sliding window.
     Input:
@@ -463,6 +463,11 @@ def _process_single_standard(data, image_size):
         else:
             raise RuntimeError("Unknown output rank for vision backbone.")
 
+    if return_images:
+        return (
+            out,
+            inputs["pixel_values"],
+        )  # Return both features and preprocessed images
     return out
 
 
@@ -578,7 +583,7 @@ def _process_sliding_window(data, stride, patch_size, image_size):
 
 
 # -------------------- Public API --------------------
-def process(data, model_id=None, image_size=896, stride=None):
+def process(data, model_id=None, image_size=896, stride=None, return_images=False):
     """
     Process raw image data through DINOv3 to extract features.
 
@@ -614,7 +619,7 @@ def process(data, model_id=None, image_size=896, stride=None):
         # If effective_patch not known yet, infer by a small run
         if _effective_patch is None:
             # print("[process] effective_patch unknown for ConvNeXt; probing...")
-            _ = _process_single_standard(data[:1], image_size)
+            _ = _process_single_standard(data[:1], image_size, return_images)
             # print(f"[process] effective_patch inferred: {_effective_patch}")
         patch_size = int(_effective_patch)
 
@@ -623,4 +628,4 @@ def process(data, model_id=None, image_size=896, stride=None):
         return _process_sliding_window(data, stride, patch_size, image_size)
 
     # print(f"[process] Single-pass mode: patch/effective={patch_size}")
-    return _process_single_standard(data, image_size)
+    return _process_single_standard(data, image_size, return_images)
