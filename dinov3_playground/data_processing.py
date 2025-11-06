@@ -1060,6 +1060,7 @@ def load_random_3d_training_data(
     augment_prob=0.5,  # Per-volume probability to apply augmentation
     augment_params=None,  # Optional dict to control augmentation distributions
     min_ground_truth_fraction=0.0,  # NEW: Minimum fraction of GT out of total volume size
+    max_attempts=None,
 ):
     """
     Load random 3D volumes from multiple datasets for 3D UNet training.
@@ -1156,7 +1157,7 @@ def load_random_3d_training_data(
         else volume_shape
     )
     raw_volumes = np.empty((num_volumes, *raw_volume_shape), dtype=np.uint16)
-    gt_volumes = np.empty((num_volumes, *volume_shape), dtype=np.uint8)
+    gt_volumes = np.empty((num_volumes, *volume_shape), dtype=np.uint32)
     gt_masks = (
         np.empty((num_volumes, *volume_shape), dtype=np.uint8)
         if allow_gt_extension
@@ -1181,7 +1182,9 @@ def load_random_3d_training_data(
     )
 
     volumes_collected = 0
-    max_attempts = num_volumes * 10  # Allow multiple attempts
+    max_attempts = (
+        num_volumes * 10 if not max_attempts else max_attempts
+    )  # Allow multiple attempts
 
     # Add progress bar for data loading
     from tqdm import tqdm
@@ -1498,7 +1501,7 @@ def load_random_3d_training_data(
 
             # Create multi-class ground truth volume
             # Initialize with background (class 0)
-            gt_volume = np.zeros(volume_shape, dtype=np.uint8)
+            gt_volume = np.zeros(volume_shape, dtype=np.uint32)
 
             # Assign class labels (assign sequential class numbers starting from 1)
             # Sort class keys alphabetically for consistent ordering - only use successfully loaded classes

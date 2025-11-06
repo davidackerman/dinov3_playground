@@ -1,3 +1,4 @@
+# %%
 """
 Preprocessing functions for extracting and caching DINOv3 features to TensorStore.
 Updated to include downsampled raw data.
@@ -319,6 +320,7 @@ def downsample_raw_to_gt(raw_volume, gt_shape):
     --------
     np.ndarray : Downsampled raw volume matching GT shape
     """
+    return raw_volume
     if raw_volume.shape == gt_shape:
         return raw_volume
 
@@ -358,6 +360,7 @@ def preprocess_and_save_volume(
     min_label_fraction=0.01,
     min_unique_ids=2,
     min_ground_truth_fraction=0.05,
+    boundary_weight=5,
     allow_gt_extension=True,
     use_compression=False,
     lsds_sigma=20.0,
@@ -511,6 +514,7 @@ def preprocess_and_save_volume(
         boundary_weights = compute_boundary_weights(
             instance_segmentation=gt_volume,
             mask=gt_mask,
+            boundary_weight=boundary_weight,
         )
         print(f"  Boundary weights shape: {boundary_weights.shape}")
 
@@ -745,3 +749,37 @@ def load_preprocessed_volume(volume_path, num_threads=None, load_datasets=None):
             print(f"  Warning: Could not load {dataset_name}: {e}")
 
     return result
+
+
+# %%
+for i in range(1):
+
+    boundary_weights = compute_boundary_weights(
+        instance_segmentation=gt,
+        mask=mask,
+        boundary_weight=10,
+    )
+
+    print("  Writing boundary weights...")
+    # Match chunking to actual array dimensions
+    if len(boundary_weights.shape) == 4:
+        weights_chunks = (min(boundary_weights.shape[0], 16), 64, 64, 64)
+    else:  # 3D array
+        weights_chunks = tuple(min(s, 64) for s in boundary_weights.shape)
+
+    weights_spec = {
+        "driver": "zarr",
+        "kvstore": {
+            "driver": "file",
+            "path": str(output_path),
+        },
+        "path": "boundary_weights",
+        "metadata": {
+            "shape": list(boundary_weights.shape),
+            "chunks": list(weights_chunks),
+            "dtype": "<f4",  # float32
+            "compressor": compressor,
+        },
+    }
+    weights_dataset = ts.open(weights_spec, create=True, context=context).result()
+    weights_dataset[:] = boundary_weights

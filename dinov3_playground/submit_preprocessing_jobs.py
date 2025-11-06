@@ -32,6 +32,7 @@ def submit_lsf_job(
     min_label_fraction=0.01,
     min_unique_ids=2,
     min_ground_truth_fraction=0.05,
+    boundary_weight=5,
     no_gt_extension=False,
     compression=False,
     num_threads=8,
@@ -118,6 +119,8 @@ def submit_lsf_job(
         str(min_unique_ids),
         "--min-ground-truth-fraction",
         str(min_ground_truth_fraction),
+        "--boundary-weight",
+        str(boundary_weight),
         "--num-threads",
         str(num_threads),
     ]
@@ -273,6 +276,12 @@ def parse_args():
         help="Minimum label fraction required",
     )
     parser.add_argument(
+        "--boundary-weight",
+        type=float,
+        default=5.0,
+        help="Boundary weight",
+    )
+    parser.add_argument(
         "--min-unique-ids",
         type=int,
         default=2,
@@ -390,6 +399,7 @@ def main():
             min_ground_truth_fraction=args.min_ground_truth_fraction,
             no_gt_extension=args.no_gt_extension,
             compression=args.compression,
+            boundary_weight=args.boundary_weight,
             num_threads=args.num_threads,
             num_processors=args.num_processors,
             memory_gb=args.memory_gb,

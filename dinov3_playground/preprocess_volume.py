@@ -103,7 +103,12 @@ def parse_args():
         action="store_true",
         help="Disable GT extension (no masks)",
     )
-
+    parser.add_argument(
+        "--boundary-weight",
+        type=float,
+        default=5,
+        help="Boundary weight for boundary affinity computation",
+    )
     # Storage configuration
     parser.add_argument(
         "--compression",
@@ -150,6 +155,7 @@ def main():
             inference_filter=args.inference_filter,
             min_label_fraction=args.min_label_fraction,
             min_unique_ids=args.min_unique_ids,
+            boundary_weight=args.boundary_weight,
             min_ground_truth_fraction=args.min_ground_truth_fraction,
             allow_gt_extension=not args.no_gt_extension,
             use_compression=args.compression,

@@ -1050,27 +1050,29 @@ class DINOv3UNet3D(nn.Module):
 
         # Encoder path with skip connections (use gradient checkpointing if enabled)
         if self.use_gradient_checkpointing and self.training:
-            enc1_out = checkpoint(self.enc1, x)  # (B, base_channels, D, H, W)
+            enc1_out = checkpoint(
+                self.enc1, x, use_reentrant=False
+            )  # (B, base_channels, D, H, W)
             enc1_pool = self.pool(enc1_out)  # (B, base_channels, D/2, H/2, W/2)
 
             enc2_out = checkpoint(
-                self.enc2, enc1_pool
+                self.enc2, enc1_pool, use_reentrant=False
             )  # (B, base_channels*2, D/2, H/2, W/2)
             enc2_pool = self.pool(enc2_out)  # (B, base_channels*2, D/4, H/4, W/4)
 
             enc3_out = checkpoint(
-                self.enc3, enc2_pool
+                self.enc3, enc2_pool, use_reentrant=False
             )  # (B, base_channels*4, D/4, H/4, W/4)
             enc3_pool = self.pool(enc3_out)  # (B, base_channels*4, D/8, H/8, W/8)
 
             enc4_out = checkpoint(
-                self.enc4, enc3_pool
+                self.enc4, enc3_pool, use_reentrant=False
             )  # (B, base_channels*8, D/8, H/8, W/8)
             enc4_pool = self.pool(enc4_out)  # (B, base_channels*8, D/16, H/16, W/16)
 
             # Bottleneck
             bottleneck_out = checkpoint(
-                self.bottleneck, enc4_pool
+                self.bottleneck, enc4_pool, use_reentrant=False
             )  # (B, base_channels*16, D/16, H/16, W/16)
         else:
             enc1_out = self.enc1(x)  # (B, base_channels, D, H, W)
@@ -1128,7 +1130,7 @@ class DINOv3UNet3D(nn.Module):
 
         dec4_concat = torch.cat([dec4_up, enc4_fused], dim=1)
         if self.use_gradient_checkpointing and self.training:
-            dec4_out = checkpoint(self.dec4, dec4_concat)
+            dec4_out = checkpoint(self.dec4, dec4_concat, use_reentrant=False)
         else:
             dec4_out = self.dec4(dec4_concat)
 
@@ -1145,7 +1147,7 @@ class DINOv3UNet3D(nn.Module):
 
         dec3_concat = torch.cat([dec3_up, enc3_fused], dim=1)
         if self.use_gradient_checkpointing and self.training:
-            dec3_out = checkpoint(self.dec3, dec3_concat)
+            dec3_out = checkpoint(self.dec3, dec3_concat, use_reentrant=False)
         else:
             dec3_out = self.dec3(dec3_concat)
 
@@ -1162,7 +1164,7 @@ class DINOv3UNet3D(nn.Module):
 
         dec2_concat = torch.cat([dec2_up, enc2_fused], dim=1)
         if self.use_gradient_checkpointing and self.training:
-            dec2_out = checkpoint(self.dec2, dec2_concat)
+            dec2_out = checkpoint(self.dec2, dec2_concat, use_reentrant=False)
         else:
             dec2_out = self.dec2(dec2_concat)
 
@@ -1179,7 +1181,7 @@ class DINOv3UNet3D(nn.Module):
 
         dec1_concat = torch.cat([dec1_up, enc1_fused], dim=1)
         if self.use_gradient_checkpointing and self.training:
-            dec1_out = checkpoint(self.dec1, dec1_concat)
+            dec1_out = checkpoint(self.dec1, dec1_concat, use_reentrant=False)
         else:
             dec1_out = self.dec1(dec1_concat)
 
@@ -2306,7 +2308,9 @@ class DINOv3UNet3DPipeline(nn.Module):
 
             # ============ ANYUP INTEGRATION HERE ============
             if self.use_anyup and self.anyup_model is not None:
-                print(f"      Using AnyUp for feature upsampling instead of interpolation")
+                print(
+                    f"      Using AnyUp for feature upsampling instead of interpolation"
+                )
                 # Use AnyUp for upsampling instead of interpolation
                 anyup_start = time.time() if enable_timing else None
 
