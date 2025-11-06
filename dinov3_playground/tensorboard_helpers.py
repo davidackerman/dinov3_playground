@@ -6,38 +6,6 @@ import cv2
 import imageio
 
 
-import os
-import numpy as np
-import torch
-import torch.nn.functional as F
-import cv2
-import imageio
-
-
-import os
-import numpy as np
-import torch
-import torch.nn.functional as F
-import cv2
-import imageio
-
-
-import os
-import numpy as np
-import torch
-import torch.nn.functional as F
-import cv2
-import imageio
-
-
-import os
-import numpy as np
-import torch
-import torch.nn.functional as F
-import cv2
-import imageio
-
-
 def log_multi_volume_grid_to_tensorboard(
     writer,
     all_vol_data,
@@ -295,6 +263,28 @@ def log_multi_volume_grid_to_tensorboard(
         raw_s, seg_s, mask_s, targ_s, pred_s = map(
             reorient_any, [raw_r, seg_r, mask_r, targ_r, pred_r]
         )
+
+        # ADD THIS: Downsample for efficiency
+        spatial_stride = 4  # downsample H, W by 4x
+        slice_stride = 4  # take every 4th slice
+
+        def downsample_volume(arr, slice_stride, spatial_stride):
+            if arr is None:
+                return None
+            # Take every Nth slice
+            arr = arr[::slice_stride]
+            # Downsample spatial dimensions
+            if arr.ndim == 3:  # (D, H, W)
+                return arr[:, ::spatial_stride, ::spatial_stride]
+            elif arr.ndim == 4:  # (D, H, W, C)
+                return arr[:, ::spatial_stride, ::spatial_stride, :]
+            return arr
+
+        raw_s = downsample_volume(raw_s, slice_stride, spatial_stride)
+        seg_s = downsample_volume(seg_s, slice_stride, spatial_stride)
+        mask_s = downsample_volume(mask_s, slice_stride, spatial_stride)
+        targ_s = downsample_volume(targ_s, slice_stride, spatial_stride)
+        pred_s = downsample_volume(pred_s, slice_stride, spatial_stride)
 
         # sizes
         S = (

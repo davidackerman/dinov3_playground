@@ -1172,7 +1172,9 @@ class BoundaryWeightedAffinityFocalLSDSLoss(torch.nn.Module):
                     mask=og_mask_np[b],
                     black_border=False,
                 )
+                np.savez(f"boundary_weights_sample{b}_old.npz", weights=weights)
                 bweights_list.append(weights)
+                
 
             boundary_weights = torch.from_numpy(np.stack(bweights_list, axis=0)).to(
                 device=device, dtype=dtype

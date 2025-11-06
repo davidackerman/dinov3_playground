@@ -11,16 +11,31 @@ from mws import process_mutex_watershed
 # dataset_path = "/nrs/cellmap/data/jrc_celegans_bw25113/jrc_celegans_bw25113.zarr/recon-1/em/fibsem-uint16/s0"
 # roi_offset = (24326, 31571, 108576)
 # roi_size_voxels = 512  # Size in voxels at the input resolution
-for organelle in ["cell"]:  # "mito", "cell"]:
+# for organelle in ["cell"]:  # "mito", "cell"]:
+for path in [
+    "/nrs/cellmap/ackermand/dinov3_training/results/dinov3_finetune_3Dunet_challenge_cell_affinities_lsds_larger_random_batchrenorm_updated_loss_anyup_seed/dinov3_unet3d_dinov3_vitl16_pretrain_sat493m"
+    # "/nrs/cellmap/ackermand/dinov3_training/results/dinov3_finetune_3Dunet_challenge_cell_affinities_lsds_larger_random_batchrenorm_updated_loss_anyup_preprocessed_boundaryweight10_smaller_model_withoutadamw/dinov3_unet3d_preprocessed_dinov3_vits16_pretrain_lvd1689m",
+    # "/nrs/cellmap/ackermand/dinov3_training/results/dinov3_finetune_3Dunet_challenge_cell_affinities_lsds_larger_random_batchrenorm_updated_loss_anyup_preprocessed_boundaryweight10_smaller_model_withadamw/dinov3_unet3d_preprocessed_dinov3_vits16_pretrain_lvd1689m",
+    # "/nrs/cellmap/ackermand/dinov3_training/results/dinov3_finetune_3Dunet_challenge_cell_affinities_lsds_larger_random_batchrenorm_updated_loss_anyup_preprocessed_boundaryweight10_withadamw/dinov3_unet3d_preprocessed_dinov3_vitl16_pretrain_sat493m",
+    # "/nrs/cellmap/ackermand/dinov3_training/results/dinov3_finetune_3Dunet_challenge_cell_affinities_lsds_larger_random_batchrenorm_updated_loss_anyup_preprocessed_boundaryweight10_withoutadamw/dinov3_unet3d_preprocessed_dinov3_vitl16_pretrain_sat493m",
+]:
+    organelle = "cell"
     if organelle == "mito":
         dataset_path = "/nrs/cellmap/data/jrc_c-elegans-op50-1/jrc_c-elegans-op50-1.zarr/recon-1/em/fibsem-int16/s0"
         path = "/nrs/cellmap/ackermand/dinov3_training/results/dinov3_finetune_3Dunet_challenge_mito_affinities_lsds_sigma_5_random_batchrenorm_updated_loss/dinov3_unet3d_dinov3_vitl16_pretrain_sat493m"
         roi_offset = (163, 18036, 17492)
     if organelle == "cell":
-        path = "/nrs/cellmap/ackermand/dinov3_training/results/dinov3_finetune_3Dunet_challenge_cell_affinities_lsds_larger_random_batchrenorm_updated_loss/dinov3_unet3d_dinov3_vitl16_pretrain_sat493m"
+        # path = "/nrs/cellmap/ackermand/dinov3_training/results/dinov3_finetune_3Dunet_challenge_cell_affinities_lsds_larger_random_batchrenorm_updated_loss_anyup_preprocessed_boundaryweight10_smaller_model/dinov3_unet3d_preprocessed_dinov3_vits16_pretrain_lvd1689m"
+        # path = "/nrs/cellmap/ackermand/dinov3_training/results/dinov3_finetune_3Dunet_challenge_cell_affinities_lsds_larger_random_batchrenorm_updated_loss_anyup_preprocessed_boundaryweight10/dinov3_unet3d_preprocessed_dinov3_vitl16_pretrain_sat493m"
+        # path = "/nrs/cellmap/ackermand/dinov3_training/results/dinov3_finetune_3Dunet_challenge_cell_affinities_lsds_larger_random_batchrenorm_updated_loss_anyup_preprocessed_boundary1p5_smallermodel/dinov3_unet3d_preprocessed_dinov3_vits16_pretrain_lvd1689m"
+        # path = "/nrs/cellmap/ackermand/dinov3_training/results/dinov3_finetune_3Dunet_challenge_cell_affinities_lsds_larger_random_batchrenorm_updated_loss_anyup_seed/dinov3_unet3d_dinov3_vitl16_pretrain_sat493m"
+        # path = "/nrs/cellmap/ackermand/dinov3_training/results/dinov3_finetune_3Dunet_challenge_cell_affinities_lsds_larger_random_batchrenorm_updated_loss_retest/dinov3_unet3d_dinov3_vitl16_pretrain_sat493m"
+        # path = "/nrs/cellmap/ackermand/dinov3_training/results/dinov3_finetune_3Dunet_challenge_cell_affinities_lsds_larger_random_batchrenorm_updated_loss_anyup_preprocessed/dinov3_unet3d_preprocessed_dinov3_vitl16_pretrain_sat493m/run_20251025_164423"
+        # path = "/nrs/cellmap/ackermand/dinov3_training/results/dinov3_finetune_3Dunet_challenge_cell_affinities_lsds_larger_random_batchrenorm_updated_loss_anyup_preprocessed_boundary1/dinov3_unet3d_preprocessed_dinov3_vitl16_pretrain_sat493m"
         dataset_path = "/nrs/cellmap/data/jrc_mus-salivary-1/jrc_mus-salivary-1.zarr/recon-1/em/fibsem-uint8/s2"
         roi_offset = (32826, 39186, 61592)
-
+        # dataset_path = "/nrs/cellmap/data/jrc_mus-liver-zon-2/jrc_mus-liver-zon-2.zarr/recon-1/em/fibsem-uint8/s2"
+        # roi_offset = (30972, 37076, 26256)
     roi_size_voxels = 512  # Size in voxels at the input resolution
     # Extract dataset name from path for file naming
     dataset_name = None
@@ -46,7 +61,7 @@ for organelle in ["cell"]:  # "mito", "cell"]:
     # path = "/nrs/cellmap/ackermand/dinov3_training/results/dinov3_finetune_3Dunet_challenge_mito_affinities_lsds_sigma_5/dinov3_unet3d_dinov3_vitl16_pretrain_sat493m"
     # path = "/nrs/cellmap/ackermand/dinov3_training/results/dinov3_finetune_3Dunet_challenge_mito_affinities_lsds_sigma_5/dinov3_unet3d_dinov3_vitl16_pretrain_sat493m/"
     # path = "/nrs/cellmap/ackermand/dinov3_training/results/dinov3_finetune_3Dunet_challenge_cell_affinities_lsds_larger_only_full/dinov3_unet3d_dinov3_vitl16_pretrain_sat493m"  # /nrs/cellmap/ackermand/dinov3_training/results/dinov3_finetune_3Dunet_challenge_cell_affinities/dinov3_unet3d_dinov3_vitl16_pretrain_sat493m"
-    inference = load_inference_model(path, checkpoint_preference="best")
+    inference = load_inference_model(path, checkpoint_preference="best")  # "best")
     output_name = "_".join(path.split("/")[-3:])
 
     # Extract model configuration
@@ -250,8 +265,8 @@ for organelle in ["cell"]:  # "mito", "cell"]:
                 )
             ),
             adjacent_edge_bias=bias,
-            lr_bias=[-0.5, -0.5],
-            filter_val=0.5,
+            lr_bias=[bias, bias],
+            filter_val=-bias,
         )
 
         # replace affinities variable with cropped version for downstream saving/visualization
@@ -921,3 +936,20 @@ for organelle in ["cell"]:  # "mito", "cell"]:
 #     f"Visualization saved to gifs/{dataset_name}_{output_name}{'_affinities' if output_type == 'affinities' else ''}.gif"
 # )
 # # %%
+# %%
+# TIFF
+# import tifffile as tiff, time
+
+# t0 = time.time()
+# arr = tiff.imread(
+#     "volume.tif"
+# )  # ensure BigTIFF; set maxworkers>1 if using tifffile 2024+
+# print("tiff sec:", time.time() - t0, arr.shape, arr.dtype)
+
+# # Zarr (directory or zip store)
+# import zarr, time
+
+# store = zarr.open("volume.zarr", mode="r")  # or zarr.ZipStore("volume.zarr.zip")
+# t0 = time.time()
+# arr = store[:]
+# print("zarr sec:", time.time() - t0, arr.shape, arr.dtype)
