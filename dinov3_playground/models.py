@@ -1742,6 +1742,9 @@ class DINOv3UNet3DPipeline(nn.Module):
                 processing_w,
                 slice_batch_size=512,
                 enable_timing=enable_timing,
+                output_d=output_d,
+                output_h=output_h,
+                output_w=output_w,
             )
             detailed_timing["xy_extraction"] = time.time() - single_plane_start
 
@@ -1751,31 +1754,31 @@ class DINOv3UNet3DPipeline(nn.Module):
                 )
 
             # Downsample features to target output size if different from processing size
-            downsample_start = time.time()
-            if (processing_d, processing_h, processing_w) != (
-                output_d,
-                output_h,
-                output_w,
-            ):
-                if enable_timing:
-                    print(
-                        f"  Downsampling XY: {tuple(batch_features.shape)} → target {(batch_features.shape[0], batch_features.shape[1], output_d, output_h, output_w)}"
-                    )
-                else:
-                    print(
-                        f"Downsampling XY features from {(processing_d, processing_h, processing_w)} to {(output_d, output_h, output_w)}"
-                    )
+            # downsample_start = time.time()
+            # if (processing_d, processing_h, processing_w) != (
+            #     output_d,
+            #     output_h,
+            #     output_w,
+            # ):
+            #     if enable_timing:
+            #         print(
+            #             f"  Downsampling XY: {tuple(batch_features.shape)} → target {(batch_features.shape[0], batch_features.shape[1], output_d, output_h, output_w)}"
+            #         )
+            #     else:
+            #         print(
+            #             f"Downsampling XY features from {(processing_d, processing_h, processing_w)} to {(output_d, output_h, output_w)}"
+            #         )
 
-                batch_features = torch.nn.functional.interpolate(
-                    batch_features,
-                    size=(output_d, output_h, output_w),
-                    mode="trilinear",
-                    align_corners=False,
-                )
+            #     batch_features = torch.nn.functional.interpolate(
+            #         batch_features,
+            #         size=(output_d, output_h, output_w),
+            #         mode="trilinear",
+            #         align_corners=False,
+            #     )
 
-                if enable_timing:
-                    print(f"  XY downsampled to: {tuple(batch_features.shape)}")
-            detailed_timing["single_plane_downsample"] = time.time() - downsample_start
+            #     if enable_timing:
+            #         print(f"  XY downsampled to: {tuple(batch_features.shape)}")
+            # detailed_timing["single_plane_downsample"] = time.time() - downsample_start
 
         # Final device transfer and timing summary
         device_transfer_start = time.time()
@@ -1815,6 +1818,8 @@ class DINOv3UNet3DPipeline(nn.Module):
         output_h=None,
         output_w=None,
     ):
+        import time
+
         """
         Extract DINOv3 features from a specific plane orientation with batching.
         Optionally downsamples immediately to save memory.
@@ -2279,7 +2284,9 @@ class DINOv3UNet3DPipeline(nn.Module):
                 extraction_start = time.time()
 
             # OPTIMIZED: Convert entire batch_features to tensor at once
-            batch_features_tensor = torch.tensor(batch_features, dtype=torch.float32)
+            # First ensure it's a proper numpy array (handle wrapper types)
+            batch_features_np = np.ascontiguousarray(batch_features, dtype=np.float32)
+            batch_features_tensor = torch.tensor(batch_features_np, dtype=torch.float32)
             # batch_features_tensor shape: (output_channels, batch_size, H_feat, W_feat)
             # Rearrange to: (batch_size, output_channels, H_feat, W_feat)
             batch_features_tensor = batch_features_tensor.permute(1, 0, 2, 3)
