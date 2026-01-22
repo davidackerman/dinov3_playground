@@ -121,7 +121,7 @@ flowchart TB
         UNET2D[DINOv3UNet<br/>2D]
         UNET3D[DINOv3UNet3D<br/>3D]
         PIPE[DINOv3UNet3D<br/>Pipeline]
-        LOSS[Loss Functions<br/>Focal | Dice | Tversky | BoundaryWeighted]
+        LOSS[Loss Functions<br/>Focal / Dice / Tversky / BoundaryWeighted]
     end
 
     subgraph output["📤 OUTPUT LAYER"]
@@ -321,7 +321,7 @@ flowchart TB
     subgraph features["🧠 FEATURE EXTRACTION"]
         FE_DINO["DINOv3 (ViT or ConvNeXt)"]
         FE_3D["3D via orthogonal plane averaging<br/>(XY + XZ + YZ) / 3"]
-        UP_OPTS["Upsampling: Bilinear | AnyUp | Learned ConvTranspose"]
+        UP_OPTS["Upsampling: Bilinear / AnyUp / Learned ConvTranspose"]
     end
 
     subgraph augment["🔄 AUGMENTATIONS"]
@@ -330,7 +330,7 @@ flowchart TB
 
     subgraph network["🔮 NETWORK"]
         NET_UNET["3D UNet with skip connections"]
-        NET_OPTS["Options: BatchNorm/Renorm | Gradient checkpointing | Context fusion"]
+        NET_OPTS["Options: BatchNorm/Renorm / Gradient checkpointing / Context fusion"]
     end
 
     subgraph targets["🎯 OUTPUT TYPES"]
